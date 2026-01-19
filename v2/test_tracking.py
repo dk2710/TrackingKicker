@@ -10,7 +10,7 @@ from goal_detector import GoalDetector
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
-VIDEO_PATH = BASE_DIR / "videos" / "Video2.mp4"
+VIDEO_PATH = r"C:\\Users\\DKleis\\PycharmProjects\\TrackingKicker\\videos\\Video2.mp4"
 
 FPS = 186.6  # Aus deinem Original-Code
 
