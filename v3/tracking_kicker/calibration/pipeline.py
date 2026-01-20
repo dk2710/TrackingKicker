@@ -5,10 +5,13 @@ from typing import Any, Dict, List
 from .colors import ColorCalibrator
 from .rods import RodCalibrator
 from .goals import GoalCalibrator
+from .field import FieldCalibrator
+
 
 
 class CalibrationPipeline:
     def __init__(self, rod_layout: List[Dict[str, Any]]):
+        self.field_cal = FieldCalibrator()
         self.rod_layout = rod_layout
         self.color_cal = ColorCalibrator()
         self.rod_cal = RodCalibrator()
@@ -25,11 +28,22 @@ class CalibrationPipeline:
         if goals_cfg is None:
             raise RuntimeError("❌ Tor-Kalibrierung abgebrochen oder unvollständig.")
 
+        field_corners_norm = self.field_cal.calibrate(first_frame)
+        if field_corners_norm is None or len(field_corners_norm) != 4:
+            raise RuntimeError("❌ Spielfeld-Ecken Kalibrierung abgebrochen oder unvollständig.")
+
+        field_cfg = {
+            "size_cm": {"w": 120.0, "h": 68.0},
+            "corners_norm": field_corners_norm  # [OL, OR, UR, UL]
+        }
+
         rods_cfg = [{"x_norm": rods_norm[i], **self.rod_layout[i]} for i in range(8)]
 
         return {
             "created": datetime.datetime.now().isoformat(),
             "colors": colors_cfg,
             "rods": rods_cfg,
-            "goals": goals_cfg
+            "goals": goals_cfg,
+            "field": field_cfg
         }
+

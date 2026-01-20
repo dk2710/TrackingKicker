@@ -1,4 +1,5 @@
 import cv2
+
 from typing import Any, Dict, List, Optional
 
 cv2.setUseOptimized(True)
@@ -6,14 +7,14 @@ cv2.setUseOptimized(True)
 from tracking_kicker.video import VideoSource
 from tracking_kicker.storage import JsonStore
 from tracking_kicker.calibration import CalibrationPipeline
-from tracking_kicker.detection import BallDetector, KalmanBallTracker
+from tracking_kicker.detection import BallDetector
 from tracking_kicker.analysis import KickerAnalyzer
 
 
 # ================================================================
 # CONFIG
 # ================================================================
-VIDEO_PATH = r"C:\Users\DKleis\PycharmProjects\TrackingKicker\videos\Video.mp4"
+VIDEO_PATH = r"C:\Users\kleis\PycharmProjects\TrackingKicker\videos\Video.mp4"
 CALIBRATION_FILE = "table_calibration.json"
 
 ROD_LAYOUT: List[Dict[str, Any]] = [
@@ -72,10 +73,12 @@ class KickerApp:
         self._load_or_calibrate()
         assert self.cfg is not None
 
-        # detector = BallDetector()
-        detector = BallDetector(debug=True, use_tracking_roi=True, search_radius=180)
-        tracker = KalmanBallTracker(fps=self.video.fps, gate_px=220.0, min_r_ratio=0.70, reacquire_px=500.0)
-        analyzer = KickerAnalyzer(fps=self.video.fps, goals_cfg=self.cfg["goals"])
+        detector = BallDetector(debug=False)  # gleiche Settings wie vorher
+        analyzer = KickerAnalyzer(
+            fps=self.video.fps,
+            goals_cfg=self.cfg["goals"],
+            field_cfg=self.cfg.get("field")
+        )
 
         delay_ms = int(round(1000 / self.video.fps))
 
@@ -84,32 +87,19 @@ class KickerApp:
             if not ret or frame is None:
                 break
 
-            # 1) Messung + Maske
             meas = detector.detect(frame)  # (x,y,r) oder None
-            ball_mask = detector.mask(frame)  # Maske für Tor-Check
+            ball_mask = detector.mask(frame)  # für Tor-Check
 
-            # 2) Zuverlässigkeit (falls last_reliable nicht existiert -> True)
-            reliable = bool(getattr(detector, "last_reliable", True))
-
-            # 3) Tracker nur mit zuverlässiger Messung füttern
-            meas_for_tracker = meas if (meas is not None and reliable) else None
-            ball_est, predicted = tracker.update(meas_for_tracker)
-
-            # 4) Was zeichnen?
-            ball_draw = meas if (meas is not None and reliable) else ball_est
-            pred_flag = (meas is None) or (not reliable) or predicted
-
-            # 5) Overlay genau einmal
-            analyzer.draw_overlay(frame, ball_draw, predicted=pred_flag, ball_mask=ball_mask)
+            analyzer.draw_overlay(frame, meas, ball_mask=ball_mask, draw_goal_boxes=True)
 
             cv2.imshow("Kicker Analyse", frame)
             key = cv2.waitKey(delay_ms) & 0xFF
             if key == 27:
                 break
             elif key == ord('+'):
-                delay_ms = max(1, int(delay_ms * 0.8))  # schneller
+                delay_ms = max(1, int(delay_ms * 0.8))
             elif key == ord('-'):
-                delay_ms = int(delay_ms * 1.25)  # langsamer
+                delay_ms = int(delay_ms * 1.25)
 
         self.video.release()
         cv2.destroyAllWindows()
