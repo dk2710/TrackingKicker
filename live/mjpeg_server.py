@@ -20,24 +20,17 @@ latest_id = 0
 
 
 def camera_loop():
+    global latest_jpeg, latest_id
+
     TARGET_FPS = 25
+    JPEG_QUALITY = 65
     frame_interval = 1.0 / TARGET_FPS
     last = 0.0
-
-    global latest_id
-    with lock:
-        latest_jpeg = buf.tobytes()
-        latest_id += 1
 
     print("📷 camera_loop started (with reconnect)")
 
     while True:
-        now = time.time()
-        sleep_t = frame_interval - (now - last)
-        if sleep_t > 0:
-            time.sleep(sleep_t)
-        last = time.time()
-
+        camera = None
         try:
             devices = pylon.TlFactory.GetInstance().EnumerateDevices()
             if not devices:
@@ -57,32 +50,37 @@ def camera_loop():
 
             while camera.IsGrabbing():
                 grab = camera.RetrieveResult(5000, pylon.TimeoutHandling_Return)
+
                 if grab and grab.GrabSucceeded():
                     img = converter.Convert(grab)
                     frame = img.GetArray()
 
-                    # falls du Undistorter nutzt:
+                    # ✅ Entzerrung aktivieren, wenn du willst
                     # frame = undistorter.apply(frame)
 
-                    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 65])
+                    # ✅ FPS Limit (gleichmäßig)
+                    now = time.time()
+                    sleep_t = frame_interval - (now - last)
+                    if sleep_t > 0:
+                        time.sleep(sleep_t)
+                    last = time.time()
+
+                    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
                     if ok:
                         jpg_bytes = buf.tobytes()
                         with lock:
                             latest_jpeg = jpg_bytes
                             latest_id += 1
 
-                _toggle = grab is not None
-                if _toggle:
+                if grab is not None:
                     grab.Release()
-
-                time.sleep(0.005)
 
         except Exception as e:
             print("❌ Camera loop error:", repr(e))
-            # hier landen auch USB disconnects etc.
+
         finally:
             try:
-                if 'camera' in locals():
+                if camera is not None:
                     try:
                         if camera.IsGrabbing():
                             camera.StopGrabbing()
@@ -98,6 +96,7 @@ def camera_loop():
 
         print("🔁 Reconnecting in 2s...")
         time.sleep(2)
+
 
 
 
