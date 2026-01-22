@@ -4,9 +4,8 @@ import threading
 import cv2
 from flask import Flask, Response
 from pypylon import pylon
+
 from LensUndistorter import LensUndistorter
-
-
 
 cv2.setUseOptimized(True)
 
@@ -15,13 +14,21 @@ undistorter = LensUndistorter("lens_config.json")
 
 lock = threading.Lock()
 latest_jpeg = None
+latest_id = 0
+
 
 def camera_loop():
-    global latest_jpeg
+    global latest_jpeg, latest_id
+
+    TARGET_FPS = 25
+    JPEG_QUALITY = 65
+    frame_interval = 1.0 / TARGET_FPS
+    last_frame_ts = 0.0
 
     print("📷 camera_loop started (with reconnect)")
 
     while True:
+        camera = None
         try:
             devices = pylon.TlFactory.GetInstance().EnumerateDevices()
             if not devices:
@@ -41,30 +48,37 @@ def camera_loop():
 
             while camera.IsGrabbing():
                 grab = camera.RetrieveResult(5000, pylon.TimeoutHandling_Return)
+
                 if grab and grab.GrabSucceeded():
                     img = converter.Convert(grab)
                     frame = img.GetArray()
 
-                    # falls du Undistorter nutzt:
-                    # frame = undistorter.apply(frame)
+                    # ✅ Entzerren aktivieren (wenn du willst)
+                    frame = undistorter.apply(frame)
 
-                    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                    # ✅ FPS-Limit (stabil)
+                    now = time.time()
+                    dt = now - last_frame_ts
+                    if dt < frame_interval:
+                        time.sleep(frame_interval - dt)
+                    last_frame_ts = time.time()
+
+                    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
                     if ok:
+                        jpg_bytes = buf.tobytes()
                         with lock:
-                            latest_jpeg = buf.tobytes()
+                            latest_jpeg = jpg_bytes
+                            latest_id += 1
 
-                _toggle = grab is not None
-                if _toggle:
+                if grab is not None:
                     grab.Release()
-
-                time.sleep(0.005)
 
         except Exception as e:
             print("❌ Camera loop error:", repr(e))
-            # hier landen auch USB disconnects etc.
+
         finally:
             try:
-                if 'camera' in locals():
+                if camera is not None:
                     try:
                         if camera.IsGrabbing():
                             camera.StopGrabbing()
@@ -82,7 +96,6 @@ def camera_loop():
         time.sleep(2)
 
 
-
 @app.route("/")
 def index():
     return """
@@ -98,15 +111,20 @@ def index():
 @app.route("/video")
 def video():
     def gen():
+        last_sent = -1
         while True:
             with lock:
                 jpg = latest_jpeg
-            if jpg is None:
-                time.sleep(0.05)
+                fid = latest_id
+
+            if jpg is None or fid == last_sent:
+                time.sleep(0.01)
                 continue
+
+            last_sent = fid
             yield (b"--frame\r\n"
                    b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
-            time.sleep(0.02)  # ~50 FPS max im Browser
+            # keine fixe 50fps Bremse nötig – wir senden nur neue Frames
     return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
