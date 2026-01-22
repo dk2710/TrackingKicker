@@ -1,6 +1,3 @@
-cd ~/dev/tischkicker
-
-cat > TrackingKicker/mjpeg_server.py <<'EOF'
 import time
 import threading
 
@@ -91,4 +88,3 @@ if __name__ == "__main__":
     t = threading.Thread(target=camera_loop, daemon=True)
     t.start()
     app.run(host="0.0.0.0", port=8080, threaded=True)
-EOF
