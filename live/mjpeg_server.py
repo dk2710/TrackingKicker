@@ -11,7 +11,7 @@ from LensUndistorter import LensUndistorter
 cv2.setUseOptimized(True)
 
 app = Flask(__name__)
-undistorter = LensUndIstorter("lens_config.json")
+undistorter = LensUndistorter("lens_config.json")
 
 lock = threading.Lock()
 latest_jpeg = None
