@@ -15,7 +15,7 @@ cv2.setUseOptimized(True)
 # ================================================================
 # CONFIG
 # ================================================================
-CONFIG_FILE = "lens_config.json"
+CONFIG_FILE = "live/lens_config.json"
 
 # Kamera/Stream Settings
 HTTP_HOST = "0.0.0.0"
