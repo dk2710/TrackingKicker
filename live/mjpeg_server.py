@@ -53,7 +53,7 @@ def camera_loop():
                         with lock:
                             latest_jpeg = buf.tobytes()
 
-               _toggle = grab is not None
+                _toggle = grab is not None
                 if _toggle:
                     grab.Release()
 
