@@ -16,50 +16,71 @@ undistorter = LensUndistorter("lens_config.json")
 lock = threading.Lock()
 latest_jpeg = None
 
-
 def camera_loop():
     global latest_jpeg
 
-    print("📷 camera_loop started")
+    print("📷 camera_loop started (with reconnect)")
 
-    camera = pylon.InstantCamera(pylon.TlFactory.GetInstance().CreateFirstDevice())
-    camera.Open()
-    print("✅ Camera opened:", camera.GetDeviceInfo().GetModelName())
-    print("ℹ️ PixelFormat:", camera.PixelFormat.Value)
-
-    # BayerRG8 -> BGR (FARBE)
-    converter = pylon.ImageFormatConverter()
-    converter.OutputPixelFormat = pylon.PixelType_BGR8packed
-    converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
-
-    camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
-
-    try:
-        while camera.IsGrabbing():
-            grab = camera.RetrieveResult(5000, pylon.TimeoutHandling_Return)
-            if grab and grab.GrabSucceeded():
-                img = converter.Convert(grab)
-                frame = img.GetArray()
-                frame = undistorter.apply(frame)
-                # HxWx3 BGR
-
-                ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-                if ok:
-                    with lock:
-                        latest_jpeg = buf.tobytes()
-
-            if grab:
-                grab.Release()
-
-            time.sleep(0.005)
-
-    finally:
+    while True:
         try:
-            camera.StopGrabbing()
-        except Exception:
-            pass
-        camera.Close()
-        print("🛑 Camera closed")
+            devices = pylon.TlFactory.GetInstance().EnumerateDevices()
+            if not devices:
+                print("⚠️ No camera found. Retrying in 2s...")
+                time.sleep(2)
+                continue
+
+            camera = pylon.InstantCamera(pylon.TlFactory.GetInstance().CreateFirstDevice())
+            camera.Open()
+            print("✅ Camera opened:", camera.GetDeviceInfo().GetModelName(), "|", camera.PixelFormat.Value)
+
+            converter = pylon.ImageFormatConverter()
+            converter.OutputPixelFormat = pylon.PixelType_BGR8packed
+            converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
+
+            camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+
+            while camera.IsGrabbing():
+                grab = camera.RetrieveResult(5000, pylon.TimeoutHandling_Return)
+                if grab and grab.GrabSucceeded():
+                    img = converter.Convert(grab)
+                    frame = img.GetArray()
+
+                    # falls du Undistorter nutzt:
+                    # frame = undistorter.apply(frame)
+
+                    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                    if ok:
+                        with lock:
+                            latest_jpeg = buf.tobytes()
+
+               _toggle = grab is not None
+                if _toggle:
+                    grab.Release()
+
+                time.sleep(0.005)
+
+        except Exception as e:
+            print("❌ Camera loop error:", repr(e))
+            # hier landen auch USB disconnects etc.
+        finally:
+            try:
+                if 'camera' in locals():
+                    try:
+                        if camera.IsGrabbing():
+                            camera.StopGrabbing()
+                    except Exception:
+                        pass
+                    try:
+                        if camera.IsOpen():
+                            camera.Close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        print("🔁 Reconnecting in 2s...")
+        time.sleep(2)
+
 
 
 @app.route("/")
