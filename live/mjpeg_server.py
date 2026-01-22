@@ -4,14 +4,10 @@ import threading
 import cv2
 from flask import Flask, Response
 from pypylon import pylon
-from LensUndistorter import LensUndistorter
-
-
 
 cv2.setUseOptimized(True)
 
 app = Flask(__name__)
-undistorter = LensUndistorter("lens_config.json")
 
 lock = threading.Lock()
 latest_jpeg = None
@@ -39,9 +35,7 @@ def camera_loop():
             grab = camera.RetrieveResult(5000, pylon.TimeoutHandling_Return)
             if grab and grab.GrabSucceeded():
                 img = converter.Convert(grab)
-                frame = img.GetArray()
-                frame = undistorter.apply(frame)
-                # HxWx3 BGR
+                frame = img.GetArray()  # HxWx3 BGR
 
                 ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
                 if ok:
