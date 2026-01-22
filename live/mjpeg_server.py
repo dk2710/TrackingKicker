@@ -4,13 +4,13 @@ import threading
 import cv2
 from flask import Flask, Response
 from pypylon import pylon
-from LensUndistorter import LensUndistorter
+from LensUndIstorter import LensUndIstorter
 
 
 cv2.setUseOptimized(True)
 
 app = Flask(__name__)
-undistorter = LensUndistorter("lens_config.json")
+undistorter = LensUndIstorter("lens_config.json")
 
 lock = threading.Lock()
 latest_jpeg = None
