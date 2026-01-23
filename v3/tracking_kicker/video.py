@@ -7,11 +7,16 @@ class VideoSource:
     def __init__(self, video_path: str):
         self.video_path = video_path
         self.cap = cv2.VideoCapture(video_path)
+        print("FPS:", self.cap.get(cv2.CAP_PROP_FPS))
+        print("Frames:", self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        print("Dauer:", self.cap.get(cv2.CAP_PROP_FRAME_COUNT) / self.cap.get(cv2.CAP_PROP_FPS))
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS)  # -> 186.636
+
         if not self.cap.isOpened():
             raise RuntimeError(f"❌ Konnte Video nicht öffnen: {video_path}")
 
         fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 0.0)
-        self.fps = fps if fps > 0 else 30.0  # Fallback
+        self.fps = fps if fps > 0 else 186.6  # Fallback
 
     def read(self) -> Tuple[bool, Optional[np.ndarray]]:
         ret, frame = self.cap.read()
