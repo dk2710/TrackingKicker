@@ -100,20 +100,35 @@ class BaslerSource:
 
         grab = None
         try:
-            grab = self.camera.RetrieveResult(
-                self.max_grab_ms,
-                pylon.TimeoutHandling_Return
-            )
+            grab = self.camera.RetrieveResult(1000, pylon.TimeoutHandling_Return)
+            if grab is None:
+                # Timeout: einfach keine Frame diese Runde
+                return None
 
-            if grab is None or not grab.GrabSucceeded():
-                return False, None
+            # Manche pypylon-Versionen brauchen diese Valid-Checks
+            if not grab.IsValid():
+                grab.Release()
+                return None
 
-            frame = grab.GetArray()
-            return True, frame
+            if not grab.GrabSucceeded():
+                # optional: Fehlerdetails
+                # print("Grab failed:", grab.GetErrorCode(), grab.GetErrorDescription())
+                grab.Release()
+                return None
+
+            frame = grab.GetArray().copy()  # copy: wichtig, damit frame nicht an grab hängt
+            grab.Release()
+            return frame
 
         except Exception as e:
+            # genau deine Meldung landet hier, falls grab invalid war
+            try:
+                if grab is not None:
+                    grab.Release()
+            except:
+                pass
             print(f"⚠️ Basler grab failed: {e}")
-            return False, None
+            return None
 
         finally:
             if grab is not None:
