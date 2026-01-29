@@ -7,12 +7,20 @@ from .rods import RodCalibrator
 from .goals import GoalCalibrator
 from .field import FieldCalibrator
 
-
+ROD_LAYOUT: List[Dict[str, Any]] = [
+    {"team": "black", "expected": 1},
+    {"team": "black", "expected": 2},
+    {"team": "white", "expected": 2},
+    {"team": "black", "expected": 5},
+    {"team": "white", "expected": 5},
+    {"team": "black", "expected": 3},
+    {"team": "white", "expected": 2},
+    {"team": "white", "expected": 1},
+]
 
 class CalibrationPipeline:
-    def __init__(self, rod_layout: List[Dict[str, Any]]):
+    def __init__(self):
         self.field_cal = FieldCalibrator()
-        self.rod_layout = rod_layout
         self.color_cal = ColorCalibrator()
         self.rod_cal = RodCalibrator()
         self.goal_cal = GoalCalibrator()
@@ -37,7 +45,7 @@ class CalibrationPipeline:
             "corners_norm": field_corners_norm  # [OL, OR, UR, UL]
         }
 
-        rods_cfg = [{"x_norm": rods_norm[i], **self.rod_layout[i]} for i in range(8)]
+        rods_cfg = [{"x_norm": rods_norm[i], **ROD_LAYOUT[i]} for i in range(8)]
 
         return {
             "created": datetime.datetime.now().isoformat(),

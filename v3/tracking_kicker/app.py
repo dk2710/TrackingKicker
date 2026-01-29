@@ -2,47 +2,45 @@ import cv2
 from typing import Any, Dict, List, Optional
 from pathlib import Path
 import time
+from queue import Queue
+import threading
+from datetime import datetime
+import numpy as np
 
-cv2.setUseOptimized(True)
+frame_queue = Queue(maxsize=2)  # WICHTIG: klein halten
+display_queue = Queue(maxsize=1)
+recording_queue = Queue()
 
-from tracking_kicker.video import VideoSource
+stop_event = threading.Event()
+record_event = threading.Event()
+
+from tracking_kicker.RawReplaySource import RawReplaySource
 from tracking_kicker.BaslerSource import BaslerSource
 from tracking_kicker.storage import JsonStore
 from tracking_kicker.calibration import CalibrationPipeline
 from tracking_kicker.detection import BallDetector
 from tracking_kicker.analysis import KickerAnalyzer
-from tracking_kicker.distoration import load_params, DistortionCorrector
+from tracking_kicker.distoration import DistortionCorrector
 
-CALIBRATION_FILE = "table_calibration.json"   # ✅ richtig!
-ROD_LAYOUT: List[Dict[str, Any]] = [
-    {"team": "black", "expected": 1},
-    {"team": "black", "expected": 2},
-    {"team": "white", "expected": 2},
-    {"team": "black", "expected": 5},
-    {"team": "white", "expected": 5},
-    {"team": "black", "expected": 3},
-    {"team": "white", "expected": 2},
-    {"team": "white", "expected": 1},
-]
+VIDEO_PATH = r"C:\Users\DKleis\PycharmProjects\TrackingKicker\v3\videos\session_raw_original.npz"
+lens_file = (Path(__file__).resolve().parents[1] / "lens_config.json").resolve()
+CALIBRATION_FILE = "table_calibration.json"
 
+#Analysevideo
+Analyse_Video_Path = (Path(__file__).resolve().parents[1] / "videos").resolve()
+Analyse_Video_Path.mkdir(parents=True, exist_ok=True)
 
 class KickerApp:
-    def __init__(self, source, calibration_path: str, rod_layout: List[Dict[str, Any]]):
+    def __init__(self, source, calibration_path: str):
         self.video = source
         self.calibration_path = calibration_path
-        self.rod_layout = rod_layout
         self.cfg: Optional[Dict[str, Any]] = None
 
-        self.lens_file = (Path(__file__).resolve().parents[1] / "lens_config.json").resolve()
-        print("LOADING lens_config FROM:", self.lens_file)
+        self.dist = DistortionCorrector(config_path=lens_file)
 
-        params = load_params(self.lens_file)
-        self.dist = DistortionCorrector(params, config_path=self.lens_file, enable_ui=False)
-
-        self._reload_lens_distortion()  # ✅ erzwingt Load + Print + Cache reset
-
-        print(f"📁 Verzerrung config: {self.lens_file}")
+        print(f"📁 Verzerrung config: {lens_file}")
         print(f"🎥 FPS erkannt: {self.video.fps:.3f}")
+        cv2.setUseOptimized(True)
 
     @staticmethod
     def _get_start_mode() -> bool:
@@ -53,7 +51,6 @@ class KickerApp:
         if frame is None:
             return None
 
-        self.dist.enable_ui(True)
         cv2.namedWindow("Distortion Preview", cv2.WINDOW_NORMAL)
 
         while True:
@@ -62,13 +59,11 @@ class KickerApp:
 
             key = cv2.waitKey(15) & 0xFF
             if key == 27:  # ESC
-                self.dist.enable_ui(False)
                 cv2.destroyWindow("Distortion Preview")
                 return None
 
             if key == ord("s"):
                 self.dist.save()  # speichert lens_config.json
-                self.dist.enable_ui(False)
                 cv2.destroyWindow("Distortion Preview")
                 return corrected
 
@@ -102,16 +97,10 @@ class KickerApp:
 
             print("📁 Kalibrierung geladen:", self.calibration_path)
 
-            self._reload_lens_distortion()  # ✅ DAS ist der entscheidende Fix
 
         self.video.reset()
 
-    import time
-
-    def run(self) -> None:
-        self._load_or_calibrate()
-        assert self.cfg is not None
-
+    def processing_loop(self, in_queue, display_queue, stop_event):
         detector = BallDetector(debug=False)
         analyzer = KickerAnalyzer(
             fps=self.video.fps,
@@ -119,73 +108,209 @@ class KickerApp:
             field_cfg=self.cfg.get("field"),
         )
 
-        # --- Echtzeit-Planung ---
-        frame_dt = 1.0 / self.video.fps
-        t0 = time.perf_counter()
-        frame_idx = 0
-
-        display_fps = 60.0
-        skip = max(1, int(round(self.video.fps / display_fps)))  # bei 186 -> 3
-        i = 0
-
-        while True:
-            ret, frame = self.video.read()
-            if (not ret) or (frame is None):
-                break
-
-            i += 1
-
-            # Optional: Wenn du wirklich Performance willst:
-            # Skip früh, bevor du teures processing machst (nur Anzeige schneller)
-            if i % skip != 0:
+        while not stop_event.is_set():
+            try:
+                frame = in_queue.get(timeout=0.5)
+            except:
                 continue
 
-            frame = self.dist.apply(frame)
+            bgr = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
+            bgr = bgr[:, :, [2, 1, 0]]  # Farbfix
 
-            meas = detector.detect(frame)
-            ball_mask = detector.mask(frame)
-            analyzer.draw_overlay(frame, meas, ball_mask=ball_mask, draw_goal_boxes=True)
+            meas = detector.detect(bgr)
+            overlay = bgr.copy()
+            analyzer.draw_overlay(overlay, meas)
+
+            # keep-latest policy
+            if display_queue.full():
+                try:
+                    display_queue.get_nowait()
+                except:
+                    pass
+
+            display_queue.put(overlay)
+
+    def camera_loop(self, video, rt_queue, rec_queue, stop_event):
+        t0 = time.time()
+        n = 0
+        dropped = 0
+
+        last_log = time.time()
+
+        while not stop_event.is_set():
+            ret, frame = video.read()
+            if not ret:
+                continue
+
+            n += 1
+
+            # Queue-Policy: keep-latest
+            if rt_queue.full():
+                try:
+                    rt_queue.get_nowait()
+                    dropped += 1
+                except:
+                    pass
+            rt_queue.put(frame)
+
+            rec_queue.put(frame)
+            # --- FPS LOGGING ---
+            now = time.time()
+            if now - last_log >= 1.0:
+                host_fps = n / (now - t0)
+                cam_fps = video.showFPS()  # ResultingFrameRate
+
+                print(
+                    f"[CAM] HostFPS={host_fps:.1f} | "
+                    f"CamFPS={cam_fps} | "
+                    f"Dropped={dropped}"
+                )
+
+                # reset
+                t0 = now
+                n = 0
+                dropped = 0
+                last_log = now
+
+    def recording_loop(self, queue, stop_event, record_event):
+        raw_frames = []
+        raw_times = []
+        recording = False
+
+        while not stop_event.is_set():
+
+            want_record = record_event.is_set()
+
+            # ▶️ START (Flanke)
+            if want_record and not recording:
+                print("▶️ RAW Recording gestartet")
+                raw_frames.clear()
+                raw_times.clear()
+                recording = True
+
+            # ⏹ STOP (Flanke)
+            if not want_record and recording:
+                print(f"💾 SAVE START {len(raw_frames)}")
+
+                frames_copy = raw_frames.copy()
+                times_copy = raw_times.copy()
+
+                # 🔥 ASYNC SAVE
+                threading.Thread(
+                    target=self._save_raw_async,
+                    args=(frames_copy, times_copy),
+                    daemon=True
+                ).start()
+
+                raw_frames.clear()
+                raw_times.clear()
+                recording = False
+
+            if not recording:
+                time.sleep(0.01)
+                continue
+
+            # 🟢 Recording läuft → Frames sammeln
+            try:
+                frame = queue.get(timeout=0.2)
+            except:
+                continue
+
+            raw_frames.append(frame.copy())
+            raw_times.append(time.perf_counter())
+
+    def _save_raw_async(self, frames, times):
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        filename = Analyse_Video_Path / f"session_raw_{ts}.npz"
+
+        print("💾 SAVE THREAD START")
+
+        np.savez(
+            filename,
+            frames=np.stack(frames),
+            times=np.array(times)
+        )
+
+        print(f"✅ SAVE DONE: {filename}")
+
+    def run(self) -> None:
+        self._load_or_calibrate()
+        assert self.cfg is not None
+
+        t_cam = threading.Thread(
+            target=self.camera_loop,
+            args=(self.video, frame_queue, recording_queue, stop_event),
+            daemon=True
+        )
+
+        t_proc = threading.Thread(
+            target=self.processing_loop,
+            args=(frame_queue, display_queue, stop_event),
+            daemon=True
+        )
+        t_rec = threading.Thread(
+            target=self.recording_loop,
+            args=(recording_queue, stop_event, record_event),
+            daemon=True
+        )
+
+        t_cam.start()
+        t_proc.start()
+        t_rec.start()
+
+        print("⌨️  Taste 'r' = Aufnahme Start/Stop | ESC = Ende")
+        while not stop_event.is_set():
+            try:
+                frame = display_queue.get(timeout=0.5)
+            except:
+                continue
 
             cv2.imshow("Kicker Analyse", frame)
+
             key = cv2.waitKey(1) & 0xFF
-            if key == 27:
+            if key == ord('q'):
                 break
-            elif key == ord("s"):
-                self.dist.save()
+
+            if key == ord('r'):
+                if record_event.is_set():
+                    record_event.clear()
+                    print("KEY → Recording OFF")
+                else:
+                    record_event.set()
+                    print("KEY → Recording ON")
+
+
+            elif key == 27:  # ESC
+                break
+
+        stop_event.set()
+        record_event.clear()
+
+        t_cam.join(timeout=1)
+        t_proc.join(timeout=1)
+        t_rec.join(timeout=1)
 
         self.video.release()
         cv2.destroyAllWindows()
-
-    def _reload_lens_distortion(self) -> None:
-        params = load_params(self.lens_file)
-        self.dist.params = params
-
-        # Cache killen (sonst bleibt alte Map aktiv!)
-        self.dist._map_x = None
-        self.dist._map_y = None
-        self.dist._last_key = None
-
-        print("✅ Active lens params:", self.dist.params)
 
 
 if __name__ == "__main__":
 
     USE_CAMERA = True
 
+
     if USE_CAMERA:
         try:
-            source = BaslerSource(fps_hint=220.0, latest_only=True)
+            source = BaslerSource( latest_only=False)
             print("📷 Quelle: Basler Kamera")
         except Exception as e:   # ✅ fängt auch _genicam.RuntimeException
             print(f"❌ Kamera nicht verfügbar: {e}")
             print("➡️ Fallback auf VideoSource…")
-            VIDEO_PATH = r"C:\Users\DKleis\PycharmProjects\TrackingKicker\videos\test2.mp4"
-            source = VideoSource(VIDEO_PATH)
+            source = RawReplaySource(VIDEO_PATH)
     else:
-        VIDEO_PATH = r"C:\Users\DKleis\PycharmProjects\TrackingKicker\videos\test2.mp4"
-        source = VideoSource(VIDEO_PATH)
+        source = RawReplaySource(VIDEO_PATH)
 
-    app = KickerApp(source, CALIBRATION_FILE, ROD_LAYOUT)
+    app = KickerApp(source, CALIBRATION_FILE)
     app.run()
 
 

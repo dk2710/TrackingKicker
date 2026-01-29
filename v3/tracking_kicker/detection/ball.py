@@ -32,7 +32,17 @@ class BallDetector:
     # -----------------------------
     # Masking
     # -----------------------------
-    def _mask_ball(self, frame_bgr: np.ndarray) -> np.ndarray:
+    def _mask_ball(self, frame: np.ndarray) -> np.ndarray:
+        # Nur wenn 1-Kanal (Bayer/Gray) -> demosaic
+        if frame.ndim == 2:
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)  # ggf. anderes Muster
+        elif frame.ndim == 3 and frame.shape[2] == 3:
+            frame_bgr = frame  # ist schon BGR
+        elif frame.ndim == 3 and frame.shape[2] == 4:
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+        else:
+            raise ValueError(f"Unexpected frame shape: {frame.shape}")
+
         blur = cv2.GaussianBlur(frame_bgr, (5, 5), 0)
         hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, self.hsv_low, self.hsv_high)
