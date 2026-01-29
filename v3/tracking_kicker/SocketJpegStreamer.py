@@ -2,6 +2,8 @@ import socket
 import struct
 from queue import Queue
 import threading
+import time
+import cv2
 
 class SocketJpegStreamer:
     def __init__(self, host="0.0.0.0", port=9999, jpeg_quality=75, send_fps=60):

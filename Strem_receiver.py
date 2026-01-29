@@ -1,6 +1,7 @@
 import socket, struct, threading
 import numpy as np
 import cv2
+import time
 
 PI_IP = "172.20.10.6"  # <-- Pi-IP
 PORT = 9999
