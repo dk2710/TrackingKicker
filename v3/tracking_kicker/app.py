@@ -40,6 +40,30 @@ CALIBRATION_FILE = "table_calibration.json"
 #Analysevideo
 Analyse_Video_Path = (Path(__file__).resolve().parents[1] / "videos").resolve()
 Analyse_Video_Path.mkdir(parents=True, exist_ok=True)
+import os
+
+HEADLESS = os.environ.get("HEADLESS", "0") == "1"
+
+def gui_named_window(name: str):
+    if not HEADLESS:
+        cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+
+def gui_imshow(name: str, frame):
+    if not HEADLESS:
+        cv2.imshow(name, frame)
+
+def gui_wait_key(ms: int = 1) -> int:
+    if not HEADLESS:
+        return cv2.waitKey(ms) & 0xFF
+    return 255  # "no key"
+
+def gui_destroy_window(name: str):
+    if not HEADLESS:
+        cv2.destroyWindow(name)
+
+def gui_destroy_all():
+    if not HEADLESS:
+        cv2.destroyAllWindows()
 
 class KickerApp:
     def __init__(self, source, calibration_path: str):
@@ -62,20 +86,24 @@ class KickerApp:
         if frame is None:
             return None
 
-        #cv2.namedWindow("Distortion Preview", cv2.WINDOW_NORMAL)
+        if HEADLESS:
+            print("⚠️ HEADLESS=1 → Distortion Tuning GUI nicht möglich. Abbruch.")
+            return None
+
+        gui_named_window("Distortion Preview")
 
         while True:
             corrected = self.dist.apply(frame)
-            #cv2.imshow("Distortion Preview", corrected)
+            gui_imshow("Distortion Preview", corrected)
 
-            key = cv2.waitKey(15) & 0xFF
+            key = gui_wait_key(15)
             if key == 27:  # ESC
-                cv2.destroyWindow("Distortion Preview")
+                gui_destroy_window("Distortion Preview")
                 return None
 
             if key == ord("s"):
-                #self.dist.save()  # speichert lens_config.json
-                cv2.destroyWindow("Distortion Preview")
+                # self.dist.save()
+                gui_destroy_window("Distortion Preview")
                 return corrected
 
     def _load_or_calibrate(self) -> None:
@@ -165,10 +193,13 @@ class KickerApp:
             if len(replay_buffer) < 2:
                 print("⚠️ Nicht genug Frames für Replay")
                 return
-
             frames = list(replay_buffer)
 
-        #cv2.namedWindow("Replay (letzte 3 Sekunden)", cv2.WINDOW_NORMAL)
+        if HEADLESS:
+            print("⚠️ HEADLESS=1 → Replay GUI nicht möglich.")
+            return
+
+        gui_named_window("Replay (letzte 3 Sekunden)")
 
         target_fps = 60
         target_dt = 1.0 / target_fps
@@ -190,15 +221,14 @@ class KickerApp:
                 idx += 1
 
             frame, _ = frames[idx]
-
             bgr = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
             bgr = bgr[:, :, [2, 1, 0]]
 
-            #cv2.imshow("Replay (letzte 3 Sekunden)", bgr)
-            if cv2.waitKey(int(target_dt * 1000)) & 0xFF == 27:
+            gui_imshow("Replay (letzte 3 Sekunden)", bgr)
+            if gui_wait_key(int(target_dt * 1000)) == 27:
                 break
 
-        cv2.destroyWindow("Replay (letzte 3 Sekunden)")
+        gui_destroy_window("Replay (letzte 3 Sekunden)")
 
     def camera_loop(self, video, rt_queue, rec_queue, stop_event):
         t0 = time.perf_counter()
@@ -384,7 +414,8 @@ class KickerApp:
             except:
                 continue
 
-            #cv2.imshow("Kicker Analyse", frame)
+            gui_imshow("Kicker Analyse", frame)
+            key = gui_wait_key(1)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
@@ -426,7 +457,8 @@ class KickerApp:
         t_rec.join(timeout=1)
 
         self.video.release()
-        cv2.destroyAllWindows()
+        gui_destroy_all()
+
 
 
 if __name__ == "__main__":

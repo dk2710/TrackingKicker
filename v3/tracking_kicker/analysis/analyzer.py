@@ -27,7 +27,7 @@ class KickerAnalyzer:
         self.score_right = 0
 
         # Goal detection tuning
-        self.goal_min_px = 60        # runter = sensibler
+        self.goal_min_px = 20        # runter = sensibler
         self.goal_min_ratio = 0.0015 # runter = sensibler
 
         # Robustheit gegen "nur 1 Frame im Tor"
