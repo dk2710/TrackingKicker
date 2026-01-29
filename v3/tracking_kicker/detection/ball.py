@@ -7,8 +7,8 @@ from typing import Optional, Tuple
 class BallDetector:
     def __init__(
         self,
-        hsv_low: Tuple[int, int, int] = (18, 70, 90),    # etwas toleranter
-        hsv_high: Tuple[int, int, int] = (45, 255, 255), # etwas toleranter (Gelb kann variieren)
+        hsv_low: Tuple[int, int, int] = (96, 100, 65),    # etwas toleranter
+        hsv_high: Tuple[int, int, int] = (110, 170, 135), # etwas toleranter (Gelb kann variieren)
         area_min: float = 60.0,
         area_max: float = 12000.0,
         use_morph: bool = True,

@@ -71,7 +71,7 @@ class KickerApp:
                 return None
 
             if key == ord("s"):
-                self.dist.save()  # speichert lens_config.json
+                #self.dist.save()  # speichert lens_config.json
                 cv2.destroyWindow("Distortion Preview")
                 return corrected
 
@@ -79,15 +79,19 @@ class KickerApp:
         do_calibration = self._get_start_mode()
 
         if do_calibration:
+            print("✅ Kalibrierung gestartet:")
             ret, first_frame = self.video.read()
-            if (not ret) or (first_frame is None):
+            bgr = cv2.cvtColor(first_frame, cv2.COLOR_BayerRG2BGR)
+
+
+            if (not ret) or (bgr is None):
                 raise RuntimeError("❌ Kein Frame aus der Quelle lesbar.")
 
-            tuned_frame = self._tune_distortion_on_single_frame(first_frame)
+            tuned_frame = self._tune_distortion_on_single_frame(bgr)
             if tuned_frame is None:
                 raise RuntimeError("❌ Verzerrung abgebrochen.")
 
-            pipeline = CalibrationPipeline(self.rod_layout)
+            pipeline = CalibrationPipeline()
             self.cfg = pipeline.run(tuned_frame)
             JsonStore.save(self.calibration_path, self.cfg)
             print("✅ Kalibrierung gespeichert:", self.calibration_path)
@@ -111,10 +115,13 @@ class KickerApp:
     def processing_loop(self, in_queue, display_queue, stop_event):
         detector = BallDetector(debug=False)
         analyzer = KickerAnalyzer(
-            fps=self.video.fps,
+            fps=0,
             goals_cfg=self.cfg["goals"],
             field_cfg=self.cfg.get("field"),
         )
+        t0 = time.perf_counter()
+        last_log = t0
+        n=0
 
         while not stop_event.is_set():
             try:
@@ -123,10 +130,22 @@ class KickerApp:
                 continue
 
             bgr = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
-            bgr = bgr[:, :, [2, 1, 0]]  # Farbfix
-
             meas = detector.detect(bgr)
             overlay = bgr.copy()
+
+
+            n += 1
+            now = time.perf_counter()
+            if now - last_log >= 1.0:
+                host_fps = n / (now - t0)
+
+                print(f"[CAM] AnalysierenFPS={host_fps:.1f} | ")
+
+                analyzer.fps =  host_fps
+                t0 = now
+                last_log = now
+                n = 0
+
             analyzer.draw_overlay(overlay, meas)
 
             # keep-latest policy
@@ -138,12 +157,52 @@ class KickerApp:
 
             display_queue.put(overlay)
 
+    def play_last_seconds(self):
+        with replay_lock:
+            if len(replay_buffer) < 2:
+                print("⚠️ Nicht genug Frames für Replay")
+                return
+
+            frames = list(replay_buffer)
+
+        cv2.namedWindow("Replay (letzte 3 Sekunden)", cv2.WINDOW_NORMAL)
+
+        target_fps = 60
+        target_dt = 1.0 / target_fps
+
+        t_start = frames[0][1]
+        t_end = frames[-1][1]
+
+        play_start = time.perf_counter()
+        idx = 0
+
+        while True:
+            now = time.perf_counter()
+            play_time = t_start + (now - play_start)
+
+            if play_time >= t_end:
+                break
+
+            while idx + 1 < len(frames) and frames[idx + 1][1] <= play_time:
+                idx += 1
+
+            frame, _ = frames[idx]
+
+            bgr = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
+            bgr = bgr[:, :, [2, 1, 0]]
+
+            cv2.imshow("Replay (letzte 3 Sekunden)", bgr)
+            if cv2.waitKey(int(target_dt * 1000)) & 0xFF == 27:
+                break
+
+        cv2.destroyWindow("Replay (letzte 3 Sekunden)")
+
     def camera_loop(self, video, rt_queue, rec_queue, stop_event):
-        t0 = time.time()
+        t0 = time.perf_counter()
+        last_log = t0
+
         n = 0
         dropped = 0
-
-        last_log = time.time()
 
         while not stop_event.is_set():
             ret, frame = video.read()
@@ -161,7 +220,6 @@ class KickerApp:
                 while len(replay_buffer) > max_len:
                     replay_buffer.popleft()
 
-            # Queue-Policy: keep-latest
             if rt_queue.full():
                 try:
                     rt_queue.get_nowait()
@@ -171,11 +229,10 @@ class KickerApp:
             rt_queue.put(frame)
 
             rec_queue.put(frame)
-            # --- FPS LOGGING ---
-            now = time.time()
+
             if now - last_log >= 1.0:
                 host_fps = n / (now - t0)
-                cam_fps = video.showFPS()  # ResultingFrameRate
+                cam_fps = video.showFPS()
 
                 print(
                     f"[CAM] HostFPS={host_fps:.1f} | "
@@ -183,11 +240,43 @@ class KickerApp:
                     f"Dropped={dropped}"
                 )
 
-                # reset
                 t0 = now
+                last_log = now
                 n = 0
                 dropped = 0
-                last_log = now
+
+    def save_last_seconds_mp4(self):
+        with replay_lock:
+            if len(replay_buffer) < 2:
+                print("⚠️ Nicht genug Frames für Video")
+                return
+
+            frames = list(replay_buffer)
+
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        out_path = Analyse_Video_Path / f"replay_{ts}.mp4"
+
+        h, w = frames[0][0].shape[:2]
+
+        target_fps = 60
+        input_fps = self.video.fps
+        step = max(1, int(round(input_fps / target_fps)))
+
+        writer = cv2.VideoWriter(
+            str(out_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            target_fps,
+            (w, h)
+        )
+
+        for i in range(0, len(frames), step):
+            frame, _ = frames[i]
+            bgr = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
+            bgr = bgr[:, :, [2, 1, 0]]
+            writer.write(bgr)
+
+        writer.release()
+        print(f"🎞️ Replay gespeichert (≈60 FPS): {out_path}")
 
     def recording_loop(self, queue, stop_event, record_event):
         raw_frames = []
@@ -291,6 +380,13 @@ class KickerApp:
             if key == ord('q'):
                 break
 
+            elif key == ord('k'):
+                print("KEY → Save Replay (letzte 3 Sekunden)")
+                threading.Thread(
+                    target=self.save_last_seconds_mp4,
+                    daemon=True
+                ).start()
+
             if key == ord('r'):
                 if record_event.is_set():
                     record_event.clear()
@@ -299,9 +395,18 @@ class KickerApp:
                     record_event.set()
                     print("KEY → Recording ON")
 
+            elif key == ord('k'):
+                print("KEY → Replay letzte 3 Sekunden")
+                threading.Thread(
+                    target=self.play_last_seconds,
+                    daemon=True
+                ).start()
+
+
 
             elif key == 27:  # ESC
                 break
+
 
         stop_event.set()
         record_event.clear()

@@ -1,6 +1,7 @@
 import cv2
 import math
 import numpy as np
+import time as time
 from typing import Any, Dict, Optional, Tuple
 
 
@@ -15,6 +16,11 @@ class KickerAnalyzer:
         self.vx_s: float = 0.0  # px/s
         self.vy_s: float = 0.0  # px/s
         self.speed_s: float = 0.0
+
+        self._speed_peak = 0.0
+        self._speed_display = 0
+        self._speed_window_start = time.perf_counter()
+        self._speed_window = 0.5
 
         # Score
         self.score_left = 0
@@ -77,6 +83,7 @@ class KickerAnalyzer:
 
             inst_vx = dx * self.fps
             inst_vy = dy * self.fps
+
             inst_speed = math.hypot(inst_vx, inst_vy)
 
             a = 0.2
@@ -275,6 +282,17 @@ class KickerAnalyzer:
                     dY = world[1] - self.prev_world[1]  # cm
                     inst_cm_s = math.hypot(dX, dY) * self.fps
                     inst_kmh = inst_cm_s * 0.036
+
+                    now = time.perf_counter()
+
+                    if inst_kmh > self._speed_peak:
+                        self._speed_peak = inst_kmh
+
+                    if now - self._speed_window_start >= self._speed_window:
+                        self._speed_display = int(round(self._speed_peak))
+                        self._speed_peak = 0.0
+                        self._speed_window_start = now
+
                     a = 0.2
                     self.speed_kmh_s = (1 - a) * self.speed_kmh_s + a * inst_kmh
                 self.prev_world = world
@@ -291,7 +309,7 @@ class KickerAnalyzer:
         cv2.putText(frame, f"GOALS  LEFT: {self.score_left}   RIGHT: {self.score_right}",
                     (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
 
-        cv2.putText(frame, f"Speed: {self.speed_kmh_s:.1f} km/h",
+        cv2.putText(frame, f"Speed: {self._speed_display} km/h",
                     (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
         if goalL:
