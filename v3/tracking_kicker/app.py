@@ -238,8 +238,14 @@ class KickerApp:
         dropped = 0
 
         while not stop_event.is_set():
-            ret, frame = video.read()
-            if not ret:
+            try:
+                ret, frame = video.read()
+            except Exception as e:
+                print(f"⚠️ Camera read exception: {e}")
+                time.sleep(0.01)
+                continue
+
+            if not ret or frame is None:
                 continue
 
             n += 1

@@ -98,17 +98,27 @@ class BaslerSource:
         if self._closed or not self.camera.IsGrabbing():
             return False, None
 
-        grab = self.camera.RetrieveResult(self.max_grab_ms, pylon.TimeoutHandling_Return)
-        if grab is None:
-            return False, None
+        grab = None
         try:
-            if not grab.GrabSucceeded():
+            grab = self.camera.RetrieveResult(
+                self.max_grab_ms,
+                pylon.TimeoutHandling_Return
+            )
+
+            if grab is None or not grab.GrabSucceeded():
                 return False, None
 
-            frame = grab.GetArray()  # <-- direkt raw (Bayer/Mono/etc.)
+            frame = grab.GetArray()
             return True, frame
+
+        except Exception as e:
+            print(f"⚠️ Basler grab failed: {e}")
+            return False, None
+
         finally:
-            grab.Release()
+            if grab is not None:
+                grab.Release()
+
 
     def read(self) -> Tuple[bool, Optional[np.ndarray]]:
         # raw grab
@@ -139,13 +149,14 @@ class BaslerSource:
         try:
             if self.camera.IsGrabbing():
                 self.camera.StopGrabbing()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"⚠️ StopGrabbing failed: {e}")
+
         try:
             if self.camera.IsOpen():
                 self.camera.Close()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"⚠️ Camera close failed: {e}")
 
     def getTemperatur(self, camera) -> str:
         try:
