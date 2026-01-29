@@ -90,11 +90,7 @@ class BaslerSource:
         except Exception:
             return str(Exception)
 
-
     def _grab_raw_once(self) -> Tuple[bool, Optional[np.ndarray]]:
-        """Einmalig raw Frame grabben (ohne Undistort)."""
-
-
         if self._closed or not self.camera.IsGrabbing():
             return False, None
 
@@ -102,41 +98,30 @@ class BaslerSource:
         try:
             grab = self.camera.RetrieveResult(1000, pylon.TimeoutHandling_Return)
             if grab is None:
-                # Timeout: einfach keine Frame diese Runde
-                return None
+                return False, None
 
-            # Manche pypylon-Versionen brauchen diese Valid-Checks
             if not grab.IsValid():
                 grab.Release()
-                return None
+                return False, None
 
             if not grab.GrabSucceeded():
-                # optional: Fehlerdetails
-                # print("Grab failed:", grab.GetErrorCode(), grab.GetErrorDescription())
                 grab.Release()
-                return None
+                return False, None
 
-            frame = grab.GetArray().copy()  # copy: wichtig, damit frame nicht an grab hängt
+            frame = grab.GetArray().copy()
             grab.Release()
-            return frame
+            return True, frame
 
         except Exception as e:
-            # genau deine Meldung landet hier, falls grab invalid war
+            print(f"⚠️ Basler grab failed: {e}")
             try:
                 if grab is not None:
                     grab.Release()
             except:
                 pass
-            print(f"⚠️ Basler grab failed: {e}")
-            return None
-
-        finally:
-            if grab is not None:
-                grab.Release()
-
+            return False, None
 
     def read(self) -> Tuple[bool, Optional[np.ndarray]]:
-        # raw grab
         ok, frame = self._grab_raw_once()
 
         if not ok or frame is None:
