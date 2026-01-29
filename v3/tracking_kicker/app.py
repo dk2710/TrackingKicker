@@ -6,11 +6,11 @@ from queue import Queue
 import threading
 from datetime import datetime
 import numpy as np
-import os
+import socket
+import struct
+
 from collections import deque
 
-
-HEADLESS = os.environ.get("HEADLESS", "0") == "1"
 REPLAY_SECONDS = 3
 
 replay_buffer = deque()          # enthält (frame, timestamp)
@@ -24,6 +24,7 @@ recording_queue = Queue()
 stop_event = threading.Event()
 record_event = threading.Event()
 
+from tracking_kicker.SocketJpegStreamer import SocketJpegStreamer
 from tracking_kicker.RawReplaySource import RawReplaySource
 from tracking_kicker.BaslerSource import BaslerSource
 from tracking_kicker.storage import JsonStore
@@ -60,12 +61,12 @@ class KickerApp:
     def _tune_distortion_on_single_frame(self, frame):
         if frame is None:
             return None
-        if not HEADLESS:
-            cv2.namedWindow("Distortion Preview", cv2.WINDOW_NORMAL)
+
+        #cv2.namedWindow("Distortion Preview", cv2.WINDOW_NORMAL)
 
         while True:
             corrected = self.dist.apply(frame)
-            cv2.imshow("Distortion Preview", corrected)
+            #cv2.imshow("Distortion Preview", corrected)
 
             key = cv2.waitKey(15) & 0xFF
             if key == 27:  # ESC
@@ -166,8 +167,8 @@ class KickerApp:
                 return
 
             frames = list(replay_buffer)
-        if not HEADLESS:
-            cv2.namedWindow("Replay (letzte 3 Sekunden)", cv2.WINDOW_NORMAL)
+
+        #cv2.namedWindow("Replay (letzte 3 Sekunden)", cv2.WINDOW_NORMAL)
 
         target_fps = 60
         target_dt = 1.0 / target_fps
@@ -193,7 +194,7 @@ class KickerApp:
             bgr = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
             bgr = bgr[:, :, [2, 1, 0]]
 
-            cv2.imshow("Replay (letzte 3 Sekunden)", bgr)
+            #cv2.imshow("Replay (letzte 3 Sekunden)", bgr)
             if cv2.waitKey(int(target_dt * 1000)) & 0xFF == 27:
                 break
 
@@ -364,7 +365,14 @@ class KickerApp:
             args=(recording_queue, stop_event, record_event),
             daemon=True
         )
+        streamer = SocketJpegStreamer(host="0.0.0.0", port=9999, jpeg_quality=75, send_fps=60)
+        t_stream = threading.Thread(
+            target=streamer.run,
+            args=(display_queue, stop_event),
+            daemon=True
+        )
 
+        t_stream.start()
         t_cam.start()
         t_proc.start()
         t_rec.start()
@@ -376,7 +384,7 @@ class KickerApp:
             except:
                 continue
 
-            cv2.imshow("Kicker Analyse", frame)
+            #cv2.imshow("Kicker Analyse", frame)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
