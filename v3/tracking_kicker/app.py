@@ -6,9 +6,11 @@ from queue import Queue
 import threading
 from datetime import datetime
 import numpy as np
-
+import os
 from collections import deque
 
+
+HEADLESS = os.environ.get("HEADLESS", "0") == "1"
 REPLAY_SECONDS = 3
 
 replay_buffer = deque()          # enthält (frame, timestamp)
@@ -58,8 +60,8 @@ class KickerApp:
     def _tune_distortion_on_single_frame(self, frame):
         if frame is None:
             return None
-
-        cv2.namedWindow("Distortion Preview", cv2.WINDOW_NORMAL)
+        if not HEADLESS:
+            cv2.namedWindow("Distortion Preview", cv2.WINDOW_NORMAL)
 
         while True:
             corrected = self.dist.apply(frame)
@@ -164,8 +166,8 @@ class KickerApp:
                 return
 
             frames = list(replay_buffer)
-
-        cv2.namedWindow("Replay (letzte 3 Sekunden)", cv2.WINDOW_NORMAL)
+        if not HEADLESS:
+            cv2.namedWindow("Replay (letzte 3 Sekunden)", cv2.WINDOW_NORMAL)
 
         target_fps = 60
         target_dt = 1.0 / target_fps
