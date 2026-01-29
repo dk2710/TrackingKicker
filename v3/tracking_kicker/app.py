@@ -7,6 +7,14 @@ import threading
 from datetime import datetime
 import numpy as np
 
+from collections import deque
+
+REPLAY_SECONDS = 3
+
+replay_buffer = deque()          # enthält (frame, timestamp)
+replay_lock = threading.Lock()
+
+
 frame_queue = Queue(maxsize=2)  # WICHTIG: klein halten
 display_queue = Queue(maxsize=1)
 recording_queue = Queue()
@@ -22,7 +30,7 @@ from tracking_kicker.detection import BallDetector
 from tracking_kicker.analysis import KickerAnalyzer
 from tracking_kicker.distoration import DistortionCorrector
 
-VIDEO_PATH = r"C:\Users\DKleis\PycharmProjects\TrackingKicker\v3\videos\session_raw_original.npz"
+VIDEO_PATH = r"C:\Users\DKleis\PycharmProjects\TrackingKicker\v3\videos\session_raw_2026-01-29_17-03-58.npz"
 lens_file = (Path(__file__).resolve().parents[1] / "lens_config.json").resolve()
 CALIBRATION_FILE = "table_calibration.json"
 
@@ -144,6 +152,15 @@ class KickerApp:
 
             n += 1
 
+            now = time.perf_counter()
+
+            with replay_lock:
+                replay_buffer.append((frame.copy(), now))
+
+                max_len = int(video.fps * REPLAY_SECONDS)
+                while len(replay_buffer) > max_len:
+                    replay_buffer.popleft()
+
             # Queue-Policy: keep-latest
             if rt_queue.full():
                 try:
@@ -176,6 +193,7 @@ class KickerApp:
         raw_frames = []
         raw_times = []
         recording = False
+        t_start = None
 
         while not stop_event.is_set():
 
@@ -186,6 +204,7 @@ class KickerApp:
                 print("▶️ RAW Recording gestartet")
                 raw_frames.clear()
                 raw_times.clear()
+                t_start = time.perf_counter()
                 recording = True
 
             # ⏹ STOP (Flanke)
@@ -205,6 +224,7 @@ class KickerApp:
                 raw_frames.clear()
                 raw_times.clear()
                 recording = False
+                t_start = None
 
             if not recording:
                 time.sleep(0.01)
@@ -217,7 +237,7 @@ class KickerApp:
                 continue
 
             raw_frames.append(frame.copy())
-            raw_times.append(time.perf_counter())
+            raw_times.append(time.perf_counter() - t_start)
 
     def _save_raw_async(self, frames, times):
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
