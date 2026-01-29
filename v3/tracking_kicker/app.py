@@ -408,46 +408,51 @@ class KickerApp:
         t_rec.start()
 
         print("⌨️  Taste 'r' = Aufnahme Start/Stop | ESC = Ende")
-        while not stop_event.is_set():
+
+        if HEADLESS:
+            print("🟢 HEADLESS=1 → keine OpenCV-GUI (kein imshow/waitKey). Stream läuft auf :9999")
             try:
-                frame = display_queue.get(timeout=0.5)
-            except:
-                continue
+                while not stop_event.is_set():
+                    time.sleep(0.2)
+            except KeyboardInterrupt:
+                pass
+        else:
+            while not stop_event.is_set():
+                try:
+                    frame = display_queue.get(timeout=0.5)
+                except:
+                    continue
 
-            gui_imshow("Kicker Analyse", frame)
-            key = gui_wait_key(1)
+                cv2.imshow("Kicker Analyse", frame)
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break
 
-            elif key == ord('k'):
-                print("KEY → Save Replay (letzte 3 Sekunden)")
-                threading.Thread(
-                    target=self.save_last_seconds_mp4,
-                    daemon=True
-                ).start()
+                elif key == ord('k'):
+                    print("KEY → Save Replay (letzte 3 Sekunden)")
+                    threading.Thread(
+                        target=self.save_last_seconds_mp4,
+                        daemon=True
+                    ).start()
 
-            if key == ord('r'):
-                if record_event.is_set():
-                    record_event.clear()
-                    print("KEY → Recording OFF")
-                else:
-                    record_event.set()
-                    print("KEY → Recording ON")
+                if key == ord('r'):
+                    if record_event.is_set():
+                        record_event.clear()
+                        print("KEY → Recording OFF")
+                    else:
+                        record_event.set()
+                        print("KEY → Recording ON")
 
-            elif key == ord('k'):
-                print("KEY → Replay letzte 3 Sekunden")
-                threading.Thread(
-                    target=self.play_last_seconds,
-                    daemon=True
-                ).start()
+                elif key == ord('k'):
+                    print("KEY → Replay letzte 3 Sekunden")
+                    threading.Thread(
+                        target=self.play_last_seconds,
+                        daemon=True
+                    ).start()
 
-
-
-            elif key == 27:  # ESC
-                break
-
+                elif key == 27:  # ESC
+                    break
 
         stop_event.set()
         record_event.clear()
@@ -457,8 +462,8 @@ class KickerApp:
         t_rec.join(timeout=1)
 
         self.video.release()
-        gui_destroy_all()
-
+        if not HEADLESS:
+            cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
