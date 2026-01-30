@@ -44,11 +44,16 @@ class KickerAnalyzer:
         # --- Goal confirmation: erst "pending", dann bestätigen wenn Ball 1s weg ist ---
         # Pending-Logik robuster
         self.goal_confirm_missing_frames = max(1, int(round(0.45 * self.fps)))  # 250ms statt 1s
-        self.goal_in_roi_confirm_frames = max(1, int(round(0.25 * self.fps)))  # ~80ms Ball im Tor reicht
+        self.goal_in_roi_confirm_frames = max(1, int(round(0.02 * self.fps)))  # ms Ball im Tor reicht
         self.pending_cancel_outside_frames = max(1, int(round(0.15 * self.fps)))  # 150ms außerhalb -> erst dann cancel
 
         self._pending_in_roi = 0
         self._pending_outside = 0
+
+        self._pending_side = None  # "left" | "right" | None
+        self._pending_start_time = 0.0
+        self._pending_seen_ball = False
+        self._goal_locked = False
 
         self.pending_goal_side: Optional[str] = None   # "left" / "right" / None
         self.pending_miss = 0                          # wie viele Frames Ball nicht erkannt wurde
@@ -124,151 +129,83 @@ class KickerAnalyzer:
 
     def _update_goals(
             self,
-            ball_mask: Optional[np.ndarray],
             ball: Optional[Tuple[int, int, int]],
             frame_shape
     ) -> Tuple[bool, bool]:
-        self._frame_idx += 1
 
         goalL = False
         goalR = False
+        now = time.perf_counter()
 
-        # Debug hold / peaks
-        if self._debug_hold > 0:
-            self._debug_hold -= 1
-        else:
-            self.peak_cntL = 0
-            self.peak_cntR = 0
+        # ----------------------------
+        # Ball-Lage bestimmen
+        # ----------------------------
+        inL = inR = False
+        in_field = False
 
-        # ---------------------------
-        # 1) Hit aus Maske (cnt/thr)
-        # ---------------------------
-        mask_hitL = False
-        mask_hitR = False
-
-        if ball_mask is not None:
-            cntL, thrL = self._goal_cnt_thr(ball_mask, "left")
-            cntR, thrR = self._goal_cnt_thr(ball_mask, "right")
-
-            mask_hitL = (cntL >= thrL)
-            mask_hitR = (cntR >= thrR)
-
-            # Debug speichern + Hold
-            self.last_cntL, self.last_thrL = cntL, thrL
-            self.last_cntR, self.last_thrR = cntR, thrR
-            self._debug_hold = self.debug_hold_frames
-
-            # Peaks
-            self.peak_cntL = max(self.peak_cntL, cntL)
-            self.peak_cntR = max(self.peak_cntR, cntR)
-        else:
-            self.last_cntL = self.last_thrL = 0
-            self.last_cntR = self.last_thrR = 0
-
-        # ---------------------------
-        # 2) Hit aus Ballposition (ROI)
-        # ---------------------------
-        ball_hitL = False
-        ball_hitR = False
         if ball is not None:
             x, y, _ = ball
-            ball_hitL = self._point_in_goal_roi(x, y, "left", frame_shape)
-            ball_hitR = self._point_in_goal_roi(x, y, "right", frame_shape)
+            inL = self._point_in_goal_roi(x, y, "left", frame_shape)
+            inR = self._point_in_goal_roi(x, y, "right", frame_shape)
+            in_field = not inL and not inR
 
-            # Optional: Richtung als Plausibilitätscheck (mit kleiner Deadzone!)
-            dead = 50.0  # px/s, ggf. anpassen
-            if self.vx_s > dead:
-                ball_hitL = False
-            if self.vx_s < -dead:
-                ball_hitR = False
+        # ----------------------------
+        # STATE: LOCKED
+        # → Warten bis Ball wieder im Feld ist
+        # ----------------------------
+        if self._goal_locked:
+            if in_field:
+                self._goal_locked = False
+            return False, False
 
-        hitL = mask_hitL or ball_hitL
-        hitR = mask_hitR or ball_hitR
+        # ----------------------------
+        # STATE: IDLE
+        # → Ball war im Tor → Pending starten
+        # ----------------------------
+        if self._pending_side is None:
+            if inL and not inR:
+                self._pending_side = "left"
+                self._pending_start_time = now
+                self._pending_seen_ball = True
+            elif inR and not inL:
+                self._pending_side = "right"
+                self._pending_start_time = now
+                self._pending_seen_ball = True
+            return False, False
 
-        # ---------------------------
-        # 3) Pending START (wenn keiner aktiv)
-        # ---------------------------
-        if self.pending_goal_side is None:
-            canL = (self._frame_idx - self._last_goal_L > self._cooldown_frames)
-            canR = (self._frame_idx - self._last_goal_R > self._cooldown_frames)
+        # ----------------------------
+        # STATE: PENDING
+        # ----------------------------
+        if ball is not None:
+            self._pending_seen_ball = True
 
-            if hitL and canL and (not hitR or not canR):
-                self.pending_goal_side = "left"
-                self.pending_miss = 0
-                self._pending_in_roi = 0
-                self._pending_outside = 0
+        # ❌ Ball kam zurück → abbrechen
+        if in_field:
+            self._pending_side = None
+            self._pending_seen_ball = False
+            return False, False
 
-            elif hitR and canR and (not hitL or not canL):
-                self.pending_goal_side = "right"
-                self.pending_miss = 0
-                self._pending_in_roi = 0
-                self._pending_outside = 0
+        # ⏱️ 1 Sekunde abgelaufen?
+        if (now - self._pending_start_time) >= 1.0:
+            if not self._pending_seen_ball:
+                # SAFETY (eigentlich unmöglich, aber sauber)
+                self._pending_side = None
+                return False, False
 
-            elif hitL and hitR and canL and canR:
-                # beide gleichzeitig -> nimm Ballposition als Entscheider
-                if ball is not None:
-                    x, y, _ = ball
-                    if self._point_in_goal_roi(x, y, "left", frame_shape):
-                        self.pending_goal_side = "left"
-                    elif self._point_in_goal_roi(x, y, "right", frame_shape):
-                        self.pending_goal_side = "right"
-                    else:
-                        self.pending_goal_side = "left"
-                else:
-                    self.pending_goal_side = "left"
-
-                self.pending_miss = 0
-                self._pending_in_roi = 0
-                self._pending_outside = 0
-
-        # ---------------------------
-        # 4) Pending UPDATE + CONFIRM
-        # ---------------------------
-        if self.pending_goal_side is not None:
-            if ball is None:
-                self.pending_miss += 1
-                self._pending_in_roi = 0
-                self._pending_outside = 0
+            # ✅ TOR
+            if self._pending_side == "left":
+                self.score_left += 1
+                goalL = True
             else:
-                x, y, _ = ball
-                inPending = self._point_in_goal_roi(x, y, self.pending_goal_side, frame_shape)
+                self.score_right += 1
+                goalR = True
 
-                if inPending:
-                    self._pending_in_roi += 1
-                    self._pending_outside = 0
-                    self.pending_miss = 0
-                else:
-                    self._pending_outside += 1
-                    self._pending_in_roi = 0
-                    self.pending_miss = 0
+            # 🔒 Lock aktivieren
+            self._goal_locked = True
 
-                    if self._pending_outside >= self.pending_cancel_outside_frames:
-                        self.pending_goal_side = None
-                        self.pending_miss = 0
-                        self._pending_in_roi = 0
-                        self._pending_outside = 0
-
-            confirm = (
-                    self.pending_goal_side is not None and (
-                    self.pending_miss >= self.goal_confirm_missing_frames or
-                    self._pending_in_roi >= self.goal_in_roi_confirm_frames
-            )
-            )
-
-            if confirm:
-                if self.pending_goal_side == "left":
-                    self.score_left += 1
-                    self._last_goal_L = self._frame_idx
-                    goalL = True
-                else:
-                    self.score_right += 1
-                    self._last_goal_R = self._frame_idx
-                    goalR = True
-
-                self.pending_goal_side = None
-                self.pending_miss = 0
-                self._pending_in_roi = 0
-                self._pending_outside = 0
+            # Reset
+            self._pending_side = None
+            self._pending_seen_ball = False
 
         return goalL, goalR
 
@@ -286,7 +223,7 @@ class KickerAnalyzer:
 
         cv2.arrowedLine(frame, (x, y), (x2, y2), (0, 255, 0), 3, tipLength=0.3)
 
-    def draw_overlay(self, frame, ball, ball_mask=None, draw_goal_boxes=False):
+    def draw_overlay(self, frame, ball, ball_mask=None, draw_goal_boxes=False)-> bool:
         h, w = frame.shape[:2]
 
         # Tor-ROIs optional zeichnen
@@ -304,17 +241,9 @@ class KickerAnalyzer:
             x, y, r = ball
             self._update_motion(x, y)  # <-- nach oben ziehen
 
-        goalL, goalR = self._update_goals(ball_mask, ball, frame.shape)
+        goalL, goalR = self._update_goals(ball, frame.shape)
 
-        # ... später NICHT nochmal self._update_motion(x,y) aufrufen
 
-        # Torerkennung über Maske
-        goalL, goalR = self._update_goals(ball_mask, ball, frame.shape)
-
-        cv2.putText(frame, f"GoalMask L: {self.last_cntL}/{self.last_thrL}  peak:{self.peak_cntL}",
-                    (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-        cv2.putText(frame, f"GoalMask R: {self.last_cntR}/{self.last_thrR}  peak:{self.peak_cntR}",
-                    (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
 
         # Ball zeichnen + Bewegung nur wenn Ball vorhanden
         if ball is not None:
@@ -367,9 +296,14 @@ class KickerAnalyzer:
         if goalL:
             cv2.putText(frame, "GOAL LEFT", (w // 2 - 130, 110),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.3, (0, 0, 255), 4)
+            return goalL
+
         if goalR:
             cv2.putText(frame, "GOAL RIGHT", (w // 2 - 150, 110),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.3, (255, 0, 0), 4)
+            return goalR
+
+        return False
 
     def _ensure_homography(self, frame_shape) -> None:
         if self.field_cfg is None or self.H_img2cm is not None:

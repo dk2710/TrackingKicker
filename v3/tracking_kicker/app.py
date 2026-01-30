@@ -161,6 +161,7 @@ class KickerApp:
                 continue
 
             bgr = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
+
             meas = detector.detect(bgr)
             overlay = bgr.copy()
 
@@ -177,7 +178,8 @@ class KickerApp:
                 last_log = now
                 n = 0
 
-            analyzer.draw_overlay(overlay, meas)
+            if(analyzer.draw_overlay(overlay, meas) == True):
+                self.play_last_seconds()
 
             # keep-latest policy
             if display_queue.full():
@@ -196,12 +198,12 @@ class KickerApp:
             frames = list(replay_buffer)
 
         if HEADLESS:
-            print("⚠️ HEADLESS=1 → Replay GUI nicht möglich.")
+
             return
 
         gui_named_window("Replay (letzte 3 Sekunden)")
 
-        target_fps = 60
+        target_fps = 120
         target_dt = 1.0 / target_fps
 
         t_start = frames[0][1]
@@ -233,7 +235,7 @@ class KickerApp:
     def camera_loop(self, video, rt_queue, rec_queue, stop_event):
         t0 = time.perf_counter()
         last_log = t0
-
+        host_fps = 0
         n = 0
         dropped = 0
 
@@ -252,12 +254,6 @@ class KickerApp:
 
             now = time.perf_counter()
 
-            with replay_lock:
-                replay_buffer.append((frame.copy(), now))
-
-                max_len = int(video.fps * REPLAY_SECONDS)
-                while len(replay_buffer) > max_len:
-                    replay_buffer.popleft()
 
             if rt_queue.full():
                 try:
@@ -283,6 +279,16 @@ class KickerApp:
                 last_log = now
                 n = 0
                 dropped = 0
+
+            with replay_lock:
+
+
+                replay_buffer.append((frame.copy(), now))
+
+                max_len = int(host_fps * REPLAY_SECONDS)
+                while len(replay_buffer) > max_len:
+                    replay_buffer.popleft()
+
 
     def save_last_seconds_mp4(self):
         with replay_lock:
