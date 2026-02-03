@@ -4,9 +4,11 @@ import numpy as np
 import time as time
 from typing import Any, Dict, Optional, Tuple
 
+from tracking_kicker.model.Vision import FieldConfig, GoalsConfig
+
 
 class KickerAnalyzer:
-    def __init__(self, goals_cfg: Dict[str, Any], field_cfg: Optional[Dict[str, Any]] = None):
+    def __init__(self, goals_cfg: GoalsConfig, field_cfg: FieldConfig | None = None):
 
         self.fps = 0.0
         self.goals_cfg = goals_cfg

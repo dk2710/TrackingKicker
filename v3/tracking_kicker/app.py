@@ -142,8 +142,8 @@ class KickerApp:
     def processing_loop(self, in_queue, display_queue, stop_event):
         detector = BallDetector(debug=False)
         analyzer = KickerAnalyzer(
-            goals_cfg=self.cfg["goals"],
-            field_cfg=self.cfg.get("field"),
+            goals_cfg=config.vision.goals,
+            field_cfg=config.vision.field,
         )
         t0 = time.perf_counter()
         last_log = t0
