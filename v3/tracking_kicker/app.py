@@ -19,6 +19,7 @@ from detection import BallDetector
 from analysis import KickerAnalyzer
 from distoration import DistortionCorrector
 from model.VisionConfig import VisionConfig
+from v3.tracking_kicker.ui.distortion_tuner import DistortionTunerUI
 
 vision = VisionConfig.load()
 
@@ -36,7 +37,6 @@ stop_event = threading.Event()
 record_event = threading.Event()
 
 VIDEO_PATH = config.videos_dir / "session_raw_2026-01-30_15-30-18.npz"
-lens_file = config.config_path
 
 #Analysevideo
 Analyse_Video_Path = (Path(__file__).resolve().parents[1] / "videos").resolve()
@@ -71,9 +71,10 @@ class KickerApp:
         self.video = source
         self.cfg: Optional[Dict[str, Any]]
 
-        self.dist = DistortionCorrector(config_path=lens_file)
+        self.dist = DistortionCorrector(config.camera)
 
-        print(f"📁 Verzerrung config: {lens_file}")
+
+        print(f"📁 Verzerrung config: {config.camera}")
         print(f"🎥 FPS erkannt: {self.video.fps:.3f}")
         cv2.setUseOptimized(True)
 
@@ -82,48 +83,49 @@ class KickerApp:
         mode = input("1 = Neue Gesamtkalibrierung | 2 = Laden: ").strip()
         return mode == "1"
 
-    def _tune_distortion_on_single_frame(self, frame):
-        if frame is None:
-            return None
-
+    def tune_distortion_live(self):
         if HEADLESS:
-            print("⚠️ HEADLESS=1 → Distortion Tuning GUI nicht möglich. Abbruch.")
-            return None
+            print("❌ HEADLESS → kein Distortion UI")
+            return
 
-        gui_named_window("Distortion Preview")
+        ret, frame = self.video.read()
+        if not ret or frame is None:
+            print("❌ Kein Frame verfügbar")
+            return
+
+        ui = DistortionTunerUI(self.dist.camera)
 
         while True:
+            ui.update_camera_if_needed()
+
             corrected = self.dist.apply(frame)
-            gui_imshow("Distortion Preview", corrected)
+            cv2.imshow("Distortion Tuning", corrected)
 
-            key = gui_wait_key(15)
-            if key == 27:  # ESC
-                gui_destroy_window("Distortion Preview")
-                return None
-
+            key = cv2.waitKey(15) & 0xFF
+            if key == 27:
+                break
             if key == ord("s"):
-                # self.dist.save()
-                gui_destroy_window("Distortion Preview")
-                return corrected
+                ui.save_to_config(config.config_path)
+
+        cv2.destroyWindow("Distortion Tuning")
 
     def _load_or_calibrate(self) -> None:
         do_calibration = self._get_start_mode()
 
         if do_calibration:
-            print("✅ Kalibrierung gestartet:")
-            ret, first_frame = self.video.read()
-            bgr = cv2.cvtColor(first_frame, cv2.COLOR_BayerRG2BGR)
+            # 🔹 Distortion LIVE tunen (ändert self.dist.camera)
+            self.tune_distortion_live()
 
+            # 🔹 danach ein frisches Frame holen
+            ret, frame = self.video.read()
+            if not ret or frame is None:
+                raise RuntimeError("❌ Kein Frame nach Distortion-Tuning")
 
-            if (not ret) or (bgr is None):
-                raise RuntimeError("❌ Kein Frame aus der Quelle lesbar.")
-
-            tuned_frame = self._tune_distortion_on_single_frame(bgr)
-            if tuned_frame is None:
-                raise RuntimeError("❌ Verzerrung abgebrochen.")
+            bgr = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
+            bgr = self.dist.apply(bgr)  # 🔥 HIER ist die Verzerrung aktiv
 
             pipeline = CalibrationPipeline()
-            self.cfg = pipeline.run(tuned_frame)
+            self.cfg = pipeline.run(bgr)
             vision.save()
 
             print("✅ Kalibrierung gespeichert:", str(vision.DEFAULT_PATH))
