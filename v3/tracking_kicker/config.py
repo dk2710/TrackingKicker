@@ -5,8 +5,6 @@ import json
 from typing import Any, Dict
 from dataclasses import asdict, fields
 from v3.tracking_kicker.model.Camera import Camera
-from tracking_kicker.model.Vision import GoalsConfig, FieldConfig, GoalROI, FieldSize
-from tracking_kicker.model.VisionConfig import VisionConfig
 
 
 @dataclass
@@ -22,10 +20,8 @@ class AppConfig:
     use_camera: bool = True
     debug_video: str | None = None
 
-    vision: VisionConfig | None = None
-
     # === Paths ===
-    base_dir: Path = field(default_factory=lambda: Path(__file__).resolve().parents[1])
+    base_dir: Path = field(default_factory=lambda: Path(__file__).resolve().parents[0])
     config_path: Path = field(init=False)
     videos_dir: Path = field(init=False)
 
@@ -51,28 +47,7 @@ class AppConfig:
         cam_data = data.pop("camera", None)
         camera = Camera(**cam_data) if cam_data else None
 
-        # Vision
-        goals_raw = data.pop("goals", None)
-        field_raw = data.pop("field", None)
-
-        vision = None
-        if goals_raw:
-            vision = VisionConfig(
-                goals=GoalsConfig(
-                    left=GoalROI(**goals_raw["left"]),
-                    right=GoalROI(**goals_raw["right"]),
-                ),
-                field=FieldConfig(
-                    size_cm=FieldSize(**field_raw["size_cm"]),
-                    corners_norm=field_raw["corners_norm"],
-                ) if field_raw else None
-            )
-
-        # 🔒 FILTER
-        allowed = {f.name for f in fields(cls) if f.init}
-        data = {k: v for k, v in data.items() if k in allowed}
-
-        return cls(camera=camera, vision=vision, **data)
+        return cls(camera=camera, **data)
 
     def save(self, path: Path | None = None):
         path = path or self.config_path

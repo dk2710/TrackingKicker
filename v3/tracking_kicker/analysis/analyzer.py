@@ -4,7 +4,7 @@ import numpy as np
 import time as time
 from typing import Any, Dict, Optional, Tuple
 
-from tracking_kicker.model.Vision import FieldConfig, GoalsConfig
+from v3.tracking_kicker.model.Vision import FieldConfig, GoalsConfig
 
 
 class KickerAnalyzer:
@@ -34,6 +34,8 @@ class KickerAnalyzer:
         self._pending_seen_ball = False
         self._goal_locked = False
 
+        #Zeitmessung
+        self._last_t: float | None = None
 
         self.field_cfg = field_cfg
         self.H_img2cm = None
@@ -158,11 +160,11 @@ class KickerAnalyzer:
         # Tor-ROIs optional zeichnen
         if draw_goal_boxes:
             for side, color in [("left", (0, 0, 255)), ("right", (255, 0, 0))]:
-                g = self.goals_cfg[side]
-                x0 = int(g["x0"] * w);
-                y0 = int(g["y0"] * h)
-                x1 = int(g["x1"] * w);
-                y1 = int(g["y1"] * h)
+                g = self.goals_cfg.left if side == "left" else self.goals_cfg.right
+                x0 = int(g.x0 * w)
+                y0 = int(g.y0 * h)
+                x1 = int(g.x1 * w)
+                y1 = int(g.y1 * h)
                 cv2.rectangle(frame, (x0, y0), (x1, y1), color, 4)
 
         goalL, goalR = self._update_goals(ball, frame.shape)
@@ -239,9 +241,9 @@ class KickerAnalyzer:
             return
 
         h, w = frame_shape[:2]
-        corners_norm = self.field_cfg["corners_norm"]  # [OL, OR, UR, UL]
-        fw = float(self.field_cfg["size_cm"]["w"])
-        fh = float(self.field_cfg["size_cm"]["h"])
+        corners_norm = self.field_cfg.corners_norm  # [OL, OR, UR, UL]
+        fw = float(self.field_cfg.size_cm.w)
+        fh = float(self.field_cfg.size_cm.h)
 
         src = np.array([[cn[0] * w, cn[1] * h] for cn in corners_norm], dtype=np.float32)
         dst = np.array([[0.0, 0.0], [fw, 0.0], [fw, fh], [0.0, fh]], dtype=np.float32)
@@ -257,10 +259,15 @@ class KickerAnalyzer:
 
     def _point_in_goal_roi(self, x: int, y: int, side: str, frame_shape) -> bool:
         h, w = frame_shape[:2]
-        g = self.goals_cfg[side]
+        if side == "left":
+            g = self.goals_cfg.left
+        elif side == "right":
+            g = self.goals_cfg.right
+        else:
+            raise ValueError(f"Unknown goal side: {side}")
 
-        x0 = int(g["x0"] * w); y0 = int(g["y0"] * h)
-        x1 = int(g["x1"] * w); y1 = int(g["y1"] * h)
+        x0 = int(g.x0 * w); y0 = int(g.y0 * h)
+        x1 = int(g.x1 * w); y1 = int(g.y1 * h)
 
         xmin, xmax = sorted((x0, x1))
         ymin, ymax = sorted((y0, y1))

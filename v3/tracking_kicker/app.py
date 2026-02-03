@@ -18,8 +18,12 @@ from calibration import CalibrationPipeline
 from detection import BallDetector
 from analysis import KickerAnalyzer
 from distoration import DistortionCorrector
+from model.VisionConfig import VisionConfig
+
+vision = VisionConfig.load()
 
 config = AppConfig.load()
+
 replay_buffer = deque()          # enthält (frame, timestamp)
 replay_lock = threading.Lock()
 
@@ -31,7 +35,7 @@ recording_queue = Queue()
 stop_event = threading.Event()
 record_event = threading.Event()
 
-VIDEO_PATH = config.videos_dir / "session_raw_2026-01-29_17-03-58.npz"
+VIDEO_PATH = config.videos_dir / "session_raw_2026-01-30_15-30-18.npz"
 lens_file = config.config_path
 
 #Analysevideo
@@ -120,8 +124,9 @@ class KickerApp:
 
             pipeline = CalibrationPipeline()
             self.cfg = pipeline.run(tuned_frame)
-            JsonStore.save(str(config.config_path), self.cfg)
-            print("✅ Kalibrierung gespeichert:", str(config.config_path))
+            vision.save()
+
+            print("✅ Kalibrierung gespeichert:", str(vision.DEFAULT_PATH))
 
 
 
@@ -142,8 +147,8 @@ class KickerApp:
     def processing_loop(self, in_queue, display_queue, stop_event):
         detector = BallDetector(debug=False)
         analyzer = KickerAnalyzer(
-            goals_cfg=config.vision.goals,
-            field_cfg=config.vision.field,
+            goals_cfg=vision.goals,
+            field_cfg=vision.field,
         )
         t0 = time.perf_counter()
         last_log = t0
