@@ -6,9 +6,9 @@ from typing import Any, Dict, Optional, Tuple
 
 
 class KickerAnalyzer:
-    def __init__(self, fps: float, goals_cfg: Dict[str, Any], field_cfg: Optional[Dict[str, Any]] = None):
+    def __init__(self, goals_cfg: Dict[str, Any], field_cfg: Optional[Dict[str, Any]] = None):
 
-        self.fps = float(fps)
+        self.fps = 0.0
         self.goals_cfg = goals_cfg
 
         # Ball motion (nur aus Messungen!)
@@ -26,61 +26,11 @@ class KickerAnalyzer:
         self.score_left = 0
         self.score_right = 0
 
-        # Goal detection tuning
-        self.goal_min_px = 20        # runter = sensibler
-        self.goal_min_ratio = 0.0015 # runter = sensibler
-
-        # Robustheit gegen "nur 1 Frame im Tor"
-        self._accL = 0
-        self._accR = 0
-        self._acc_decay = 0.6   # 0..1, höher = länger "merken"
-        self._frame_idx = 0
-        self._cooldown_frames = max(1, int(round(1 * self.fps)))  # 0.5s cooldown
-        self._last_goal_L = -10**9
-        self._last_goal_R = -10**9
-        self._in_goal_L = False
-        self._in_goal_R = False
-
-        # --- Goal confirmation: erst "pending", dann bestätigen wenn Ball 1s weg ist ---
-        # Pending-Logik robuster
-        self.goal_confirm_missing_frames = max(1, int(round(0.45 * self.fps)))  # 250ms statt 1s
-        self.goal_in_roi_confirm_frames = max(1, int(round(0.02 * self.fps)))  # ms Ball im Tor reicht
-        self.pending_cancel_outside_frames = max(1, int(round(0.15 * self.fps)))  # 150ms außerhalb -> erst dann cancel
-
-        self._pending_in_roi = 0
-        self._pending_outside = 0
 
         self._pending_side = None  # "left" | "right" | None
         self._pending_start_time = 0.0
         self._pending_seen_ball = False
         self._goal_locked = False
-
-        self.pending_goal_side: Optional[str] = None   # "left" / "right" / None
-        self.pending_miss = 0                          # wie viele Frames Ball nicht erkannt wurde
-        self.pending_started_frame = -10**9            # Frame-Index, wann pending gestartet wurde
-
-        # optional: cooldown lieber auch ~1s, damit nichts doppelt zählt
-        self._cooldown_frames = max(self._cooldown_frames, self.goal_confirm_missing_frames)
-
-
-        # Debug: cnt/thr pro Seite anzeigen
-        self.last_cntL = 0
-        self.last_thrL = 0
-        self.last_cntR = 0
-        self.last_thrR = 0
-
-        # Debug Anzeige "festhalten" (damit man schnelle Tore ablesen kann)
-        self.debug_hold_frames = int(round(2.0 * self.fps))  # 2 Sekunden halten
-        self._debug_hold = 0
-
-        # Peak innerhalb der Hold-Phase (hilft bei 1-Frame-Treffern)
-        self.peak_cntL = 0
-        self.peak_cntR = 0
-
-
-        # Pixel-Accumulator statt 0/1 Hits (hilft bei schnellen Toren)
-        self._accL_px = 0.0
-        self._accR_px = 0.0
 
 
         self.field_cfg = field_cfg
@@ -95,7 +45,6 @@ class KickerAnalyzer:
 
             inst_vx = dx * self.fps
             inst_vy = dy * self.fps
-
             inst_speed = math.hypot(inst_vx, inst_vy)
 
             a = 0.2
@@ -104,28 +53,6 @@ class KickerAnalyzer:
             self.speed_s = (1 - a) * self.speed_s + a * inst_speed
 
         self.prev_xy = (x, y)
-
-    def _goal_cnt_thr(self, ball_mask: np.ndarray, side: str) -> Tuple[int, int]:
-        h, w = ball_mask.shape[:2]
-        g = self.goals_cfg[side]
-
-        x0 = int(g["x0"] * w);
-        y0 = int(g["y0"] * h)
-        x1 = int(g["x1"] * w);
-        y1 = int(g["y1"] * h)
-
-        x0, x1 = sorted((max(0, x0), min(w, x1)))
-        y0, y1 = sorted((max(0, y0), min(h, y1)))
-
-        if x1 <= x0 or y1 <= y0:
-            return 0, 10 ** 9
-
-        roi = ball_mask[y0:y1, x0:x1]
-        cnt = int(cv2.countNonZero(roi))
-        area = int(roi.size)
-
-        thr = max(self.goal_min_px, int(self.goal_min_ratio * area))
-        return cnt, thr
 
     def _update_goals(
             self,
@@ -236,14 +163,7 @@ class KickerAnalyzer:
                 y1 = int(g["y1"] * h)
                 cv2.rectangle(frame, (x0, y0), (x1, y1), color, 4)
 
-        # VOR goal detection:
-        if ball is not None:
-            x, y, r = ball
-            self._update_motion(x, y)  # <-- nach oben ziehen
-
         goalL, goalR = self._update_goals(ball, frame.shape)
-
-
 
         # Ball zeichnen + Bewegung nur wenn Ball vorhanden
         if ball is not None:
@@ -251,6 +171,13 @@ class KickerAnalyzer:
 
             # Homography (für km/h) vorbereiten
             self._ensure_homography(frame.shape)
+
+            now = time.perf_counter()
+            if self._last_t is not None:
+                dt = now - self._last_t
+                if dt > 0:
+                    self.fps = 1.0 / dt
+            self._last_t = now
 
             # Pixel-Speed/Richtung
             self._update_motion(x, y)

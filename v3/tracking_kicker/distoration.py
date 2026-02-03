@@ -11,7 +11,7 @@ import cv2
 
 @dataclass
 class DistortionParams:
-    k1: float = -0.20
+    k1: float = 0.00
     k2: float = 0.05
     k3: float = 0.00
     p1: float = 0.00

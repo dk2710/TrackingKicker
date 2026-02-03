@@ -1,94 +1,50 @@
-import time
+from __future__ import annotations
 from typing import Optional, Tuple, Dict
-
-import cv2
+import time
 import numpy as np
 from pypylon import pylon, genicam
 
-
-DISTORTION_CFG = {
-    "k1": -0.167,
-    "k2": 0.05,
-    "k3": -0.005,
-    "p1": 0.014,
-    "p2": 0.005,
-    "scale": 1.12
-}
+from v3.tracking_kicker.model.Camera import Camera
 
 
 class BaslerSource:
     def __init__(
         self,
-        fps_hint: float = 0,
-        max_grab_ms: int = 5000,
-        latest_only: bool = False,
-        force_fps: float = None,
+        cfg: Camera
     ):
-        self.max_grab_ms = max_grab_ms
-        self._closed = False
-
-        #Für FPS Logs
-        self._t0 = time.time()
-        self._n = 0
-        self._fps_host = 0.0
+        self.cfg = cfg
+        self._closed = False # Dafür da um die Kamera zu stoppen
 
         # --- Basler öffnen ---
         factory = pylon.TlFactory.GetInstance()
         device = factory.CreateFirstDevice()
         self.camera = pylon.InstantCamera(device)
         self.camera.Open()
+        # nach Open(), vor StartGrabbing()
+        self.camera.ExposureAuto.Value = "Off"
+        self.camera.PixelFormat.Value = "BayerRG8"
+        self.camera.GainAuto.Value = "Off"
+        # nach Open(), vor StartGrabbing()
+        #self.try_set(self.camera, "ExposureAuto", "Off")
+        self.try_set(self.camera, "GainAuto", "Off")
 
-        self.logging(self.camera)
-
-        self.camera.Height.Value = 650
-        self.camera.OffsetY.Value = 266
-
-        self.camera.Width.Value = 1100
-        self.camera.OffsetX.Value = 240
-
-
-        print(f"✅ Basler geöffnet: {self.camera.GetDeviceInfo().GetModelName()}")
-
-
-        if force_fps is not None:
-            # Setzen (wenn Nodes existieren)
-            self.try_set(self.camera, "AcquisitionFrameRateEnable", True)
-            self.try_set(self.camera, "AcquisitionFrameRate", float(force_fps))
-
-        # Immer: nur lesen (Diagnose)
-        fps_res = self.try_get(self.camera, "BslResultingAcquisitionFrameRate")
-        if fps_res is None:
-            fps_res = self.try_get(self.camera, "ResultingFrameRate")
-
-        print("➡️ Resulting FPS:", fps_res)
-
-        # FPS lesen
-        self.fps = fps_hint
-        try:
-            if hasattr(self.camera, "ResultingFrameRate"):
-                v = float(self.camera.ResultingFrameRate.GetValue())
-                if v > 0:
-                    self.fps = v
-        except Exception:
-            pass
-
-        print(f"{self.getTemperatur(self.camera)}")
+        self.try_set(self.camera, "ExposureTime", cfg.camera.exposure_time)  # 8 ms (sichtbar)
+        # optional etwas Gain, wenn nötig:
+        self.try_set(self.camera, "Gain", cfg.camera.exposure_gain.lue)
 
 
-        strategy = pylon.GrabStrategy_LatestImageOnly if True else pylon.GrabStrategy_OneByOne
+        self.camera.Height.Value = cfg.camera.Height
+        self.camera.OffsetY.Value = cfg.camera.offset_y
+
+        self.camera.Width.Value = cfg.camera.width
+        self.camera.OffsetX.Value = cfg.camera.offset_x
+
+        strategy = pylon.GrabStrategy_LatestImageOnly
         self.camera.StartGrabbing(strategy)
         time.sleep(0.05)
+        self.loggingonce(self.camera)
 
 #------------------------------------------------ --------------------------------------------------------------------------------
-    def showfps(self) -> str:
-        try:
-            if hasattr(self.camera, "ResultingFrameRate"):
-                v = float(self.camera.ResultingFrameRate.GetValue())
-                if v > 0:
-                    self.fps = v
-                    return str(self.fps)
-        except Exception:
-            return str(Exception)
 
     def _grab_raw_once(self) -> Tuple[bool, Optional[np.ndarray]]:
         if self._closed or not self.camera.IsGrabbing():
@@ -186,34 +142,21 @@ class BaslerSource:
             return None
 
 
-    def host_fps_tick(self) -> float:
-        # im __init__ setzen:
-        # self._t0 = time.time(); self._n = 0; self._fps_host = 0.0
-        self._n += 1
-        now = time.time()
-        dt = now - self._t0
-        if dt >= 1.0:
-            self._fps_host = self._n / dt
-            self._n = 0
-            self._t0 = now
-        return self._fps_host
-
-
-
 
     def logging(self, cam):
-        # nach Open(), vor StartGrabbing()
-        cam.ExposureAuto.Value = "Off"
-        cam.PixelFormat.Value = "BayerRG8"
-        cam.GainAuto.Value = "Off"
-        # nach Open(), vor StartGrabbing()
-        self.try_set(cam, "ExposureAuto", "Off")
-        self.try_set( cam,"GainAuto", "Off")
+        try:
+            if hasattr(self.camera, "ResultingFrameRate"):
+                v = float(self.camera.ResultingFrameRate.GetValue())
+                if v > 0:
+                    self.fps = v
+                    print("FPS:", v)
+        except Exception:
+            pass
+        print("Temperatur:", {self.getTemperatur(self.camera)})
+        return str(self.fps)
 
-        self.try_set(cam, "ExposureTime", 4000.0)  # 8 ms (sichtbar)
-        # optional etwas Gain, wenn nötig:
-        self.try_set(cam, "Gain", 5.0)
-
+    def loggingonce(self, cam):
+        print(f"✅ Basler geöffnet: {self.camera.GetDeviceInfo().GetModelName()}")
         print("ExposureTime:", self.try_get(self.camera, "ExposureTime"))
         print("Gain:", self.try_get(self.camera, "Gain"))
         print("Resulting FPS:", cam.BslResultingAcquisitionFrameRate.Value)
@@ -231,7 +174,6 @@ class BaslerSource:
         # nach cam.Open()
         print("PixelFormat:", self.try_get(cam, "PixelFormat"))
         print("PixelColorFilter:", self.try_get(cam, "PixelColorFilter"))  # z.B. "BayerRG", "BayerBG", ...
-
 
 
 

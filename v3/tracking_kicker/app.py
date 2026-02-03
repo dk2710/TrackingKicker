@@ -6,13 +6,20 @@ from queue import Queue
 import threading
 from datetime import datetime
 import numpy as np
-import socket
-import struct
 
 from collections import deque
 
-REPLAY_SECONDS = 3
+from v3.tracking_kicker.config import AppConfig
+from SocketJpegStreamer import SocketJpegStreamer
+from RawReplaySource import RawReplaySource
+from BaslerSource import BaslerSource
+from storage import JsonStore
+from calibration import CalibrationPipeline
+from detection import BallDetector
+from analysis import KickerAnalyzer
+from distoration import DistortionCorrector
 
+config = AppConfig.load()
 replay_buffer = deque()          # enthält (frame, timestamp)
 replay_lock = threading.Lock()
 
@@ -24,18 +31,8 @@ recording_queue = Queue()
 stop_event = threading.Event()
 record_event = threading.Event()
 
-from tracking_kicker.SocketJpegStreamer import SocketJpegStreamer
-from tracking_kicker.RawReplaySource import RawReplaySource
-from tracking_kicker.BaslerSource import BaslerSource
-from tracking_kicker.storage import JsonStore
-from tracking_kicker.calibration import CalibrationPipeline
-from tracking_kicker.detection import BallDetector
-from tracking_kicker.analysis import KickerAnalyzer
-from tracking_kicker.distoration import DistortionCorrector
-
-VIDEO_PATH = r"C:\Users\DKleis\PycharmProjects\TrackingKicker\v3\videos\session_raw_2026-01-29_17-03-58.npz"
-lens_file = (Path(__file__).resolve().parents[1] / "lens_config.json").resolve()
-CALIBRATION_FILE = "table_calibration.json"
+VIDEO_PATH = config.videos_dir / "session_raw_2026-01-29_17-03-58.npz"
+lens_file = config.config_path
 
 #Analysevideo
 Analyse_Video_Path = (Path(__file__).resolve().parents[1] / "videos").resolve()
@@ -66,10 +63,9 @@ def gui_destroy_all():
         cv2.destroyAllWindows()
 
 class KickerApp:
-    def __init__(self, source, calibration_path: str):
+    def __init__(self, source):
         self.video = source
-        self.calibration_path = calibration_path
-        self.cfg: Optional[Dict[str, Any]] = None
+        self.cfg: Optional[Dict[str, Any]]
 
         self.dist = DistortionCorrector(config_path=lens_file)
 
@@ -124,21 +120,21 @@ class KickerApp:
 
             pipeline = CalibrationPipeline()
             self.cfg = pipeline.run(tuned_frame)
-            JsonStore.save(self.calibration_path, self.cfg)
-            print("✅ Kalibrierung gespeichert:", self.calibration_path)
+            JsonStore.save(str(config.config_path), self.cfg)
+            print("✅ Kalibrierung gespeichert:", str(config.config_path))
 
 
 
         else:
 
-            cfg = JsonStore.load(self.calibration_path)
+            cfg = JsonStore.load(str(config.config_path))
 
             if cfg is None:
-                raise RuntimeError(f"❌ Kalibrierungsdatei nicht gefunden: {self.calibration_path}")
+                raise RuntimeError(f"❌ Kalibrierungsdatei nicht gefunden: {str(config.config_path)}")
 
             self.cfg = cfg
 
-            print("📁 Kalibrierung geladen:", self.calibration_path)
+            print("📁 Kalibrierung geladen:", str(config.config_path))
 
 
         self.video.reset()
@@ -146,7 +142,6 @@ class KickerApp:
     def processing_loop(self, in_queue, display_queue, stop_event):
         detector = BallDetector(debug=False)
         analyzer = KickerAnalyzer(
-            fps=0,
             goals_cfg=self.cfg["goals"],
             field_cfg=self.cfg.get("field"),
         )
@@ -285,7 +280,7 @@ class KickerApp:
 
                 replay_buffer.append((frame.copy(), now))
 
-                max_len = int(host_fps * REPLAY_SECONDS)
+                max_len = int(host_fps * config.replay_seconds)
                 while len(replay_buffer) > max_len:
                     replay_buffer.popleft()
 
@@ -480,21 +475,19 @@ class KickerApp:
 
 if __name__ == "__main__":
 
-    USE_CAMERA = True
 
-
-    if USE_CAMERA:
+    if config.use_camera:
         try:
-            source = BaslerSource( latest_only=False)
+            source = BaslerSource(config.camera)
             print("📷 Quelle: Basler Kamera")
         except Exception as e:   # ✅ fängt auch _genicam.RuntimeException
             print(f"❌ Kamera nicht verfügbar: {e}")
             print("➡️ Fallback auf VideoSource…")
-            source = RawReplaySource(VIDEO_PATH)
+            source = RawReplaySource(str(VIDEO_PATH))
     else:
-        source = RawReplaySource(VIDEO_PATH)
+        source = RawReplaySource(str(VIDEO_PATH))
 
-    app = KickerApp(source, CALIBRATION_FILE)
+    app = KickerApp(source)
     app.run()
 
 
