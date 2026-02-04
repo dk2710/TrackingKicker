@@ -5,6 +5,8 @@ import time as time
 from typing import Any, Dict, Optional, Tuple
 
 from v3.tracking_kicker.model.Vision import FieldConfig, GoalsConfig
+from v3.tracking_kicker.analysis.rod_control import RodControlTracker
+
 
 
 class KickerAnalyzer:
@@ -37,10 +39,18 @@ class KickerAnalyzer:
         #Zeitmessung
         self._last_t: float | None = None
 
+
+        #Bereicherkennung
         self.field_cfg = field_cfg
+        self.rod_control = None
         self.H_img2cm = None
         self.prev_world = None
         self.speed_kmh_s = 0.0
+
+        if self.field_cfg is not None and getattr(self.field_cfg, "rods", None) is not None:
+            self.rod_control = RodControlTracker(
+                rods_x_norm=self.field_cfg.rods.xs_norm
+            )
 
     def _update_motion(self, x: int, y: int) -> None:
         if self.prev_xy is not None:
@@ -173,6 +183,10 @@ class KickerAnalyzer:
         if ball is not None:
             x, y, r = ball
 
+            if self.rod_control is not None:
+                x_norm = x / w
+                self.rod_control.update(x_norm)
+
             # Homography (für km/h) vorbereiten
             self._ensure_homography(frame.shape)
 
@@ -182,6 +196,18 @@ class KickerAnalyzer:
                 if dt > 0:
                     self.fps = 1.0 / dt
             self._last_t = now
+
+            if self.rod_control is not None:
+                for i, cnt in enumerate(self.rod_control.get_counts()):
+                    cv2.putText(
+                        frame,
+                        f"Rod {i + 1}: {cnt}",
+                        (20, 100 + i * 22),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (255, 255, 0),
+                        2
+                    )
 
             # Pixel-Speed/Richtung
             self._update_motion(x, y)
@@ -272,3 +298,18 @@ class KickerAnalyzer:
         xmin, xmax = sorted((x0, x1))
         ymin, ymax = sorted((y0, y1))
         return (xmin <= x <= xmax) and (ymin <= y <= ymax)
+
+    def _ball_zone(self, x: int, frame_shape) -> int | None:
+        if self.field_cfg is None or self.field_cfg.rods is None:
+            return None
+
+        _, w = frame_shape[:2]
+        xn = x / w
+
+        rods = sorted(self.field_cfg.rods.xs_norm)
+
+        for i, rx in enumerate(rods):
+            if xn < rx:
+                return i
+
+        return len(rods)  # letzte Zone

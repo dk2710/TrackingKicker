@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
-
+from v3.tracking_kicker.model.RodConfig import RodConfig
 
 @dataclass
 class GoalROI:
@@ -26,3 +26,4 @@ class FieldSize:
 class FieldConfig:
     size_cm: FieldSize
     corners_norm: List[Tuple[float, float]]
+    rods: RodConfig | None = None

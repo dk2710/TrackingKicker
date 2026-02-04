@@ -1,5 +1,4 @@
-
-
+from v3.tracking_kicker.model.RodConfig import RodConfig
 from v3.tracking_kicker.model.Vision import GoalsConfig, FieldConfig, GoalROI, FieldSize
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -36,6 +35,7 @@ class VisionConfig:
             field=FieldConfig(
                 size_cm=FieldSize(**field_raw["size_cm"]),
                 corners_norm=field_raw["corners_norm"],
+                rods=RodConfig(**field_raw["rods"]) if "rods" in field_raw else None
             ) if field_raw else None
         )
 
@@ -45,3 +45,9 @@ class VisionConfig:
 
         with open(path, "w", encoding="utf-8") as f:
             json.dump(asdict(self), f, indent=2)
+
+    def reload(self):
+        new = VisionConfig.load(self.DEFAULT_PATH)
+
+        self.goals = new.goals
+        self.field = new.field

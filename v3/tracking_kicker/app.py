@@ -19,15 +19,16 @@ from detection import BallDetector
 from analysis import KickerAnalyzer
 from distoration import DistortionCorrector
 from model.VisionConfig import VisionConfig
+from v3.tracking_kicker.model.RodConfig import RodConfig
 from v3.tracking_kicker.ui.distortion_tuner import DistortionTunerUI
+from v3.tracking_kicker.ui.rod_calibration import RodCalibrationUI
 
-vision = VisionConfig.load()
-
-config = AppConfig.load()
 
 replay_buffer = deque()          # enthält (frame, timestamp)
 replay_lock = threading.Lock()
 
+config = AppConfig.load()
+vision = VisionConfig.load()
 
 frame_queue = Queue(maxsize=2)  # WICHTIG: klein halten
 display_queue = Queue(maxsize=1)
@@ -71,10 +72,16 @@ class KickerApp:
         self.video = source
         self.cfg: Optional[Dict[str, Any]]
 
-        self.dist = DistortionCorrector(config.camera)
+        self.dist = DistortionCorrector(camera=config.camera)
 
+        self.vision = VisionConfig.load()
 
-        print(f"📁 Verzerrung config: {config.camera}")
+        # ✅ HIER DER WICHTIGE TEIL
+        self.rod_control = None
+
+        if self.vision.field and self.vision.field.rods:
+            self.rod_control = self.vision.field.rods
+
         print(f"🎥 FPS erkannt: {self.video.fps:.3f}")
         cv2.setUseOptimized(True)
 
@@ -113,44 +120,47 @@ class KickerApp:
         do_calibration = self._get_start_mode()
 
         if do_calibration:
-            # 🔹 Distortion LIVE tunen (ändert self.dist.camera)
             self.tune_distortion_live()
 
-            # 🔹 danach ein frisches Frame holen
             ret, frame = self.video.read()
             if not ret or frame is None:
                 raise RuntimeError("❌ Kein Frame nach Distortion-Tuning")
 
             bgr = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
-            bgr = self.dist.apply(bgr)  # 🔥 HIER ist die Verzerrung aktiv
+            bgr = self.dist.apply(bgr)
+
+            rod_ui = RodCalibrationUI()
+            result = rod_ui.run(bgr)
+
+            if result is None:
+                raise RuntimeError("❌ Stangenkalibrierung abgebrochen")
+
+            self.vision.field.rods = RodConfig(xs_norm=result.xs_norm)
 
             pipeline = CalibrationPipeline()
             self.cfg = pipeline.run(bgr)
-            vision.save()
 
-            print("✅ Kalibrierung gespeichert:", str(vision.DEFAULT_PATH))
-
-
+            self.vision.save()
+            print("✅ Kalibrierung gespeichert")
 
         else:
+            # 🔁 NUR LADEN
+            self.vision = VisionConfig.load()
+            self.config = AppConfig.load()
+            self.dist = DistortionCorrector(camera=self.config.camera)
 
-            cfg = JsonStore.load(str(config.config_path))
-
-            if cfg is None:
-                raise RuntimeError(f"❌ Kalibrierungsdatei nicht gefunden: {str(config.config_path)}")
-
-            self.cfg = cfg
-
-            print("📁 Kalibrierung geladen:", str(config.config_path))
-
+            if self.vision.field and self.vision.field.rods:
+                print("🪵 Stangen geladen:", self.vision.field.rods.xs_norm)
+            else:
+                print("⚠️ Keine Stangenkalibrierung vorhanden")
 
         self.video.reset()
 
     def processing_loop(self, in_queue, display_queue, stop_event):
         detector = BallDetector(debug=False)
         analyzer = KickerAnalyzer(
-            goals_cfg=vision.goals,
-            field_cfg=vision.field,
+            goals_cfg=self.vision.goals,
+            field_cfg=self.vision.field,
         )
         t0 = time.perf_counter()
         last_log = t0
@@ -163,6 +173,7 @@ class KickerApp:
                 continue
 
             bgr = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
+            bgr = self.dist.apply(bgr)
 
             meas = detector.detect(bgr)
             overlay = bgr.copy()
@@ -391,7 +402,6 @@ class KickerApp:
 
     def run(self) -> None:
         self._load_or_calibrate()
-        assert self.cfg is not None
 
         t_cam = threading.Thread(
             target=self.camera_loop,
