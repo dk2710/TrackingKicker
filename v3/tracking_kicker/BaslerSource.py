@@ -28,16 +28,16 @@ class BaslerSource:
         #self.try_set(self.camera, "ExposureAuto", "Off")
         self.try_set(self.camera, "GainAuto", "Off")
 
-        self.try_set(self.camera, "ExposureTime", cfg.camera.exposure_time)  # 8 ms (sichtbar)
+        self.try_set(self.camera, "ExposureTime", cfg.exposure_time)  # 8 ms (sichtbar)
         # optional etwas Gain, wenn nötig:
-        self.try_set(self.camera, "Gain", cfg.camera.exposure_gain.lue)
+        self.try_set(self.camera, "Gain", cfg.gain)
 
 
-        self.camera.Height.Value = cfg.camera.Height
-        self.camera.OffsetY.Value = cfg.camera.offset_y
+        self.camera.Height.Value = cfg.height
+        self.camera.OffsetY.Value = cfg.offset_y
 
-        self.camera.Width.Value = cfg.camera.width
-        self.camera.OffsetX.Value = cfg.camera.offset_x
+        self.camera.Width.Value = cfg.width
+        self.camera.OffsetX.Value = cfg.offset_x
 
         strategy = pylon.GrabStrategy_LatestImageOnly
         self.camera.StartGrabbing(strategy)
