@@ -13,7 +13,7 @@ class Camera:
 
     # Exposure / Gain
     exposure_time: float #= 4000.0
-    gain: float #= 5.0
+    gain: float
 
     # Debug / Modus
     grab_strategy_latest_only: bool #= True

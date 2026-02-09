@@ -48,15 +48,8 @@ class BallDetector:
         mask = cv2.inRange(hsv, self.hsv_low, self.hsv_high)
 
         if self.use_morph:
-            # Kernel-Größen leicht kleiner -> weniger "gelbe Teppiche"
-            k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-            k_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close, iterations=1)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k_open,  iterations=1)
-
-            # optional minimal dilate
-            mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
         return mask
 
@@ -145,8 +138,20 @@ class BallDetector:
 
         for c in cnts:
             a = cv2.contourArea(c)
+            (x, y), r = cv2.minEnclosingCircle(c)
+
+            # Grundfilter
             if not (self.area_min < a < self.area_max):
                 continue
+
+            # Größenfilter nach gelerntem Ball
+            if self.expected_r is not None:
+                if r < 0.65 * self.expected_r:
+                    continue
+                if r > 1.45 * self.expected_r:
+                    continue
+
+            # 🔥 DAS FEHLTE
             score, trip = self._score_contour(c, exp_r)
             if score > best_score:
                 best_score = score
@@ -163,6 +168,10 @@ class BallDetector:
 
         x_i, y_i, r_i = best_trip
         (_, _), r_float = cv2.minEnclosingCircle(best_c)
+
+        # 🔒 Initiale Ballgröße setzen
+        if self.expected_r is None and r_float >= 5:
+            self.expected_r = float(r_float)
 
         reliable = self._is_reliable(best_c, r_float)
 

@@ -68,85 +68,55 @@ class KickerAnalyzer:
 
         self.prev_xy = (x, y)
 
-    def _update_goals(
-            self,
-            ball: Optional[Tuple[int, int, int]],
-            frame_shape
-    ) -> Tuple[bool, bool]:
+    def _update_goals(self, ball, frame_shape):
+        goalL = goalR = False
 
-        goalL = False
-        goalR = False
-        now = time.perf_counter()
+        if ball is None:
+            # Ball weg → mögliches Tor bestätigen
+            if self._pending_side is not None and not self._goal_locked:
+                if self._pending_side == "left":
+                    self.score_left += 1
+                    goalL = True
+                else:
+                    self.score_right += 1
+                    goalR = True
 
-        # ----------------------------
-        # Ball-Lage bestimmen
-        # ----------------------------
-        inL = inR = False
-        in_field = False
+                self._goal_locked = True
+                self._pending_side = None
 
-        if ball is not None:
-            x, y, _ = ball
-            inL = self._point_in_goal_roi(x, y, "left", frame_shape)
-            inR = self._point_in_goal_roi(x, y, "right", frame_shape)
-            in_field = not inL and not inR
+            return goalL, goalR
 
-        # ----------------------------
-        # STATE: LOCKED
-        # → Warten bis Ball wieder im Feld ist
-        # ----------------------------
+        x, y, r = ball
+
+        inL = self._ball_in_goal_roi(x, y, r, "left", frame_shape)
+        inR = self._ball_in_goal_roi(x, y, r, "right", frame_shape)
+
+        # LOCKED: warten bis Ball wieder im Feld ist
         if self._goal_locked:
-            if in_field:
+            if not inL and not inR:
                 self._goal_locked = False
             return False, False
 
-        # ----------------------------
-        # STATE: IDLE
-        # → Ball war im Tor → Pending starten
-        # ----------------------------
+        # Ball betritt Tor
         if self._pending_side is None:
-            if inL and not inR:
+            if inL:
                 self._pending_side = "left"
-                self._pending_start_time = now
-                self._pending_seen_ball = True
-            elif inR and not inL:
+            elif inR:
                 self._pending_side = "right"
-                self._pending_start_time = now
-                self._pending_seen_ball = True
             return False, False
 
-        # ----------------------------
-        # STATE: PENDING
-        # ----------------------------
-        if ball is not None:
-            self._pending_seen_ball = True
-
-        # ❌ Ball kam zurück → abbrechen
-        if in_field:
-            self._pending_side = None
-            self._pending_seen_ball = False
-            return False, False
-
-        # ⏱️ 1 Sekunde abgelaufen?
-        if (now - self._pending_start_time) >= 1.0:
-            if not self._pending_seen_ball:
-                # SAFETY (eigentlich unmöglich, aber sauber)
-                self._pending_side = None
-                return False, False
-
-            # ✅ TOR
-            if self._pending_side == "left":
-                self.score_left += 1
-                goalL = True
-            else:
-                self.score_right += 1
-                goalR = True
-
-            # 🔒 Lock aktivieren
+        # Ball war im Tor, ist jetzt draußen → TOR
+        if self._pending_side == "left" and not inL:
+            self.score_left += 1
+            goalL = True
             self._goal_locked = True
-
-            # Reset
             self._pending_side = None
-            self._pending_seen_ball = False
+
+        elif self._pending_side == "right" and not inR:
+            self.score_right += 1
+            goalR = True
+            self._goal_locked = True
+            self._pending_side = None
 
         return goalL, goalR
 
@@ -283,21 +253,22 @@ class KickerAnalyzer:
         out = cv2.perspectiveTransform(pt, self.H_img2cm)[0][0]
         return float(out[0]), float(out[1])
 
-    def _point_in_goal_roi(self, x: int, y: int, side: str, frame_shape) -> bool:
+    def _ball_in_goal_roi(self, x, y, r, side, frame_shape) -> bool:
         h, w = frame_shape[:2]
-        if side == "left":
-            g = self.goals_cfg.left
-        elif side == "right":
-            g = self.goals_cfg.right
-        else:
-            raise ValueError(f"Unknown goal side: {side}")
+        g = self.goals_cfg.left if side == "left" else self.goals_cfg.right
 
-        x0 = int(g.x0 * w); y0 = int(g.y0 * h)
-        x1 = int(g.x1 * w); y1 = int(g.y1 * h)
+        x0 = int(g.x0 * w);
+        y0 = int(g.y0 * h)
+        x1 = int(g.x1 * w);
+        y1 = int(g.y1 * h)
 
         xmin, xmax = sorted((x0, x1))
         ymin, ymax = sorted((y0, y1))
-        return (xmin <= x <= xmax) and (ymin <= y <= ymax)
+
+        return (
+                (x + r >= xmin) and (x - r <= xmax) and
+                (y + r >= ymin) and (y - r <= ymax)
+        )
 
     def _ball_zone(self, x: int, frame_shape) -> int | None:
         if self.field_cfg is None or self.field_cfg.rods is None:

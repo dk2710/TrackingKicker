@@ -75,7 +75,6 @@ class KickerApp:
 
 
         print(f"📁 Verzerrung config: {config.camera}")
-        print(f"🎥 FPS erkannt: {self.video.fps:.3f}")
         cv2.setUseOptimized(True)
 
     @staticmethod
@@ -163,6 +162,7 @@ class KickerApp:
                 continue
 
             bgr = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
+            bgr = self.dist.apply(bgr)
 
             meas = detector.detect(bgr)
             overlay = bgr.copy()
@@ -282,15 +282,12 @@ class KickerApp:
                 n = 0
                 dropped = 0
 
+            MAX_REPLAY_FRAMES = int(200 * config.replay_seconds)  # z.B. feste 200 FPS
+
             with replay_lock:
-
-
-                replay_buffer.append((frame.copy(), now))
-
-                max_len = int(host_fps * config.replay_seconds)
-                while len(replay_buffer) > max_len:
+                replay_buffer.append((frame, now))  # kein copy hier!
+                while len(replay_buffer) > MAX_REPLAY_FRAMES:
                     replay_buffer.popleft()
-
 
     def save_last_seconds_mp4(self):
         with replay_lock:
