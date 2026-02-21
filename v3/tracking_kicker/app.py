@@ -25,7 +25,7 @@ vision = VisionConfig.load()
 
 config = AppConfig.load()
 
-replay_buffer = deque()          # enthält (frame, timestamp)
+replay_buffer = deque(maxlen=int(60 * config.replay_seconds))        # enthält (frame, timestamp)
 replay_lock = threading.Lock()
 
 
@@ -36,7 +36,7 @@ recording_queue = Queue()
 stop_event = threading.Event()
 record_event = threading.Event()
 
-VIDEO_PATH = config.videos_dir / "session_raw_2026-01-30_15-30-18.npz"
+VIDEO_PATH = config.videos_dir / "test.npz"
 
 #Analysevideo
 Analyse_Video_Path = (Path(__file__).resolve().parents[1] / "videos").resolve()
@@ -67,10 +67,10 @@ def gui_destroy_all():
         cv2.destroyAllWindows()
 
 class KickerApp:
+
     def __init__(self, source):
         self.video = source
         self.cfg: Optional[Dict[str, Any]]
-
         self.dist = DistortionCorrector(config.camera)
 
 
@@ -145,7 +145,7 @@ class KickerApp:
 
         self.video.reset()
 
-    def processing_loop(self, in_queue, display_queue, stop_event):
+    def processing_loop(self, in_queue, dp_queue, stop_event):
         detector = BallDetector(debug=False)
         analyzer = KickerAnalyzer(
             goals_cfg=vision.goals,
@@ -171,7 +171,8 @@ class KickerApp:
             n += 1
             now = time.perf_counter()
             if now - last_log >= 1.0:
-                host_fps = n / (now - t0)
+                dt = now - last_log
+                host_fps = n / dt
 
                 print(f"[CAM] AnalysierenFPS={host_fps:.1f} | ")
 
@@ -184,13 +185,13 @@ class KickerApp:
                 self.play_last_seconds()
 
             # keep-latest policy
-            if display_queue.full():
+            if dp_queue.full():
                 try:
-                    display_queue.get_nowait()
+                    dp_queue.get_nowait()
                 except:
                     pass
 
-            display_queue.put(overlay)
+            dp_queue.put(overlay)
 
     def play_last_seconds(self):
         with replay_lock:
@@ -237,9 +238,11 @@ class KickerApp:
     def camera_loop(self, video, rt_queue, rec_queue, stop_event):
         t0 = time.perf_counter()
         last_log = t0
-        host_fps = 0
         n = 0
         dropped = 0
+        self._replay_last_store = 0.0
+        self._replay_interval = 1.0 / 60.0
+        self._max_replay_frames = int(60 * config.replay_seconds)
 
         while not stop_event.is_set():
             try:
@@ -265,10 +268,12 @@ class KickerApp:
                     pass
             rt_queue.put(frame)
 
-            rec_queue.put(frame)
+            if record_event.is_set():
+                rec_queue.put(frame)
 
             if now - last_log >= 1.0:
-                host_fps = n / (now - t0)
+                dt = now - last_log
+                host_fps = n / dt
                 cam_fps = video.showFPS()
 
                 print(
@@ -282,12 +287,16 @@ class KickerApp:
                 n = 0
                 dropped = 0
 
-            MAX_REPLAY_FRAMES = int(200 * config.replay_seconds)  # z.B. feste 200 FPS
 
-            with replay_lock:
-                replay_buffer.append((frame, now))  # kein copy hier!
-                while len(replay_buffer) > MAX_REPLAY_FRAMES:
-                    replay_buffer.popleft()
+            now = time.perf_counter()
+
+            if now - self._replay_last_store >= self._replay_interval:
+                with replay_lock:
+                    replay_buffer.append((frame, now))
+                    if len(replay_buffer) > self._max_replay_frames:
+                        replay_buffer.popleft()
+
+                self._replay_last_store = now
 
     def save_last_seconds_mp4(self):
         with replay_lock:
@@ -454,14 +463,6 @@ class KickerApp:
                     else:
                         record_event.set()
                         print("KEY → Recording ON")
-
-                elif key == ord('k'):
-                    print("KEY → Replay letzte 3 Sekunden")
-                    threading.Thread(
-                        target=self.play_last_seconds,
-                        daemon=True
-                    ).start()
-
                 elif key == 27:  # ESC
                     break
 

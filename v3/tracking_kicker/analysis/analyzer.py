@@ -24,7 +24,7 @@ class KickerAnalyzer:
         self._speed_peak = 0.0
         self._speed_display = 0
         self._speed_window_start = time.perf_counter()
-        self._speed_window = 0.5
+        self._speed_window = 0.05
 
         # Score
         self.score_left = 0
@@ -149,6 +149,17 @@ class KickerAnalyzer:
 
         goalL, goalR = self._update_goals(ball, frame.shape)
 
+        if self.rod_control is not None:
+            for i, cnt in enumerate(self.rod_control.get_counts()):
+                cv2.putText(
+                    frame,
+                    f"Rod {i + 1}: {cnt}",
+                    (20, 100 + i * 22),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 255, 0),
+                    2
+                )
         # Ball zeichnen + Bewegung nur wenn Ball vorhanden
         if ball is not None:
             x, y, r = ball
@@ -167,17 +178,7 @@ class KickerAnalyzer:
                     self.fps = 1.0 / dt
             self._last_t = now
 
-            if self.rod_control is not None:
-                for i, cnt in enumerate(self.rod_control.get_counts()):
-                    cv2.putText(
-                        frame,
-                        f"Rod {i + 1}: {cnt}",
-                        (20, 100 + i * 22),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (255, 255, 0),
-                        2
-                    )
+
 
             # Pixel-Speed/Richtung
             self._update_motion(x, y)
@@ -195,12 +196,12 @@ class KickerAnalyzer:
 
                     if inst_kmh > self._speed_peak:
                         self._speed_peak = inst_kmh
-
                     if now - self._speed_window_start >= self._speed_window:
                         self._speed_display = int(round(self._speed_peak))
                         self._speed_peak = 0.0
                         self._speed_window_start = now
 
+                    _speed_display = int(round(self._speed_peak))
                     a = 0.2
                     self.speed_kmh_s = (1 - a) * self.speed_kmh_s + a * inst_kmh
                 self.prev_world = world
