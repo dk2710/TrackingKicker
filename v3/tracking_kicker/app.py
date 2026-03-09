@@ -36,7 +36,7 @@ recording_queue = Queue()
 stop_event = threading.Event()
 record_event = threading.Event()
 
-VIDEO_PATH = config.videos_dir / "test.npz"
+VIDEO_PATH = config.videos_dir / "test2.npz"
 
 #Analysevideo
 Analyse_Video_Path = (Path(__file__).resolve().parents[1] / "videos").resolve()
@@ -181,8 +181,19 @@ class KickerApp:
                 last_log = now
                 n = 0
 
+            now = time.perf_counter()
+
+            if now - self._replay_last_store >= self._replay_interval:
+                with replay_lock:
+                    replay_buffer.append((frame, now))
+                    if len(replay_buffer) > self._max_replay_frames:
+                        replay_buffer.popleft()
+
+                self._replay_last_store = now
+
             if(analyzer.draw_overlay(overlay, meas) == True):
                 self.play_last_seconds()
+
 
             # keep-latest policy
             if dp_queue.full():
@@ -288,15 +299,7 @@ class KickerApp:
                 dropped = 0
 
 
-            now = time.perf_counter()
 
-            if now - self._replay_last_store >= self._replay_interval:
-                with replay_lock:
-                    replay_buffer.append((frame, now))
-                    if len(replay_buffer) > self._max_replay_frames:
-                        replay_buffer.popleft()
-
-                self._replay_last_store = now
 
     def save_last_seconds_mp4(self):
         with replay_lock:

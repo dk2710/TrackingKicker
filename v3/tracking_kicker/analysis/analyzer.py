@@ -24,7 +24,7 @@ class KickerAnalyzer:
         self._speed_peak = 0.0
         self._speed_display = 0
         self._speed_window_start = time.perf_counter()
-        self._speed_window = 0.05
+        self._speed_window = 0.2
 
         # Score
         self.score_left = 0
