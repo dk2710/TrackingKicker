@@ -13,7 +13,6 @@ from v3.tracking_kicker.config import AppConfig
 from SocketJpegStreamer import SocketJpegStreamer
 from RawReplaySource import RawReplaySource
 from BaslerSource import BaslerSource
-from storage import JsonStore
 from calibration import CalibrationPipeline
 from detection import BallDetector
 from analysis import KickerAnalyzer
@@ -290,6 +289,7 @@ class KickerApp:
                 print(
                     f"[CAM] HostFPS={host_fps:.1f} | "
                     f"CamFPS={cam_fps} | "
+                    
                     f"Dropped={dropped}"
                 )
 
