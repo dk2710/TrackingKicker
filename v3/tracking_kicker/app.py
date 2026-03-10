@@ -18,6 +18,7 @@ from detection import BallDetector
 from analysis import KickerAnalyzer
 from distoration import DistortionCorrector
 from model.VisionConfig import VisionConfig
+from storage import JsonStore
 from v3.tracking_kicker.ui.distortion_tuner import DistortionTunerUI
 
 vision = VisionConfig.load()
@@ -191,7 +192,7 @@ class KickerApp:
                 self._replay_last_store = now
 
             if(analyzer.draw_overlay(overlay, meas) == True):
-                self.play_last_seconds()
+               self.play_last_seconds()
 
 
             # keep-latest policy
