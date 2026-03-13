@@ -30,7 +30,7 @@ class BallDetector:
         self.max_hold_frames = 2  # hält 1-2 Frames stabil, wenn Ball kurz "weg"
 
     # -----------------------------
-    # Masking
+    # Masking ----- Angucken
     # -----------------------------
     def _mask_ball(self, frame: np.ndarray) -> np.ndarray:
         # Nur wenn 1-Kanal (Bayer/Gray) -> demosaic
@@ -151,7 +151,6 @@ class BallDetector:
                 if r > 1.45 * self.expected_r:
                     continue
 
-            # 🔥 DAS FEHLTE
             score, trip = self._score_contour(c, exp_r)
             if score > best_score:
                 best_score = score

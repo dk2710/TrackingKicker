@@ -181,7 +181,7 @@ class KickerAnalyzer:
 
 
             # Pixel-Speed/Richtung
-            self._update_motion(x, y)
+            # self._update_motion(x, y)
 
             # km/h-Speed (wenn field_cfg vorhanden)
             world = self._img_to_cm(x, y)
@@ -194,6 +194,7 @@ class KickerAnalyzer:
 
                     now = time.perf_counter()
 
+                    #Durchschnitt berechnen der Geschwindigkeit
                     if inst_kmh > self._speed_peak:
                         self._speed_peak = inst_kmh
                     if now - self._speed_window_start >= self._speed_window:
@@ -251,6 +252,7 @@ class KickerAnalyzer:
         if self.H_img2cm is None:
             return None
         pt = np.array([[[float(x), float(y)]]], dtype=np.float32)
+        #SPEICHERUNG DER X UND Y WERTE FÜR POSITION
         out = cv2.perspectiveTransform(pt, self.H_img2cm)[0][0]
         return float(out[0]), float(out[1])
 

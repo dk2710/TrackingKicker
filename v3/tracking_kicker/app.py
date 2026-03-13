@@ -177,11 +177,9 @@ class KickerApp:
                 print(f"[CAM] AnalysierenFPS={host_fps:.1f} | ")
 
                 analyzer.fps =  host_fps
-                t0 = now
                 last_log = now
                 n = 0
 
-            now = time.perf_counter()
 
             if now - self._replay_last_store >= self._replay_interval:
                 with replay_lock:
@@ -294,7 +292,6 @@ class KickerApp:
                     f"Dropped={dropped}"
                 )
 
-                t0 = now
                 last_log = now
                 n = 0
                 dropped = 0
