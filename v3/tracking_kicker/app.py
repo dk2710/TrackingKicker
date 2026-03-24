@@ -11,19 +11,19 @@ import asyncio
 from collections import deque
 import os
 
-from .comms.ws_gateway import WSGateway
-
 from v3.tracking_kicker.config import AppConfig
 from .SocketJpegStreamer import SocketJpegStreamer
-from RawReplaySource import RawReplaySource
-from BaslerSource import BaslerSource
-from calibration import CalibrationPipeline
-from detection import BallDetector
-from analysis import KickerAnalyzer
-from distoration import DistortionCorrector
-from model.VisionConfig import VisionConfig
-from storage import JsonStore
-from v3.tracking_kicker.ui.distortion_tuner import DistortionTunerUI
+from .RawReplaySource import RawReplaySource
+from .BaslerSource import BaslerSource
+from .calibration import CalibrationPipeline
+from .detection import BallDetector
+from .analysis import KickerAnalyzer
+from .distoration import DistortionCorrector
+from .model.VisionConfig import VisionConfig
+from .storage import JsonStore
+from .ui.distortion_tuner import DistortionTunerUI
+from .comms.ws_gateway import WSGateway
+
 
 # -------------------------------------------------
 # Globale Konfiguration / Queues / Buffer
