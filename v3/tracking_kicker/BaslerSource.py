@@ -24,7 +24,7 @@ class BaslerSource:
         self.camera.Open()
         # nach Open(), vor StartGrabbing()
         self.camera.ExposureAuto.Value = "Off"
-        self.camera.PixelFormat.Value = "BayerRG8packed "
+        self.camera.PixelFormat.Value = "BayerRG8"
         self.camera.GainAuto.Value = "Off"
         # nach Open(), vor StartGrabbing()
         #self.try_set(self.camera, "ExposureAuto", "Off")
