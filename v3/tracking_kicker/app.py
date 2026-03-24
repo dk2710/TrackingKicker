@@ -131,7 +131,7 @@ class KickerApp:
             if not ret or frame is None:
                 raise RuntimeError("❌ Kein Frame nach Distortion-Tuning")
 
-            # bgr = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
+            frame = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
             bgr = self.dist.apply(frame)
 
             pipeline = CalibrationPipeline()
@@ -221,8 +221,8 @@ class KickerApp:
             except:
                 continue
 
-            # bgr = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
-            bgr = self.dist.apply(frame)
+            bgr = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
+            bgr = self.dist.apply(bgr)
             meas = detector.detect(bgr)
             overlay = bgr.copy()
 
@@ -294,7 +294,7 @@ class KickerApp:
                 idx += 1
 
             frame, _ = frames[idx]
-            # bgr = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
+            frame = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
             bgr = frame[:, :, [2, 1, 0]]
 
             gui_imshow("Replay (letzte 3 Sekunden)", bgr)
