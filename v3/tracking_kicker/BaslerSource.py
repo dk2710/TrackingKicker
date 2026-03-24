@@ -82,7 +82,7 @@ class BaslerSource:
     def read(self) -> Tuple[bool, Optional[np.ndarray]]:
         ok, frame = self._grab_raw_once()
 
-        frame = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
+        #frame = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
         if not ok or frame is None:
             return False, None
 
