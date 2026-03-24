@@ -14,7 +14,7 @@ import os
 from .comms.ws_gateway import WSGateway
 
 from v3.tracking_kicker.config import AppConfig
-from SocketJpegStreamer import SocketJpegStreamer
+from .SocketJpegStreamer import SocketJpegStreamer
 from RawReplaySource import RawReplaySource
 from BaslerSource import BaslerSource
 from calibration import CalibrationPipeline
