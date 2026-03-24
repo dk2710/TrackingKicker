@@ -198,8 +198,8 @@ class BallDetector:
             y1 = min(H, by + bh + pad)
 
             roi = frame_bgr[y0:y1, x0:x1]
-            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-            gray = cv2.GaussianBlur(gray, (7, 7), 1.5)
+            #gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(roi, (7, 7), 1.5)
 
             minR = max(2, int(exp_r * 0.7))
             maxR = max(minR + 2, int(exp_r * 1.35))

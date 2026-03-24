@@ -1,6 +1,8 @@
 from __future__ import annotations
 from typing import Optional, Tuple, Dict
 import time
+
+import cv2
 import numpy as np
 from pypylon import pylon, genicam
 
@@ -22,7 +24,7 @@ class BaslerSource:
         self.camera.Open()
         # nach Open(), vor StartGrabbing()
         self.camera.ExposureAuto.Value = "Off"
-        self.camera.PixelFormat.Value = "BayerRG8"
+        self.camera.PixelFormat.Value = "BayerRG8packed "
         self.camera.GainAuto.Value = "Off"
         # nach Open(), vor StartGrabbing()
         #self.try_set(self.camera, "ExposureAuto", "Off")
@@ -80,6 +82,7 @@ class BaslerSource:
     def read(self) -> Tuple[bool, Optional[np.ndarray]]:
         ok, frame = self._grab_raw_once()
 
+        frame = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
         if not ok or frame is None:
             return False, None
 
