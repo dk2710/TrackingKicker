@@ -11,7 +11,7 @@ import asyncio
 from collections import deque
 import os
 
-from comms.ws_gateway import WSGateway
+from .comms.ws_gateway import WSGateway
 
 from v3.tracking_kicker.config import AppConfig
 from SocketJpegStreamer import SocketJpegStreamer
