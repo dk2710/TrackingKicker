@@ -1,12 +1,13 @@
 from __future__ import annotations
 from typing import Optional, Tuple, Dict
+
+
 import time
 
-import cv2
-import numpy as np
 from pypylon import pylon, genicam
 
 from v3.tracking_kicker.model.Camera import Camera
+from v3.tracking_kicker.Objects.Frames import Frame
 
 
 class BaslerSource:
@@ -48,7 +49,7 @@ class BaslerSource:
 
 #------------------------------------------------ --------------------------------------------------------------------------------
 
-    def _grab_raw_once(self) -> Tuple[bool, Optional[np.ndarray]]:
+    def _grab_raw_once(self) -> Tuple[bool, Optional[Frame]]:
         if self._closed or not self.camera.IsGrabbing():
             return False, None
 
@@ -66,9 +67,12 @@ class BaslerSource:
                 grab.Release()
                 return False, None
 
-            frame = grab.GetArray().copy()
+            objFrame = Frame()
+            objFrame.frame = grab.GetArray().copy()
+            objFrame.timestamp = time.perf_counter()
             grab.Release()
-            return True, frame
+
+            return True, objFrame
 
         except Exception as e:
             print(f"⚠️ Basler grab failed: {e}")
@@ -79,14 +83,14 @@ class BaslerSource:
                 pass
             return False, None
 
-    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
-        ok, frame = self._grab_raw_once()
+    def read(self) -> Tuple[bool, Optional[Frame]]:
+        ok, objframe = self._grab_raw_once()
 
         #frame = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
-        if not ok or frame is None:
+        if not ok or objframe is None:
             return False, None
 
-        return True, frame
+        return True, objframe
 
     def showFPS(self) -> str:
         try:

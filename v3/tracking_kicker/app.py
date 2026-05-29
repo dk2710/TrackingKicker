@@ -111,7 +111,7 @@ class KickerApp:
         ui = DistortionTunerUI(self.dist.camera)
         while True:
             ui.update_camera_if_needed()
-            corrected = self.dist.apply(frame)
+            corrected = self.dist.apply(frame.frame)
             cv2.imshow("Distortion Tuning", corrected)
             key = cv2.waitKey(15) & 0xFF
             if key == 27:
@@ -131,11 +131,11 @@ class KickerApp:
             if not ret or frame is None:
                 raise RuntimeError("❌ Kein Frame nach Distortion-Tuning")
 
-            frame = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
-            bgr = self.dist.apply(frame)
+            frame.frame = cv2.cvtColor(frame.frame, cv2.COLOR_BayerRG2BGR)
+            frame.frame = self.dist.apply(frame.frame)
 
             pipeline = CalibrationPipeline()
-            self.cfg = pipeline.run(bgr)
+            self.cfg = pipeline.run(frame.frame)
             vision.save()
 
             print("✅ Kalibrierung gespeichert:", str(vision.DEFAULT_PATH))
@@ -205,7 +205,7 @@ class KickerApp:
     # ---------------------------------------------
     # Loops
     # ---------------------------------------------
-    def processing_loop(self, in_queue, dp_queue, stop_event):
+    def processing_loop(self, frame_queue, dp_queue, stop_event):
         detector = BallDetector(debug=False)
         analyzer = KickerAnalyzer(
             goals_cfg=vision.goals,
@@ -217,11 +217,11 @@ class KickerApp:
 
         while not stop_event.is_set():
             try:
-                frame = in_queue.get(timeout=0.5)
+                frame = frame_queue.get(timeout=0.5)
             except:
                 continue
 
-            bgr = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
+            bgr = cv2.cvtColor(frame.frame, cv2.COLOR_BayerRG2BGR)
             bgr = self.dist.apply(bgr)
             meas = detector.detect(bgr)
             overlay = bgr.copy()
@@ -239,7 +239,7 @@ class KickerApp:
             # Replay-Buffer füllen (rohe Frames + Zeit)
             if now - self._replay_last_store >= self._replay_interval:
                 with replay_lock:
-                    replay_buffer.append((frame, now))
+                    replay_buffer.append((frame.frame, frame.timestamp))
                     if len(replay_buffer) > self._max_replay_frames:
                         replay_buffer.popleft()
                 self._replay_last_store = now
@@ -303,48 +303,31 @@ class KickerApp:
 
         gui_destroy_window("Replay (letzte 3 Sekunden)")
 
-    def camera_loop(self, video, rt_queue, rec_queue, stop_event):
-        t0 = time.perf_counter()
-        last_log = t0
-        n = 0
+    def camera_loop(self, video, frame_queue, rec_queue, stop_event):
         dropped = 0
-        self._replay_last_store = 0.0
-        self._replay_interval = 1.0 / 60.0
-        self._max_replay_frames = int(60 * config.replay_seconds)
 
         while not stop_event.is_set():
             try:
-                ret, frame = video.read()
+                ret, objframe = video.read()
             except Exception as e:
                 print(f"⚠️ Camera read exception: {e}")
                 time.sleep(0.01)
                 continue
 
-            if not ret or frame is None:
+            if not ret or objframe is None:
                 continue
 
-            n += 1
-            now = time.perf_counter()
-
-            if rt_queue.full():
+            if frame_queue.full():
                 try:
-                    rt_queue.get_nowait()
+                    frame_queue.get_nowait()
                     dropped += 1
                 except:
                     pass
-            rt_queue.put(frame)
+
+            frame_queue.put(objframe)
 
             if record_event.is_set():
-                rec_queue.put(frame)
-
-            if now - last_log >= 1.0:
-                dt = now - last_log
-                host_fps = n / dt
-                cam_fps = video.showFPS()
-                print(f"[CAM] HostFPS={host_fps:.1f} | CamFPS={cam_fps} | Dropped={dropped}")
-                last_log = now
-                n = 0
-                dropped = 0
+                rec_queue.put(objframe)
 
     def save_last_seconds_mp4(self):
         with replay_lock:

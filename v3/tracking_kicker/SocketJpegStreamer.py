@@ -13,64 +13,36 @@ class SocketJpegStreamer:
         self.send_fps = float(send_fps)
 
     def run(self, display_queue: Queue, stop_event: threading.Event):
+        import socket
+
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind((self.host, self.port))
         srv.listen(1)
-        print(f"🌐 Streamer wartet auf Client: {self.host}:{self.port}")
 
-        srv.settimeout(1.0)
-        conn = None
-        try:
-            while not stop_event.is_set():
-                try:
-                    conn, addr = srv.accept()
-                    print("✅ Stream-Client verbunden:", addr)
-                    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                    break
-                except socket.timeout:
-                    continue
+        print(f"🌐 HTTP MJPEG Stream läuft: http://localhost:{self.port}")
 
-            if conn is None:
-                return
+        conn, addr = srv.accept()
+        print("✅ Client verbunden:", addr)
 
-            dt = 1.0 / self.send_fps
-            t_next = time.perf_counter()
+        # ✅ HTTP HEADER!!!!
+        conn.sendall(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n"
+        )
 
-            while not stop_event.is_set():
-                # fps pacing
-                now = time.perf_counter()
-                if now < t_next:
-                    time.sleep(max(0, t_next - now))
-                t_next += dt
-
-                # latest-only aus display_queue ziehen (alles alte wegwerfen)
-                frame = None
-                try:
-                    frame = display_queue.get(timeout=0.2)
-                    while True:
-                        frame = display_queue.get_nowait()
-                except:
-                    pass
-
-                if frame is None:
-                    continue
-
-                ok, jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
-                if not ok:
-                    continue
-
-                payload = jpg.tobytes()
-                conn.sendall(struct.pack("!I", len(payload)))
-                conn.sendall(payload)
-
-        except Exception as e:
-            print("⚠️ Streamer stopped:", e)
-        finally:
+        while not stop_event.is_set():
             try:
-                if conn:
-                    conn.close()
+                frame = display_queue.get(timeout=1)
             except:
-                pass
-            srv.close()
-            print("🛑 Streamer beendet")
+                continue
+
+            ok, jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
+            if not ok:
+                continue
+
+            conn.sendall(
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + jpg.tobytes() + b"\r\n"
+            )
+
