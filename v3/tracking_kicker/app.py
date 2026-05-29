@@ -527,4 +527,12 @@ if __name__ == "__main__":
             source = RawReplaySource(str(VIDEO_PATH))
 
         app = KickerApp(source)
-        app.run()
+
+        try:
+            app.run()
+        finally:
+            try:
+                source.release()
+                print("✅ Kamera freigegeben")
+            except:
+                pass
