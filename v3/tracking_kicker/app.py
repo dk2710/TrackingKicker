@@ -23,6 +23,7 @@ from .model.VisionConfig import VisionConfig
 from .storage import JsonStore
 from .ui.distortion_tuner import DistortionTunerUI
 from .comms.ws_gateway import WSGateway
+from v3.tracking_kicker.Objects.Frames import Frame
 
 
 # -------------------------------------------------
@@ -221,22 +222,11 @@ class KickerApp:
             except:
                 continue
 
-            bgr = cv2.cvtColor(frame.frame, cv2.COLOR_BayerRG2BGR)
-            bgr = self.dist.apply(bgr)
-            meas = detector.detect(bgr)
-            overlay = bgr.copy()
+            frame.frame = cv2.cvtColor(frame.frame, cv2.COLOR_BayerRG2BGR)
 
+            frame.frame = self.dist.apply(frame.frame)
             n += 1
             now = time.perf_counter()
-            if now - last_log >= 1.0:
-                dt = now - last_log
-                host_fps = n / dt
-                print(f"[CAM] AnalysierenFPS={host_fps:.1f} | ")
-                analyzer.fps = host_fps
-                last_log = now
-                n = 0
-
-            # Replay-Buffer füllen (rohe Frames + Zeit)
             if now - self._replay_last_store >= self._replay_interval:
                 with replay_lock:
                     replay_buffer.append((frame.frame, frame.timestamp))
@@ -244,11 +234,8 @@ class KickerApp:
                         replay_buffer.popleft()
                 self._replay_last_store = now
 
-            # Tor-Event erkannt?
-            if analyzer.draw_overlay(overlay, meas) is True:
-                # Wenn HEADLESS -> an Angular streamen (WS).
-                # Wenn nicht HEADLESS -> lokales Fenster abspielen.
-                self.play_last_seconds()
+            meas = detector.detect(frame)
+            analyzer.draw_overlay(frame)
 
             # display_queue: keep-latest
             if dp_queue.full():
@@ -256,7 +243,23 @@ class KickerApp:
                     dp_queue.get_nowait()
                 except:
                     pass
-            dp_queue.put(overlay)
+            dp_queue.put(frame.frame)
+
+            goal =False
+            if meas is True:
+                goal = analyzer.process_frame(frame)
+
+            if goal is True:
+                self.play_last_seconds()
+
+            # FPS immer berechnen
+            if now - last_log >= 1.0:
+                dt = now - last_log
+                host_fps = n / dt
+                print(f"[CAM] AnalysierenFPS={host_fps:.1f} | ")
+                last_log = now
+                n = 0
+
 
     def play_last_seconds(self):
         """Spielt lokal ab (GUI) oder sendet im HEADLESS-Fall das Replay an Angular (WS)."""
@@ -294,10 +297,8 @@ class KickerApp:
                 idx += 1
 
             frame, _ = frames[idx]
-            frame = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
-            bgr = frame[:, :, [2, 1, 0]]
 
-            gui_imshow("Replay (letzte 3 Sekunden)", bgr)
+            gui_imshow("Replay (letzte 3 Sekunden)", frame)
             if gui_wait_key(int(target_dt * 1000)) == 27:
                 break
 

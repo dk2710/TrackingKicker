@@ -2,236 +2,124 @@ import cv2
 import numpy as np
 import math
 from typing import Optional, Tuple
-
+from v3.tracking_kicker.Objects.Frames import Frame
 
 class BallDetector:
     def __init__(
         self,
-        hsv_low: Tuple[int, int, int] = (100, 110, 90),    # etwas toleranter
-        hsv_high: Tuple[int, int, int] = (112, 255, 255), # etwas toleranter (Gelb kann variieren)
+        hsv_low: Tuple[int, int, int] = (100, 110, 90),
+        hsv_high: Tuple[int, int, int] = (112, 255, 255),
         area_min: float = 60.0,
         area_max: float = 12000.0,
-        use_morph: bool = True,
         debug: bool = False,
     ):
         self.hsv_low = hsv_low
         self.hsv_high = hsv_high
         self.area_min = area_min
         self.area_max = area_max
-        self.use_morph = use_morph
         self.debug = debug
 
-        # gelernter Radius (Stabilisierung)
         self.expected_r: Optional[float] = None
-
-        # Last good detection (für kurze Aussetzer)
         self._last_xy: Optional[Tuple[int, int]] = None
         self._miss = 0
-        self.max_hold_frames = 2  # hält 1-2 Frames stabil, wenn Ball kurz "weg"
+        self.max_hold_frames = 2
 
-    # -----------------------------
-    # Masking ----- Angucken
-    # -----------------------------
+    # ---------------------------------------------------------
+    # Mask
+    # ---------------------------------------------------------
     def _mask_ball(self, frame: np.ndarray) -> np.ndarray:
-        # Nur wenn 1-Kanal (Bayer/Gray) -> demosaic
         if frame.ndim == 2:
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)  # ggf. anderes Muster
-        elif frame.ndim == 3 and frame.shape[2] == 3:
-            frame_bgr = frame  # ist schon BGR
-        elif frame.ndim == 3 and frame.shape[2] == 4:
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
         else:
-            raise ValueError(f"Unexpected frame shape: {frame.shape}")
+            frame_bgr = frame
 
-        blur = cv2.GaussianBlur(frame_bgr, (5, 5), 0)
-        hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
+        hsv = cv2.cvtColor(cv2.GaussianBlur(frame_bgr, (5, 5), 0), cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, self.hsv_low, self.hsv_high)
 
-        if self.use_morph:
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        if self.debug:
+            cv2.imshow("Ball mask", mask)
 
         return mask
 
-    def mask(self, frame_bgr: np.ndarray) -> np.ndarray:
-        m = self._mask_ball(frame_bgr)
-        if self.debug:
-            cv2.imshow("Ball mask (FULL)", m)
-        return m
-
-    # -----------------------------
-    # Geometry helpers
-    # -----------------------------
+    # ---------------------------------------------------------
+    # Geometry
+    # ---------------------------------------------------------
     @staticmethod
-    def _circularity(contour) -> float:
-        a = cv2.contourArea(contour)
-        p = cv2.arcLength(contour, True)
-        if p <= 1e-6:
-            return 0.0
-        return float(4.0 * math.pi * a / (p * p))
+    def _circularity(c) -> float:
+        a = cv2.contourArea(c)
+        p = cv2.arcLength(c, True)
+        return 4.0 * math.pi * a / (p * p) if p > 1e-6 else 0.0
 
     @staticmethod
-    def _solidity(contour) -> float:
-        a = cv2.contourArea(contour)
+    def _solidity(c) -> float:
+        a = cv2.contourArea(c)
         if a <= 1e-6:
             return 0.0
-        hull = cv2.convexHull(contour)
+        hull = cv2.convexHull(c)
         ha = cv2.contourArea(hull)
-        if ha <= 1e-6:
-            return 0.0
-        return float(a / ha)
+        return a / ha if ha > 1e-6 else 0.0
 
-    def _score_contour(self, contour, exp_r: Optional[float]) -> Tuple[float, Tuple[int,int,int]]:
-        a = cv2.contourArea(contour)
-        (x, y), r = cv2.minEnclosingCircle(contour)
-        if r < 2:
-            return -1e9, (0,0,0)
+    def _score(self, c, exp_r: Optional[float]):
+        a = cv2.contourArea(c)
+        (x, y), r = cv2.minEnclosingCircle(c)
 
-        circ = self._circularity(contour)
-        sol = self._solidity(contour)
+        circ = self._circularity(c)
+        sol = self._solidity(c)
 
-        # Radius-Nähe (wenn expected_r existiert)
         r_score = 0.0
-        if exp_r is not None and exp_r > 1e-6:
-            # relative Abweichung
+        if exp_r:
             rel = abs(r - exp_r) / exp_r
-            r_score = -rel  # kleiner rel = besser
+            r_score = -rel
 
-        # Area-Liebling: nicht blind größte, aber leicht bevorzugt
-        a_score = math.log(max(a, 1.0))
+        score = (2.2 * circ) + (1.2 * sol) + (0.6 * r_score) + (0.1 * math.log(max(a, 1.0)))
+        return score, (int(x), int(y), int(r))
 
-        # Gesamt: Circularity + Solidity dominieren, Radius hilft stabilisieren
-        score = (2.2 * circ) + (1.2 * sol) + (0.6 * r_score) + (0.10 * a_score)
-
-        return score, (int(round(x)), int(round(y)), int(round(r)))
-
-    def _is_reliable(self, contour, r: float) -> bool:
-        circ = self._circularity(contour)
-        sol = self._solidity(contour)
-        # zuverlässiger: Kreisig + nicht zu konkav
-        return (circ >= 0.55) and (sol >= 0.85) and (r >= 2.0)
-
-    # -----------------------------
+    # ---------------------------------------------------------
     # Detection
-    # -----------------------------
-    def detect(self, frame_bgr: np.ndarray) -> Optional[Tuple[int, int, int]]:
-        mask = self._mask_ball(frame_bgr)
-
-        if self.debug:
-            cv2.imshow("Ball mask (FULL)", mask)
-
+    # ---------------------------------------------------------
+    def detect(self, frame: Frame):
+        mask = self._mask_ball(frame.frame)
         cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
         if not cnts:
-            # kurzer Hold (gegen flackern)
-            if self._last_xy is not None and self._miss < self.max_hold_frames and self.expected_r is not None:
-                self._miss += 1
-                return (self._last_xy[0], self._last_xy[1], int(round(self.expected_r)))
-            self._last_xy = None
+            frame.ball = None
             return None
 
-        exp_r = self.expected_r
-
-        # Kandidaten filtern & scoren
-        best_score = -1e9
-        best_c = None
-        best_trip = None
+        candidates = []
 
         for c in cnts:
-            a = cv2.contourArea(c)
             (x, y), r = cv2.minEnclosingCircle(c)
 
-            # Grundfilter
-            if not (self.area_min < a < self.area_max):
+            # Radius-Filter
+            if not (5 < r < 25):
                 continue
 
-            # Größenfilter nach gelerntem Ball
-            if self.expected_r is not None:
-                if r < 0.65 * self.expected_r:
-                    continue
-                if r > 1.45 * self.expected_r:
-                    continue
+            # Circularity
+            circ = self._circularity(c)
+            if circ < 0.5:
+                continue
 
-            score, trip = self._score_contour(c, exp_r)
-            if score > best_score:
-                best_score = score
-                best_c = c
-                best_trip = trip
+            # Solidity
+            sol = self._solidity(c)
+            if sol < 0.85:
+                continue
 
-        if best_c is None or best_trip is None:
-            # Hold
-            if self._last_xy is not None and self._miss < self.max_hold_frames and self.expected_r is not None:
-                self._miss += 1
-                return (self._last_xy[0], self._last_xy[1], int(round(self.expected_r)))
-            self._last_xy = None
+            candidates.append((c, (x, y, r)))
+
+        if not candidates:
+            frame.ball = None
             return None
 
-        x_i, y_i, r_i = best_trip
-        (_, _), r_float = cv2.minEnclosingCircle(best_c)
+        _, (x, y, r) = max(candidates, key=lambda t: cv2.contourArea(t[0]))
 
-        # 🔒 Initiale Ballgröße setzen
-        if self.expected_r is None and r_float >= 5:
-            self.expected_r = float(r_float)
+        # Hier speicherst du ALLES in einem Feld
+        frame.ball = (int(x), int(y), int(r))
 
-        reliable = self._is_reliable(best_c, r_float)
+        return True
 
-        if reliable:
-            # expected_r glätten
-            if self.expected_r is None:
-                self.expected_r = float(r_float)
-            else:
-                self.expected_r = 0.85 * self.expected_r + 0.15 * float(r_float)
 
-            self._last_xy = (x_i, y_i)
-            self._miss = 0
-            return (x_i, y_i, max(2, int(round(r_float))))
 
-        # Recovery: Wenn wir expected_r haben, nutze Hough in ROI (deine Idee, aber etwas stabiler)
-        if self.expected_r is not None:
-            exp_r = float(self.expected_r)
 
-            bx, by, bw, bh = cv2.boundingRect(best_c)
-            pad = int(max(18, exp_r * 2.0))
-            H, W = frame_bgr.shape[:2]
-            x0 = max(0, bx - pad)
-            y0 = max(0, by - pad)
-            x1 = min(W, bx + bw + pad)
-            y1 = min(H, by + bh + pad)
-
-            roi = frame_bgr[y0:y1, x0:x1]
-            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-            gray = cv2.GaussianBlur(gray, (7, 7), 1.5)
-
-            minR = max(2, int(exp_r * 0.7))
-            maxR = max(minR + 2, int(exp_r * 1.35))
-
-            circles = cv2.HoughCircles(
-                gray,
-                cv2.HOUGH_GRADIENT,
-                dp=1.2,
-                minDist=max(10, int(exp_r)),
-                param1=120,
-                param2=16,  # leicht sensibler
-                minRadius=minR,
-                maxRadius=maxR
-            )
-
-            if circles is not None:
-                c0 = circles[0][0]
-                cx, cy, cr = float(c0[0]), float(c0[1]), float(c0[2])
-                x_f = int(round(cx + x0))
-                y_f = int(round(cy + y0))
-                r_f = int(round(cr))
-
-                self._last_xy = (x_f, y_f)
-                self._miss = 0
-                return (x_f, y_f, r_f)
-
-            # Fallback: konturzentrum + expected radius
-            self._last_xy = (x_i, y_i)
-            self._miss = 0
-            return (x_i, y_i, int(round(exp_r)))
-
-        # Ohne expected_r: nimm bestes Fragment
-        self._last_xy = (x_i, y_i)
-        self._miss = 0
-        return (x_i, y_i, max(2, r_i))

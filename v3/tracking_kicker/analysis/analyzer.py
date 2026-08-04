@@ -12,7 +12,7 @@ from v3.tracking_kicker.analysis.rod_control import RodControlTracker
 class KickerAnalyzer:
     def __init__(self, goals_cfg: GoalsConfig, field_cfg: FieldConfig | None = None):
 
-        self.fps = 0.0
+        self.prev_ball_frame = None
         self.goals_cfg = goals_cfg
 
         # Ball motion (nur aus Messungen!)
@@ -24,7 +24,7 @@ class KickerAnalyzer:
         self._speed_peak = 0.0
         self._speed_display = 0
         self._speed_window_start = time.perf_counter()
-        self._speed_window = 0.2
+        self._speed_window = 0.5
 
         # Score
         self.score_left = 0
@@ -52,21 +52,6 @@ class KickerAnalyzer:
                 rods_x_norm=self.field_cfg.rods.xs_norm
             )
 
-    def _update_motion(self, x: int, y: int) -> None:
-        if self.prev_xy is not None:
-            dx = x - self.prev_xy[0]
-            dy = y - self.prev_xy[1]
-
-            inst_vx = dx * self.fps
-            inst_vy = dy * self.fps
-            inst_speed = math.hypot(inst_vx, inst_vy)
-
-            a = 0.2
-            self.vx_s = (1 - a) * self.vx_s + a * inst_vx
-            self.vy_s = (1 - a) * self.vy_s + a * inst_vy
-            self.speed_s = (1 - a) * self.speed_s + a * inst_speed
-
-        self.prev_xy = (x, y)
 
     def _update_goals(self, ball, frame_shape):
         goalL = goalR = False
@@ -134,8 +119,69 @@ class KickerAnalyzer:
 
         cv2.arrowedLine(frame, (x, y), (x2, y2), (0, 255, 0), 3, tipLength=0.3)
 
-    def draw_overlay(self, frame, ball, ball_mask=None, draw_goal_boxes=False)-> bool:
-        h, w = frame.shape[:2]
+    def process_frame(self, frame):
+        h, w = frame.frame.shape[:2]
+
+        # Torerkennung
+        goalL, goalR = self._update_goals(frame.ball, frame.frame.shape)
+
+        # Rod-Control
+        if self.rod_control is not None and frame.ball is not None:
+            x, y, r = frame.ball
+            x_norm = x / w
+            self.rod_control.update(x_norm)
+
+        # Homography vorbereiten
+        self._ensure_homography(frame.frame.shape)
+
+        # km/h Berechnung
+        # km/h Berechnung
+        if frame.ball is not None:
+            x, y, r = frame.ball
+            world = self._img_to_cm(x, y)
+
+            if world is not None:
+                if self.prev_world is not None and self.prev_ball_time is not None:
+
+                    # Zeitdifferenz
+                    dt = frame.timestamp - self.prev_ball_time
+                    if dt > 0:
+                        # Distanz in cm
+                        dX = world[0] - self.prev_world[0]
+                        dY = world[1] - self.prev_world[1]
+                        dist_cm = math.hypot(dX, dY)
+
+                        # Geschwindigkeit in cm/s
+                        inst_cm_s = dist_cm / dt
+
+                        # Geschwindigkeit in km/h
+                        inst_kmh = inst_cm_s * 0.036
+
+                        # Peak / Anzeige
+                        now = time.perf_counter()
+                        if inst_kmh > self._speed_peak:
+                            self._speed_peak = inst_kmh
+                        if now - self._speed_window_start >= self._speed_window:
+                            self._speed_display = int(round(self._speed_peak))
+                            self._speed_peak = 0.0
+                            self._speed_window_start = now
+
+                        # Glättung
+                        a = 0.2
+                        self.speed_kmh_s = (1 - a) * self.speed_kmh_s + a * inst_kmh
+
+                # Speichern für nächsten Frame
+                self.prev_world = world
+                self.prev_ball_time = frame.timestamp
+
+        else:
+            self.prev_world = None
+            self.prev_ball_time = None
+
+        return goalL, goalR
+
+    def draw_overlay(self, frame, draw_goal_boxes=False):
+        h, w = frame.frame.shape[:2]
 
         # Tor-ROIs optional zeichnen
         if draw_goal_boxes:
@@ -145,14 +191,19 @@ class KickerAnalyzer:
                 y0 = int(g.y0 * h)
                 x1 = int(g.x1 * w)
                 y1 = int(g.y1 * h)
-                cv2.rectangle(frame, (x0, y0), (x1, y1), color, 4)
+                cv2.rectangle(frame.frame, (x0, y0), (x1, y1), color, 4)
 
-        goalL, goalR = self._update_goals(ball, frame.shape)
+        # Ball zeichnen
+        if frame.ball is not None:
+            x, y, r = frame.ball
+            cv2.circle(frame.frame, (int(x), int(y)), max(2, int(r)), (0, 255, 255), 3)
+            self._draw_arrow(frame.frame, int(x), int(y))
 
+        # Rod-Control anzeigen
         if self.rod_control is not None:
             for i, cnt in enumerate(self.rod_control.get_counts()):
                 cv2.putText(
-                    frame,
+                    frame.frame,
                     f"Rod {i + 1}: {cnt}",
                     (20, 100 + i * 22),
                     cv2.FONT_HERSHEY_SIMPLEX,
@@ -160,79 +211,14 @@ class KickerAnalyzer:
                     (255, 255, 0),
                     2
                 )
-        # Ball zeichnen + Bewegung nur wenn Ball vorhanden
-        if ball is not None:
-            x, y, r = ball
 
-            if self.rod_control is not None:
-                x_norm = x / w
-                self.rod_control.update(x_norm)
-
-            # Homography (für km/h) vorbereiten
-            self._ensure_homography(frame.shape)
-
-            now = time.perf_counter()
-            if self._last_t is not None:
-                dt = now - self._last_t
-                if dt > 0:
-                    self.fps = 1.0 / dt
-            self._last_t = now
-
-
-
-            # Pixel-Speed/Richtung
-            # self._update_motion(x, y)
-
-            # km/h-Speed (wenn field_cfg vorhanden)
-            world = self._img_to_cm(x, y)
-            if world is not None:
-                if self.prev_world is not None:
-                    dX = world[0] - self.prev_world[0]  # cm
-                    dY = world[1] - self.prev_world[1]  # cm
-                    inst_cm_s = math.hypot(dX, dY) * self.fps
-                    inst_kmh = inst_cm_s * 0.036
-
-                    now = time.perf_counter()
-
-                    #Durchschnitt berechnen der Geschwindigkeit
-                    if inst_kmh > self._speed_peak:
-                        self._speed_peak = inst_kmh
-                    if now - self._speed_window_start >= self._speed_window:
-                        self._speed_display = int(round(self._speed_peak))
-                        self._speed_peak = 0.0
-                        self._speed_window_start = now
-
-                    _speed_display = int(round(self._speed_peak))
-                    a = 0.2
-                    self.speed_kmh_s = (1 - a) * self.speed_kmh_s + a * inst_kmh
-                self.prev_world = world
-
-            cv2.circle(frame, (x, y), max(2, int(r)), (0, 255, 255), 3)
-            self._draw_arrow(frame, x, y)
-
-        else:
-            # wichtig: verhindert "Speed-Spikes", wenn Ball mal fehlt
-            self.prev_xy = None
-            self.prev_world = None
-
-        # UI Texte (Score, Speed etc.)
-        cv2.putText(frame, f"GOALS  LEFT: {self.score_left}   RIGHT: {self.score_right}",
+        # Score
+        cv2.putText(frame.frame, f"GOALS LEFT: {self.score_left} RIGHT: {self.score_right}",
                     (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
 
-        cv2.putText(frame, f"Speed: {self._speed_display} km/h",
+        # Speed
+        cv2.putText(frame.frame, f"Speed: {self._speed_display} km/h",
                     (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-
-        if goalL:
-            cv2.putText(frame, "GOAL LEFT", (w // 2 - 130, 110),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.3, (0, 0, 255), 4)
-            return goalL
-
-        if goalR:
-            cv2.putText(frame, "GOAL RIGHT", (w // 2 - 150, 110),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.3, (255, 0, 0), 4)
-            return goalR
-
-        return False
 
     def _ensure_homography(self, frame_shape) -> None:
         if self.field_cfg is None or self.H_img2cm is not None:
