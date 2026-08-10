@@ -1,3 +1,5 @@
+from xml.etree.ElementTree import tostring
+
 import cv2
 import math
 import numpy as np
@@ -21,10 +23,22 @@ class KickerAnalyzer:
         self.vy_s: float = 0.0  # px/s
         self.speed_s: float = 0.0
 
-        self._speed_peak = 0.0
         self._speed_display = 0
         self._speed_window_start = time.perf_counter()
-        self._speed_window = 0.5
+        self._speed_window = 0.1
+        self.min_dt = 0.015  # 15 ms
+        self.prev_ball_time = None
+
+        self.ball_history = []  # Liste aus (timestamp, world_x, world_y)
+        self.history_size = 8  # über 8 Frames mitteln
+
+        # Buffer für die letzten 20 Frames
+        self.world_buffer = []
+        self.time_buffer = []
+
+        self._speed_peak = 0.0
+        self._speed_peak_time = time.perf_counter()
+        self._speed_peak_hold = 1 # 0.5 Sekunden halten
 
         # Score
         self.score_left = 0
@@ -134,49 +148,80 @@ class KickerAnalyzer:
         # Homography vorbereiten
         self._ensure_homography(frame.frame.shape)
 
-        # km/h Berechnung
-        # km/h Berechnung
+
+        WINDOW = 10
+
+        # Ball erkannt?
         if frame.ball is not None:
             x, y, r = frame.ball
             world = self._img_to_cm(x, y)
-
-            if world is not None:
-                if self.prev_world is not None and self.prev_ball_time is not None:
-
-                    # Zeitdifferenz
-                    dt = frame.timestamp - self.prev_ball_time
-                    if dt > 0:
-                        # Distanz in cm
-                        dX = world[0] - self.prev_world[0]
-                        dY = world[1] - self.prev_world[1]
-                        dist_cm = math.hypot(dX, dY)
-
-                        # Geschwindigkeit in cm/s
-                        inst_cm_s = dist_cm / dt
-
-                        # Geschwindigkeit in km/h
-                        inst_kmh = inst_cm_s * 0.036
-
-                        # Peak / Anzeige
-                        now = time.perf_counter()
-                        if inst_kmh > self._speed_peak:
-                            self._speed_peak = inst_kmh
-                        if now - self._speed_window_start >= self._speed_window:
-                            self._speed_display = int(round(self._speed_peak))
-                            self._speed_peak = 0.0
-                            self._speed_window_start = now
-
-                        # Glättung
-                        a = 0.2
-                        self.speed_kmh_s = (1 - a) * self.speed_kmh_s + a * inst_kmh
-
-                # Speichern für nächsten Frame
-                self.prev_world = world
-                self.prev_ball_time = frame.timestamp
-
+            self.world_buffer.append(world)
         else:
-            self.prev_world = None
-            self.prev_ball_time = None
+            # Ball nicht erkannt → None eintragen
+            self.world_buffer.append(None)
+
+        # Zeitstempel immer speichern
+        self.time_buffer.append(frame.timestamp)
+
+        # Buffer begrenzen
+        if len(self.world_buffer) > WINDOW:
+            self.world_buffer.pop(0)
+            self.time_buffer.pop(0)
+
+        # Nur messen, wenn 20 Frames im Fenster sind
+        if len(self.world_buffer) == WINDOW:
+
+            # Alle echten Ballpunkte extrahieren
+            valid_points = [(i, p) for i, p in enumerate(self.world_buffer) if p is not None]
+
+            # Wenn weniger als 2 echte Punkte → keine Messung möglich
+            if len(valid_points) < 2:
+                self.speed_kmh_s = 0.0
+                return
+
+            # Start = erster echter Punkt
+            start_index, start = valid_points[0]
+
+            # End = letzter echter Punkt
+            end_index, end = valid_points[-1]
+
+            # Distanz
+            dX = end[0] - start[0]
+            dY = end[1] - start[1]
+            dist_cm = math.hypot(dX, dY)
+
+            # Zeit zwischen diesen beiden Frames
+            dt = self.time_buffer[end_index] - self.time_buffer[start_index]
+
+            if dt > 0:
+                inst_cm_s = dist_cm / dt
+                inst_kmh = inst_cm_s * 0.036
+
+                # ECHTEN Wert speichern
+                self.speed_kmh_s = inst_kmh
+
+                # --- PEAK HOLD LOGIK ---
+                now = time.perf_counter()
+
+                # Peak aktualisieren, wenn neuer Wert größer ist
+                if inst_kmh > self._speed_peak:
+                    self._speed_peak = inst_kmh
+                    self._speed_peak_time = now
+
+                    print("X 1.", end[0], "X 3.", start[0], )
+                    print("Y 1.", end[1], "Y 3.", start[1], )
+                    print("dist_cm:", dist_cm)
+                    print("dt:", self.time_buffer[end_index], self.time_buffer[start_index])
+                    print("inst_kmh:", inst_kmh)
+
+                # Peak zurücksetzen, wenn 0.5s vergangen sind
+                if now - self._speed_peak_time > self._speed_peak_hold:
+                    self._speed_peak = inst_kmh
+
+                # Anzeige = Peak (optional geglättet)
+                a = 0.2
+                self._speed_display = (1 - a) * self._speed_display + a * self._speed_peak
+
 
         return goalL, goalR
 

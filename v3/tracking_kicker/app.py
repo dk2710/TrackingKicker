@@ -94,6 +94,8 @@ class KickerApp:
         self._replay_interval = 1.0 / 60.0
         self._max_replay_frames = int(60 * config.replay_seconds)
 
+        self.global_frame_index = 0
+
     @staticmethod
     def _get_start_mode() -> bool:
         mode = input("1 = Neue Gesamtkalibrierung | 2 = Laden: ").strip()
@@ -235,6 +237,8 @@ class KickerApp:
                 self._replay_last_store = now
 
             meas = detector.detect(frame)
+            self.global_frame_index += 1
+
             analyzer.draw_overlay(frame)
 
             # display_queue: keep-latest
@@ -249,8 +253,10 @@ class KickerApp:
             if meas is True:
                 goal = analyzer.process_frame(frame)
 
+
             if goal is True:
                 self.play_last_seconds()
+
 
             # FPS immer berechnen
             if now - last_log >= 1.0:
