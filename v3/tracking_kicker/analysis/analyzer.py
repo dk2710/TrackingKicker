@@ -318,3 +318,7 @@ class KickerAnalyzer:
                 return i
 
         return len(rods)  # letzte Zone
+
+    @property
+    def speed_display(self):
+        return self._speed_display

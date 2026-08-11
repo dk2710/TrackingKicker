@@ -108,7 +108,9 @@ class BaslerSource:
     def release(self) -> None:
         if self._closed:
             return
+
         self._closed = True
+
         try:
             if self.camera.IsGrabbing():
                 self.camera.StopGrabbing()
@@ -120,6 +122,11 @@ class BaslerSource:
                 self.camera.Close()
         except Exception as e:
             print(f"⚠️ Camera close failed: {e}")
+
+        try:
+            del self.camera
+        except Exception:
+            pass
 
     def getTemperatur(self, camera) -> str:
         try:

@@ -1,18 +1,19 @@
-# -*- coding: utf-8 -*-
-import cv2
-from typing import Any, Dict, Optional
-from pathlib import Path
-import time
-from queue import Queue
-import threading
-from datetime import datetime
-import numpy as np
-import asyncio
-from collections import deque
-import os
 
-from v3.tracking_kicker.config import AppConfig
-from .SocketJpegStreamer import SocketJpegStreamer
+import cv2
+import os
+import time
+import threading
+from collections import deque
+from datetime import datetime
+from pathlib import Path
+from queue import Queue, Empty
+from typing import Any, Dict, Optional
+from flask import Flask, jsonify, send_file
+
+import numpy as np
+import traceback
+
+from .config import AppConfig
 from .RawReplaySource import RawReplaySource
 from .BaslerSource import BaslerSource
 from .calibration import CalibrationPipeline
@@ -22,25 +23,13 @@ from .distoration import DistortionCorrector
 from .model.VisionConfig import VisionConfig
 from .storage import JsonStore
 from .ui.distortion_tuner import DistortionTunerUI
-from .comms.ws_gateway import WSGateway
-from v3.tracking_kicker.Objects.Frames import Frame
 
 
 # -------------------------------------------------
-# Globale Konfiguration / Queues / Buffer
+# Globale Konfiguration
 # -------------------------------------------------
 vision = VisionConfig.load()
 config = AppConfig.load()
-
-replay_buffer = deque(maxlen=int(60 * config.replay_seconds))  # (frame, timestamp)
-replay_lock = threading.Lock()
-
-frame_queue = Queue(maxsize=2)   # klein halten
-display_queue = Queue(maxsize=1) # keep-latest
-recording_queue = Queue()
-
-stop_event = threading.Event()
-record_event = threading.Event()
 
 VIDEO_PATH = config.videos_dir / "test.npz"
 
@@ -49,29 +38,36 @@ Analyse_Video_Path.mkdir(parents=True, exist_ok=True)
 
 HEADLESS = os.environ.get("HEADLESS", "0") == "1"
 
+
 # -------------------------------------------------
-# GUI helpers (no-op bei HEADLESS)
+# GUI helpers
 # -------------------------------------------------
 def gui_named_window(name: str):
     if not HEADLESS:
         cv2.namedWindow(name, cv2.WINDOW_NORMAL)
 
+
 def gui_imshow(name: str, frame):
     if not HEADLESS:
         cv2.imshow(name, frame)
 
+
 def gui_wait_key(ms: int = 1) -> int:
     if not HEADLESS:
         return cv2.waitKey(ms) & 0xFF
-    return 255  # "no key"
+
+    return 255
+
 
 def gui_destroy_window(name: str):
     if not HEADLESS:
         cv2.destroyWindow(name)
 
+
 def gui_destroy_all():
     if not HEADLESS:
         cv2.destroyAllWindows()
+
 
 # -------------------------------------------------
 # KickerApp
@@ -79,27 +75,151 @@ def gui_destroy_all():
 class KickerApp:
     def __init__(self, source):
         self.video = source
+
         self.cfg: Optional[Dict[str, Any]] = None
         self.dist = DistortionCorrector(config.camera)
 
-        # WebSocket-Gateway (für Angular)
-        self.ws = WSGateway(host="0.0.0.0", port=8777, token="SUPERSECRET")
-        self.ws_loop: Optional[asyncio.AbstractEventLoop] = None
-
         print(f"📁 Verzerrung config: {config.camera}")
+
         cv2.setUseOptimized(True)
 
-        # Replay-Steuerung
+        # Queues gehören jetzt zur App
+        self.frame_queue = Queue(maxsize=2)
+        self.display_queue = Queue(maxsize=1)
+        self.recording_queue = Queue()
+
+        self.raw_queue = Queue(maxsize=2)
+        self.processed_queue = Queue(maxsize=2)
+
+        self.history_lock = threading.Lock()
+
+        # Events gehören jetzt zur App
+        self.stop_event = threading.Event()
+        self.record_event = threading.Event()
+
+        # Replay gehört jetzt zur App
+        self.replay_buffer = deque(maxlen=int(60 * config.replay_seconds))
+        self.replay_lock = threading.Lock()
+        self.history_frames = deque()
+
         self._replay_last_store = 0.0
         self._replay_interval = 1.0 / 60.0
         self._max_replay_frames = int(60 * config.replay_seconds)
 
-        self.global_frame_index = 0
+        self.api = Flask(__name__)
+        self.last_analysis = {}
+
+        self.api.add_url_rule(
+            "/test",
+            "test",
+            self.api_test,
+            methods=["GET"]
+        )
+        self.api.add_url_rule(
+            "/goal",
+            "goal",
+            self.api_goal,
+            methods=["GET"]
+        )
+        self.detector = BallDetector(debug=False)
+
+        self.analyzer = KickerAnalyzer(
+            goals_cfg=vision.goals,
+            field_cfg=vision.field,
+        )
+
+
+    def api_test(self):
+        print("TEST")
+        return jsonify({
+            "status": "ok"
+        })
+
+    def api_loop(self):
+        self.api.run(
+            host="0.0.0.0",
+            port=5000,
+            threaded=True,
+            use_reloader=False
+        )
+
+    def api_goal(self):
+
+        goal_detector = BallDetector(debug=False)
+
+        goal_analyzer = KickerAnalyzer(
+            goals_cfg=vision.goals,
+            field_cfg=vision.field,
+        )
+        frames = list(self.history_frames)
+
+        for frame in frames:
+            frame.frame = cv2.cvtColor(frame.frame, cv2.COLOR_BayerRG2BGR)
+            frame.frame = self.dist.apply(frame.frame)
+
+            goal_detector.detect(frame)
+            goal_analyzer.process_frame(frame)
+
+
+        speed = goal_analyzer.speed_display
+        video_path = self.create_goal_video(frames)
+
+        response = send_file(
+            video_path,
+            mimetype="video/mp4",
+            as_attachment=True
+        )
+
+        response.headers["Ball-Speed"] = str(speed)
+        #response.headers["Goal-Side"] = "red"
+        #response.headers["Analysis-FPS"] = "60"
+
+        return response
+
+    from pathlib import Path
+    from datetime import datetime
+    import cv2
+
+    def create_goal_video(self, frames):
+
+        if not frames:
+            raise ValueError("Keine Frames vorhanden")
+
+        output_dir = Path("videos")
+        output_dir.mkdir(exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+        video_path = output_dir / f"goal_{timestamp}.mp4"
+
+        first_frame = frames[0].frame
+        height, width = first_frame.shape[:2]
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+        writer = cv2.VideoWriter(
+            str(video_path),
+            fourcc,
+            60.0,
+            (width, height)
+        )
+
+        try:
+            for frame in frames:
+                writer.write(frame.frame)
+
+        finally:
+            writer.release()
+
+        print(f"✅ Goal Video erstellt: {video_path}")
+
+        return str(video_path)
 
     @staticmethod
     def _get_start_mode() -> bool:
         mode = input("1 = Neue Gesamtkalibrierung | 2 = Laden: ").strip()
         return mode == "1"
+
 
     def tune_distortion_live(self):
         if HEADLESS:
@@ -107,30 +227,38 @@ class KickerApp:
             return
 
         ret, frame = self.video.read()
+
         if not ret or frame is None:
             print("❌ Kein Frame verfügbar")
             return
 
         ui = DistortionTunerUI(self.dist.camera)
+
         while True:
             ui.update_camera_if_needed()
+
             corrected = self.dist.apply(frame.frame)
+
             cv2.imshow("Distortion Tuning", corrected)
+
             key = cv2.waitKey(15) & 0xFF
+
             if key == 27:
                 break
+
             if key == ord("s"):
                 ui.save_to_config(config.config_path)
+
         cv2.destroyWindow("Distortion Tuning")
 
     def _load_or_calibrate(self) -> None:
         do_calibration = self._get_start_mode()
 
         if do_calibration:
-            # Distortion live tunen
             self.tune_distortion_live()
 
             ret, frame = self.video.read()
+
             if not ret or frame is None:
                 raise RuntimeError("❌ Kein Frame nach Distortion-Tuning")
 
@@ -139,149 +267,280 @@ class KickerApp:
 
             pipeline = CalibrationPipeline()
             self.cfg = pipeline.run(frame.frame)
+
             vision.save()
 
             print("✅ Kalibrierung gespeichert:", str(vision.DEFAULT_PATH))
+
         else:
             cfg = JsonStore.load(str(config.config_path))
+
             if cfg is None:
                 raise RuntimeError(f"❌ Kalibrierungsdatei nicht gefunden: {str(config.config_path)}")
+
             self.cfg = cfg
+
             print("📁 Kalibrierung geladen:", str(config.config_path))
 
         self.video.reset()
 
-    # ---------------------------------------------
-    # WS: Helper
-    # ---------------------------------------------
-    def _start_ws_gateway(self):
-        """Startet den WebSocket-Gateway in eigenem Event-Loop/Thread."""
-        self.ws_loop = asyncio.new_event_loop()
+    # -------------------------------------------------
+    # Camera Loop
+    # -------------------------------------------------
 
-        def _run_ws():
-            asyncio.set_event_loop(self.ws_loop)
-            self.ws_loop.run_until_complete(self.ws.start())
+    def camera_loop(self):
+        dropped = 0
 
-        t_ws = threading.Thread(target=_run_ws, daemon=True)
-        t_ws.start()
+        while not self.stop_event.is_set():
+            try:
+                ret, objframe = self.video.read()
 
-    def _publish_json(self, payload: Dict[str, Any]):
-        """Thread-sicher JSON an alle WS-Clients senden."""
-        if self.ws_loop is None:
-            return
-        fut = asyncio.run_coroutine_threadsafe(self.ws.broadcast_json(payload), self.ws_loop)
-        # optional: fut.result(timeout=?)
+                if not ret or objframe is None:
+                    continue
 
-    def _broadcast_frame(self, jpg_bytes: bytes):
-        """Thread-sicher Binärframe an alle WS-Clients senden."""
-        if self.ws_loop is None:
-            return
-        asyncio.run_coroutine_threadsafe(self.ws.broadcast_frame(jpg_bytes), self.ws_loop)
+                # Frame für die letzten 3 Sekunden speichern
+                self.history_frames.append(objframe)
 
-    def send_replay_over_ws(self, target_fps: int = 60, jpeg_quality: int = 80):
-        """Schickt die letzten Sekunden als JPEG-Binärframes über WebSocket an Angular."""
-        with replay_lock:
-            if len(replay_buffer) < 2:
-                print("⚠️ Nicht genug Frames für WS-Replay")
-                return
-            frames = list(replay_buffer)
+                # Alles älter als 3 Sekunden entfernen
+                while self.history_frames and objframe.timestamp - self.history_frames[0].timestamp > 3:
+                    self.history_frames.popleft()
 
-        input_fps = getattr(self.video, "fps", 60)
-        step = max(1, int(round(float(input_fps) / float(target_fps))))
-        sub = frames[::step] if step > 1 else frames
+                if self.frame_queue.full():
+                    try:
+                        self.frame_queue.get_nowait()
+                        dropped += 1
+                    except Empty:
+                        pass
 
-        # 1) Startsignal
-        self._publish_json({"type": "replay_start", "fps": target_fps, "frames": len(sub)})
+                self.frame_queue.put(objframe)
 
-        # 2) Frames (JPEG / Binär) senden
-        for (frame, _) in sub:
-            # Dein Buffer speichert "frame" roh (meist RGB). Für imencode brauchen wir BGR:
-            bgr = frame[:, :, [2, 1, 0]] if frame.ndim == 3 and frame.shape[2] == 3 else frame
-            ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
-            if not ok:
+                # Aufnahme bekommt bewusst eine Kopie vom Rohbild
+                # damit processing_loop das Objekt nicht vorher verändert
+                if self.record_event.is_set():
+                    try:
+                        self.recording_queue.put(objframe)
+                    except Exception as e:
+                        print(f"⚠️ Recording Queue Fehler: {e}")
+
+            except Exception as e:
+                print(f"❌ Camera-Loop Fehler: {e}")
+                traceback.print_exc()
+                self.stop_event.set()
+                break
+
+    def correction_loop(self):
+
+        while not self.stop_event.is_set():
+
+            try:
+                frame = self.raw_queue.get(timeout=0.5)
+
+                frame.frame = cv2.cvtColor(
+                    frame.frame,
+                    cv2.COLOR_BayerRG2BGR
+                )
+
+                frame.frame = self.dist.apply(
+                    frame.frame
+                )
+
+                with self.history_lock:
+
+                    self.history_frames.append(frame)
+
+                    while (
+                            self.history_frames
+                            and frame.timestamp - self.history_frames[0].timestamp > 3
+                    ):
+                        self.history_frames.popleft()
+
+                if self.processed_queue.full():
+                    try:
+                        self.processed_queue.get_nowait()
+                    except Empty:
+                        pass
+
+                self.processed_queue.put(frame)
+
+            except Empty:
                 continue
-            self._broadcast_frame(buf.tobytes())
 
-        # 3) Ende
-        self._publish_json({"type": "replay_end"})
+            except Exception as e:
+                print(f"❌ Correction-Loop Fehler: {e}")
+                traceback.print_exc()
+                self.stop_event.set()
+                break
 
-    # ---------------------------------------------
-    # Loops
-    # ---------------------------------------------
-    def processing_loop(self, frame_queue, dp_queue, stop_event):
-        detector = BallDetector(debug=False)
-        analyzer = KickerAnalyzer(
-            goals_cfg=vision.goals,
-            field_cfg=vision.field,
-        )
-        t0 = time.perf_counter()
-        last_log = t0
+    # -------------------------------------------------
+    # Processing Loop
+    # -------------------------------------------------
+    def processing_loop(self):
+        last_log = time.perf_counter()
         n = 0
 
-        while not stop_event.is_set():
+        while not self.stop_event.is_set():
             try:
-                frame = frame_queue.get(timeout=0.5)
-            except:
+                frame = self.frame_queue.get(timeout=0.5)
+
+                frame.frame = cv2.cvtColor(frame.frame, cv2.COLOR_BayerRG2BGR)
+                frame.frame = self.dist.apply(frame.frame)
+
+                now = time.perf_counter()
+                n += 1
+
+                if now - self._replay_last_store >= self._replay_interval:
+                    with self.replay_lock:
+                        self.replay_buffer.append((frame.frame.copy(), frame.timestamp))
+
+                        if len(self.replay_buffer) > self._max_replay_frames:
+                            self.replay_buffer.popleft()
+
+                    self._replay_last_store = now
+
+                meas = self.detector.detect(frame)
+
+                self.analyzer.draw_overlay(frame)
+
+                if self.display_queue.full():
+                    try:
+                        self.display_queue.get_nowait()
+                    except Empty:
+                        pass
+
+                self.display_queue.put(frame.frame)
+
+                goal = False
+
+                if meas is True:
+                    goal = self.analyzer.process_frame(frame)
+
+                if goal is True:
+                    self.play_last_seconds()
+
+                if now - last_log >= 1.0:
+                    dt = now - last_log
+                    host_fps = n / dt
+
+                    print(f"[CAM] AnalysierenFPS={host_fps:.1f} | ")
+
+                    last_log = now
+                    n = 0
+
+            except Empty:
                 continue
 
-            frame.frame = cv2.cvtColor(frame.frame, cv2.COLOR_BayerRG2BGR)
+            except Exception as e:
+                print(f"❌ Processing-Loop Fehler: {e}")
+                self.stop_event.set()
+                break
 
-            frame.frame = self.dist.apply(frame.frame)
-            n += 1
-            now = time.perf_counter()
-            if now - self._replay_last_store >= self._replay_interval:
-                with replay_lock:
-                    replay_buffer.append((frame.frame, frame.timestamp))
-                    if len(replay_buffer) > self._max_replay_frames:
-                        replay_buffer.popleft()
-                self._replay_last_store = now
+    # -------------------------------------------------
+    # Recording Loop
+    # -------------------------------------------------
+    def recording_loop(self):
+        raw_frames = []
+        raw_times = []
 
-            meas = detector.detect(frame)
-            self.global_frame_index += 1
+        recording = False
+        t_start = None
 
-            analyzer.draw_overlay(frame)
-
-            # display_queue: keep-latest
-            if dp_queue.full():
+        try:
+            while not self.stop_event.is_set():
                 try:
-                    dp_queue.get_nowait()
-                except:
-                    pass
-            dp_queue.put(frame.frame)
+                    want_record = self.record_event.is_set()
 
-            goal =False
-            if meas is True:
-                goal = analyzer.process_frame(frame)
+                    if want_record and not recording:
+                        print("▶️ RAW Recording gestartet")
 
+                        raw_frames.clear()
+                        raw_times.clear()
 
-            if goal is True:
-                self.play_last_seconds()
+                        t_start = time.perf_counter()
+                        recording = True
 
+                    if not want_record and recording:
+                        print(f"💾 SAVE START {len(raw_frames)}")
 
-            # FPS immer berechnen
-            if now - last_log >= 1.0:
-                dt = now - last_log
-                host_fps = n / dt
-                print(f"[CAM] AnalysierenFPS={host_fps:.1f} | ")
-                last_log = now
-                n = 0
+                        self._start_save_thread(raw_frames, raw_times)
 
+                        raw_frames.clear()
+                        raw_times.clear()
 
-    def play_last_seconds(self):
-        """Spielt lokal ab (GUI) oder sendet im HEADLESS-Fall das Replay an Angular (WS)."""
-        with replay_lock:
-            if len(replay_buffer) < 2:
-                print("⚠️ Nicht genug Frames für Replay")
-                return
-            frames = list(replay_buffer)
+                        recording = False
+                        t_start = None
 
-        if HEADLESS:
-            # Kein lokales Fenster -> WS-Output an Angular
-            self.send_replay_over_ws(target_fps=60, jpeg_quality=80)
+                    if not recording:
+                        time.sleep(0.01)
+                        continue
+
+                    raw_frame = self.recording_queue.get(timeout=0.2)
+
+                    raw_frames.append(raw_frame.copy())
+                    raw_times.append(time.perf_counter() - t_start)
+
+                except Empty:
+                    continue
+
+                except Exception as e:
+                    print(f"❌ Recording-Loop Fehler: {e}")
+                    self.stop_event.set()
+                    break
+
+        finally:
+            # Falls während laufender Aufnahme beendet wird,
+            # trotzdem alles speichern, was bereits aufgenommen wurde
+            if recording and len(raw_frames) > 0:
+                print(f"💾 SAVE BEIM BEENDEN {len(raw_frames)}")
+                self._start_save_thread(raw_frames, raw_times)
+
+    def _start_save_thread(self, raw_frames, raw_times):
+        frames_copy = raw_frames.copy()
+        times_copy = raw_times.copy()
+
+        threading.Thread(
+            target=self._save_raw_async,
+            args=(frames_copy, times_copy),
+            daemon=True
+        ).start()
+
+    def _save_raw_async(self, frames, times):
+        if not frames:
+            print("⚠️ Keine Frames zum Speichern vorhanden")
             return
 
-        # Lokales OpenCV-Playback
-        gui_named_window("Replay (letzte 3 Sekunden)")
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        filename = Analyse_Video_Path / f"session_raw_{ts}.npz"
+
+        try:
+            print("💾 SAVE THREAD START")
+
+            np.savez(
+                filename,
+                frames=np.stack(frames),
+                times=np.array(times)
+            )
+
+            print(f"✅ SAVE DONE: {filename}")
+
+        except Exception as e:
+            print(f"❌ Fehler beim Speichern der Aufnahme: {e}")
+
+    # -------------------------------------------------
+    # Replay
+    # -------------------------------------------------
+    def play_last_seconds(self):
+        with self.replay_lock:
+            if len(self.replay_buffer) < 2:
+                print("⚠️ Nicht genug Frames für Replay")
+                return
+
+            frames = list(self.replay_buffer)
+
+        if HEADLESS:
+            print("⚠️ HEADLESS aktiv → lokales Replay wird nicht angezeigt")
+            return
+
+        gui_named_window("Replay (letzte Sekunden)")
 
         target_fps = 120
         target_dt = 1.0 / target_fps
@@ -292,7 +551,7 @@ class KickerApp:
         play_start = time.perf_counter()
         idx = 0
 
-        while True:
+        while not self.stop_event.is_set():
             now = time.perf_counter()
             play_time = t_start + (now - play_start)
 
@@ -304,217 +563,118 @@ class KickerApp:
 
             frame, _ = frames[idx]
 
-            gui_imshow("Replay (letzte 3 Sekunden)", frame)
+            gui_imshow("Replay (letzte Sekunden)", frame)
+
             if gui_wait_key(int(target_dt * 1000)) == 27:
                 break
 
-        gui_destroy_window("Replay (letzte 3 Sekunden)")
+        gui_destroy_window("Replay (letzte Sekunden)")
 
-    def camera_loop(self, video, frame_queue, rec_queue, stop_event):
-        dropped = 0
-
-        while not stop_event.is_set():
-            try:
-                ret, objframe = video.read()
-            except Exception as e:
-                print(f"⚠️ Camera read exception: {e}")
-                time.sleep(0.01)
-                continue
-
-            if not ret or objframe is None:
-                continue
-
-            if frame_queue.full():
-                try:
-                    frame_queue.get_nowait()
-                    dropped += 1
-                except:
-                    pass
-
-            frame_queue.put(objframe)
-
-            if record_event.is_set():
-                rec_queue.put(objframe)
-
-    def save_last_seconds_mp4(self):
-        with replay_lock:
-            if len(replay_buffer) < 2:
-                print("⚠️ Nicht genug Frames für Video")
-                return
-            frames = list(replay_buffer)
-
-        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        out_path = Analyse_Video_Path / f"replay_{ts}.mp4"
-
-        h, w = frames[0][0].shape[:2]
-
-        target_fps = 60
-        input_fps = getattr(self.video, "fps", 60)
-        step = max(1, int(round(input_fps / target_fps)))
-
-        writer = cv2.VideoWriter(
-            str(out_path),
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            target_fps,
-            (w, h)
-        )
-
-        for i in range(0, len(frames), step):
-            frame, _ = frames[i]
-            bgr = frame[:, :, [2, 1, 0]]
-            writer.write(bgr)
-
-        writer.release()
-        print(f"🎞️ Replay gespeichert (≈60 FPS): {out_path}")
-
-    def recording_loop(self, queue, stop_event, record_event):
-        raw_frames = []
-        raw_times = []
-        recording = False
-        t_start = None
-
-        while not stop_event.is_set():
-            want_record = record_event.is_set()
-
-            # ▶️ START (Flanke)
-            if want_record and not recording:
-                print("▶️ RAW Recording gestartet")
-                raw_frames.clear()
-                raw_times.clear()
-                t_start = time.perf_counter()
-                recording = True
-
-            # ⏹ STOP (Flanke)
-            if not want_record and recording:
-                print(f"💾 SAVE START {len(raw_frames)}")
-                frames_copy = raw_frames.copy()
-                times_copy = raw_times.copy()
-                threading.Thread(
-                    target=self._save_raw_async,
-                    args=(frames_copy, times_copy),
-                    daemon=True
-                ).start()
-                raw_frames.clear()
-                raw_times.clear()
-                recording = False
-                t_start = None
-
-            if not recording:
-                time.sleep(0.01)
-                continue
-
-            # 🟢 Recording läuft → Frames sammeln
-            try:
-                frame = queue.get(timeout=0.2)
-            except:
-                continue
-
-            raw_frames.append(frame.copy())
-            raw_times.append(time.perf_counter() - t_start)
-
-    def _save_raw_async(self, frames, times):
-        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        filename = Analyse_Video_Path / f"session_raw_{ts}.npz"
-
-        print("💾 SAVE THREAD START")
-        np.savez(
-            filename,
-            frames=np.stack(frames),
-            times=np.array(times)
-        )
-        print(f"✅ SAVE DONE: {filename}")
-
-    # ---------------------------------------------
+    # -------------------------------------------------
     # Run
-    # ---------------------------------------------
-    def run(self) -> None:
-        # WS-Gateway starten (für Angular)
-        self._start_ws_gateway()
+    # -------------------------------------------------
+    def run(self) -> bool:
+        restart_requested = False
 
-        self._load_or_calibrate()
-        assert self.cfg is not None
+        try:
+            self.stop_event.clear()
+            self.record_event.clear()
+            self._load_or_calibrate()
 
-        t_cam = threading.Thread(
-            target=self.camera_loop,
-            args=(self.video, frame_queue, recording_queue, stop_event),
-            daemon=True
-        )
+            assert self.cfg is not None
 
-        t_proc = threading.Thread(
-            target=self.processing_loop,
-            args=(frame_queue, display_queue, stop_event),
-            daemon=True
-        )
+            self.t_api = threading.Thread(
+                target=self.api_loop,
+                daemon=True
+            )
+            self.t_cam = threading.Thread(
+                target=self.camera_loop,
+                daemon=True
+            )
 
-        t_rec = threading.Thread(
-            target=self.recording_loop,
-            args=(recording_queue, stop_event, record_event),
-            daemon=True
-        )
+            self.t_proc = threading.Thread(
+                target=self.processing_loop,
+                daemon=True
+            )
 
-        # Live-Stream bleibt wie gehabt
-        streamer = SocketJpegStreamer(host="0.0.0.0", port=9999, jpeg_quality=75, send_fps=60)
-        t_stream = threading.Thread(
-            target=streamer.run,
-            args=(display_queue, stop_event),
-            daemon=True
-        )
+            self.t_rec = threading.Thread(
+                target=self.recording_loop,
+                daemon=True
+            )
 
-        t_stream.start()
-        t_cam.start()
-        t_proc.start()
-        t_rec.start()
+            self.t_cam.start()
+            self.t_proc.start()
+            self.t_rec.start()
+            self.t_api.start()
 
-        print("⌨️  Taste 'r' = Aufnahme Start/Stop | ESC = Ende")
+            print("⌨️  Taste 'r' = Aufnahme Start/Stop | ESC/q = Ende | P = Neustart")
 
-        if HEADLESS:
-            print("🟢 HEADLESS=1 → keine OpenCV-GUI (kein imshow/waitKey).")
-            print("🟢 Live-Stream: http://<host>:9999/  |  WS für Angular: ws://<host>:8777/?token=SUPERSECRET")
-            try:
-                while not stop_event.is_set():
+            if HEADLESS:
+                print("🟢 HEADLESS=1 → keine OpenCV-GUI")
+
+                while not self.stop_event.is_set():
                     time.sleep(0.2)
-            except KeyboardInterrupt:
+
+            else:
+                while not self.stop_event.is_set():
+                    try:
+                        frame = self.display_queue.get(timeout=0.5)
+                    except Empty:
+                        continue
+
+                    gui_imshow("Kicker Analyse", frame)
+
+                    key = cv2.waitKey(1) & 0xFF
+
+                    if key == ord("q"):
+                        print("KEY → Ende")
+                        break
+
+                    elif key == ord("r"):
+                        if self.record_event.is_set():
+                            self.record_event.clear()
+                            print("KEY → Recording OFF")
+                        else:
+                            self.record_event.set()
+                            print("KEY → Recording ON")
+
+                    elif key == 27:
+                        print("KEY → ESC Ende")
+                        break
+
+                    elif key == ord("P"):
+                        print("KEY → Neustart")
+                        restart_requested = True
+                        break
+
+        except KeyboardInterrupt:
+            print("🛑 Programm durch Benutzer beendet")
+
+        except Exception as e:
+            print(f"❌ Unerwarteter Fehler in app.run(): {e}")
+
+        finally:
+            self.stop_event.set()
+            self.record_event.clear()
+
+            self._join_threads()
+
+            try:
+                gui_destroy_all()
+            except Exception:
                 pass
-        else:
-            while not stop_event.is_set():
-                try:
-                    frame = display_queue.get(timeout=0.5)
-                except:
-                    continue
 
-                gui_imshow("Kicker Analyse", frame)
-                key = cv2.waitKey(1) & 0xFF
+        return restart_requested
 
-                if key == ord('q'):
-                    break
-                elif key == ord('k'):
-                    print("KEY → Save Replay (letzte 3 Sekunden)")
-                    threading.Thread(
-                        target=self.save_last_seconds_mp4,
-                        daemon=True
-                    ).start()
-                elif key == ord('r'):
-                    if record_event.is_set():
-                        record_event.clear()
-                        print("KEY → Recording OFF")
-                    else:
-                        record_event.set()
-                        print("KEY → Recording ON")
-                elif key == 27:  # ESC
-                    break
-                elif key == ord('P'):
-                    return
+    def _join_threads(self):
+        for thread in [self.t_cam, self.t_proc, self.t_rec, self.t_api]:
+            if thread is None:
+                continue
 
-        stop_event.set()
-        record_event.clear()
-
-        t_cam.join(timeout=1)
-        t_proc.join(timeout=1)
-        t_rec.join(timeout=1)
-
-        self.video.release()
-        if not HEADLESS:
-            cv2.destroyAllWindows()
+            try:
+                thread.join(timeout=1)
+            except Exception:
+                pass
 
 
 # -------------------------------------------------
@@ -522,24 +682,50 @@ class KickerApp:
 # -------------------------------------------------
 if __name__ == "__main__":
     while True:
-        if config.use_camera:
-            try:
-                source = BaslerSource(config.camera)
-                print("📷 Quelle: Basler Kamera")
-            except Exception as e:  # fängt auch _genicam.RuntimeException
-                print(f"❌ Kamera nicht verfügbar: {e}")
-                print("➡️ Fallback auf VideoSource…")
-                source = RawReplaySource(str(VIDEO_PATH))
-        else:
-            source = RawReplaySource(str(VIDEO_PATH))
-
-        app = KickerApp(source)
+        source = None
+        restart_requested = False
 
         try:
-            app.run()
+            if config.use_camera:
+                try:
+                    source = BaslerSource(config.camera)
+                    print("📷 Quelle: Basler Kamera")
+
+                except Exception as e:
+                    print(f"❌ Kamera nicht verfügbar: {e}")
+                    print("➡️ Fallback auf RawReplaySource")
+                    source = RawReplaySource(str(VIDEO_PATH))
+
+            else:
+                source = RawReplaySource(str(VIDEO_PATH))
+
+            app = KickerApp(source)
+
+            restart_requested = app.run()
+
+        except KeyboardInterrupt:
+            print("🛑 Programm durch Benutzer beendet")
+            break
+
+        except Exception as e:
+            print(f"❌ Unerwarteter Fehler im Main-Block: {e}")
+
         finally:
+            if source is not None:
+                try:
+                    source.release()
+                    print("✅ Kamera freigegeben")
+                except Exception as e:
+                    print(f"⚠️ Fehler beim Freigeben der Kamera: {e}")
+
+            source = None
+
             try:
-                source.release()
-                print("✅ Kamera freigegeben")
-            except:
+                gui_destroy_all()
+            except Exception:
                 pass
+
+            time.sleep(1)
+
+        if not restart_requested:
+            break

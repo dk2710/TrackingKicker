@@ -1,5 +1,5 @@
 {
-  "headless": false,
+  "headless": true,
   "replay_seconds": 3,
   "target_display_fps": 60,
   "replay_fps": 120,
