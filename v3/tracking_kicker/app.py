@@ -176,10 +176,6 @@ class KickerApp:
 
         return response
 
-    from pathlib import Path
-    from datetime import datetime
-    import cv2
-
     def create_goal_video(self, frames):
 
         if not frames:
