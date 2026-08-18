@@ -21,6 +21,8 @@ class BaslerSource:
         self._read_log_time = time.perf_counter()
         self._last_grab_error = None
         self._last_grab_error_time = 0.0
+        self._consecutive_grab_failures = 0
+        self._last_grab_recovery_time = 0.0
         self._closed = False # Dafür da um die Kamera zu stoppen
 
         # --- Basler öffnen ---
@@ -47,10 +49,16 @@ class BaslerSource:
         self.camera.Width.Value = cfg.width
         self.camera.OffsetX.Value = cfg.offset_x
 
-        # Die konfigurierte Bildrate bisher nur zu protokollieren reicht
-        # nicht: Die Kamera lief dadurch mit ca. 209 FPS. Das kann am
-        # USB-Hub zu Payload-Verlusten und Block-ID-Spruengen fuehren.
-        # Begrenze die Kamera deshalb explizit auf die konfigurierte Rate.
+        # Mehr Host-Puffer verhindern, dass ein kurzzeitig blockierter
+        # Processing-Thread den pylon-Stream sofort ueberlaeuft. Die
+        # Analyse verwirft weiterhin alte Frames und wird nicht gedrosselt.
+        try:
+            self.camera.MaxNumBuffer = 64
+            print("✅ pylon MaxNumBuffer = 64")
+        except Exception as e:
+            print(f"⚠️ MaxNumBuffer nicht setzbar: {e}")
+
+        # Hohe Kamerarate fuer die schnelle Ballerkennung beibehalten.
         if getattr(cfg, "force_fps", 0) and cfg.force_fps > 0:
             self.try_set(self.camera, "AcquisitionFrameRateEnable", True)
             self.try_set(self.camera, "AcquisitionFrameRate", float(cfg.force_fps))
@@ -100,6 +108,7 @@ class BaslerSource:
             objFrame.frame = grab.GetArray().copy()
             objFrame.timestamp = time.perf_counter()
             grab.Release()
+            self._consecutive_grab_failures = 0
 
             return True, objFrame
 
@@ -111,6 +120,24 @@ class BaslerSource:
             except:
                 pass
             return False, None
+
+    def _recover_grab_stream(self) -> None:
+        """Synchronisiert den pylon-Stream nach USB-/Block-ID-Fehlern neu."""
+        now = time.perf_counter()
+        if now - self._last_grab_recovery_time < 2.0:
+            return
+
+        self._last_grab_recovery_time = now
+        print("[CAM-RECOVER] Grab-Stream wird neu synchronisiert")
+        try:
+            if self.camera.IsGrabbing():
+                self.camera.StopGrabbing()
+            time.sleep(0.05)
+            self.camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+            self._consecutive_grab_failures = 0
+            print("[CAM-RECOVER] Grab-Stream wieder gestartet")
+        except BaseException as e:
+            print(f"[CAM-RECOVER] Neustart fehlgeschlagen: {e}")
 
     @staticmethod
     def _grab_error_code(grab) -> str:
@@ -139,6 +166,9 @@ class BaslerSource:
         now = time.perf_counter()
         if not ok or objframe is None:
             self._read_failures += 1
+            self._consecutive_grab_failures += 1
+            if self._consecutive_grab_failures >= 5:
+                self._recover_grab_stream()
         else:
             self._read_count += 1
 
@@ -176,6 +206,10 @@ class BaslerSource:
         if self._closed:
             return
 
+        # Weitere Grab-Aufrufe und automatische Recovery waehrend des
+        # Herunterfahrens sofort unterbinden.
+        self._closed = True
+
         try:
             if self.camera.IsGrabbing():
                 self.camera.StopGrabbing()
@@ -192,8 +226,6 @@ class BaslerSource:
             del self.camera
         except BaseException:
             pass
-
-        self._closed = True
 
     def getTemperatur(self, camera) -> str:
         try:

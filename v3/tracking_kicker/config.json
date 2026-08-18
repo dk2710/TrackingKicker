@@ -6,7 +6,7 @@
   "use_camera": true,
   "debug_video": "session_raw_2026-01-29_17-03-58.npz",
   "camera": {
-    "force_fps": 60,
+    "force_fps": 200,
     "height": 650,
     "offset_y": 266,
     "width": 1100,
