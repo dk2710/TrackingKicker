@@ -676,12 +676,20 @@ class KickerApp:
             "-c:v", "libvpx",
             "-deadline", "realtime",
             "-cpu-used", "8",
+            "-threads", "2",
             "-crf", "10",
             "-b:v", "0",
             "-pix_fmt", "yuv420p",
             "-f", "webm",
             str(temp_path),
         ]
+
+        # Die Goal-Kodierung darf den Kamera-Grab und die Analyse auf dem
+        # Orange Pi nicht verdrängen. Wenn vorhanden, laufen die zwei
+        # FFmpeg-Threads deshalb auf den grossen Kernen 4-7.
+        taskset = shutil.which("taskset")
+        if taskset:
+            command = [taskset, "-c", "4-7"] + command
 
         process = subprocess.Popen(
             command,
