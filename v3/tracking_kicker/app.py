@@ -37,7 +37,20 @@ VIDEO_PATH = config.videos_dir / "test.npz"
 Analyse_Video_Path = (Path(__file__).resolve().parents[1] / "videos").resolve()
 Analyse_Video_Path.mkdir(parents=True, exist_ok=True)
 
-HEADLESS = os.environ.get("HEADLESS", "0") == "1"
+# Auf Geraeten ohne Monitor darf OpenCV keine HighGUI-Funktionen aufrufen.
+# Die Einstellung aus config.json kann per HEADLESS=0 bewusst ueberschrieben
+# werden, sofern ein Display vorhanden ist.
+_headless_env = os.environ.get("HEADLESS")
+_no_linux_display = (
+    os.name == "posix"
+    and not os.environ.get("DISPLAY")
+    and not os.environ.get("WAYLAND_DISPLAY")
+)
+HEADLESS = (
+    config.headless
+    if _headless_env is None
+    else _headless_env == "1"
+) or _no_linux_display
 GOAL_VIDEO_DURATION_SECONDS = 3
 GOAL_VIDEO_FPS = 60
 GOAL_VIDEO_FRAME_LIMIT = GOAL_VIDEO_DURATION_SECONDS * GOAL_VIDEO_FPS
