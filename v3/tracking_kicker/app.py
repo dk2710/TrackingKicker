@@ -2,6 +2,7 @@
 import cv2
 import copy
 import os
+import signal
 import time
 import threading
 from collections import deque
@@ -117,6 +118,10 @@ class KickerApp:
         self.goal_video_frame_count = 0
         self.goal_video_fps = GOAL_VIDEO_FPS
         self.goal_video_thread: Optional[threading.Thread] = None
+        self.t_api = None
+        self.t_cam = None
+        self.t_proc = None
+        self.t_rec = None
 
         # Events gehören jetzt zur App
         self.stop_event = threading.Event()
@@ -165,6 +170,11 @@ class KickerApp:
         return jsonify({
             "status": "ok"
         })
+
+    def _request_shutdown(self, signum=None, _frame=None):
+        signal_name = signal.Signals(signum).name if signum else "shutdown"
+        print(f"\n🛑 Stop angefordert ({signal_name})")
+        self.stop_event.set()
 
     def api_loop(self):
         self.api.run(
@@ -545,13 +555,36 @@ class KickerApp:
     def processing_loop(self):
         last_log = time.perf_counter()
         n = 0
+        stage_time = {
+            "cvt": 0.0,
+            "dist": 0.0,
+            "detect": 0.0,
+            "overlay": 0.0,
+            "analyze": 0.0,
+        }
+        skipped_processing_frames = 0
 
         while not self.stop_event.is_set():
             try:
                 frame = self.frame_queue.get(timeout=0.5)
 
+                # Bei einer 200-FPS-Kamera nicht mit alten Frames hinterher-
+                # laufen. Fuer die Live-Analyse ist immer der aktuellste
+                # verfuegbare Frame relevant.
+                while True:
+                    try:
+                        frame = self.frame_queue.get_nowait()
+                        skipped_processing_frames += 1
+                    except Empty:
+                        break
+
+                stage_start = time.perf_counter()
                 frame.frame = cv2.cvtColor(frame.frame, cv2.COLOR_BayerRG2BGR)
+                stage_time["cvt"] += time.perf_counter() - stage_start
+
+                stage_start = time.perf_counter()
                 frame.frame = self.dist.apply(frame.frame)
+                stage_time["dist"] += time.perf_counter() - stage_start
 
                 now = time.perf_counter()
                 n += 1
@@ -565,9 +598,13 @@ class KickerApp:
 
                     self._replay_last_store = now
 
+                stage_start = time.perf_counter()
                 meas = self.detector.detect(frame)
+                stage_time["detect"] += time.perf_counter() - stage_start
 
+                stage_start = time.perf_counter()
                 self.analyzer.draw_overlay(frame)
+                stage_time["overlay"] += time.perf_counter() - stage_start
 
                 if self.display_queue.full():
                     try:
@@ -580,7 +617,9 @@ class KickerApp:
                 goal = False
 
                 if meas is True:
+                    stage_start = time.perf_counter()
                     goal = self.analyzer.process_frame(frame)
+                    stage_time["analyze"] += time.perf_counter() - stage_start
 
                 if goal is True:
                     self._start_goal_video_preparation(force=True)
@@ -590,10 +629,21 @@ class KickerApp:
                     dt = now - last_log
                     host_fps = n / dt
 
-                    print(f"[CAM] AnalysierenFPS={host_fps:.1f} | ")
+                    print(
+                        f"[CAM] AnalysierenFPS={host_fps:.1f} | "
+                        f"cvt={stage_time['cvt'] / n * 1000:.1f}ms "
+                        f"dist={stage_time['dist'] / n * 1000:.1f}ms "
+                        f"detect={stage_time['detect'] / n * 1000:.1f}ms "
+                        f"overlay={stage_time['overlay'] / n * 1000:.1f}ms "
+                        f"analyze={stage_time['analyze'] / n * 1000:.1f}ms "
+                        f"uebersprungen={skipped_processing_frames}"
+                    )
 
                     last_log = now
                     n = 0
+                    skipped_processing_frames = 0
+                    for key in stage_time:
+                        stage_time[key] = 0.0
 
             except Empty:
                 continue
@@ -746,6 +796,12 @@ class KickerApp:
         restart_requested = False
 
         try:
+            # Signale kommen immer im Main-Thread an. Dadurch funktioniert
+            # Ctrl+C auch im Headless-Betrieb und beendet alle Worker sauber.
+            signal.signal(signal.SIGINT, self._request_shutdown)
+            if hasattr(signal, "SIGTERM"):
+                signal.signal(signal.SIGTERM, self._request_shutdown)
+
             self.stop_event.clear()
             self.record_event.clear()
             self._load_or_calibrate()
@@ -827,6 +883,12 @@ class KickerApp:
             self.record_event.clear()
 
             self._join_threads()
+
+            try:
+                self.video.release()
+                print("✅ Kamera/Videoquelle freigegeben")
+            except Exception as e:
+                print(f"⚠️ Videoquelle konnte nicht freigegeben werden: {e}")
 
             try:
                 gui_destroy_all()

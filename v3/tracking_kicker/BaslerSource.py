@@ -16,6 +16,9 @@ class BaslerSource:
         cfg: Camera
     ):
         self.cfg = cfg
+        self._read_count = 0
+        self._read_failures = 0
+        self._read_log_time = time.perf_counter()
         self._closed = False # Dafür da um die Kamera zu stoppen
 
         # --- Basler öffnen ---
@@ -86,6 +89,23 @@ class BaslerSource:
     def read(self) -> Tuple[bool, Optional[Frame]]:
         ok, objframe = self._grab_raw_once()
 
+        now = time.perf_counter()
+        if not ok or objframe is None:
+            self._read_failures += 1
+        else:
+            self._read_count += 1
+
+        if now - self._read_log_time >= 1.0:
+            elapsed = now - self._read_log_time
+            delivered_fps = self._read_count / elapsed
+            print(
+                f"[CAM-RAW] geliefert={self._read_count} "
+                f"fps={delivered_fps:.1f} fehlgeschlagen={self._read_failures}"
+            )
+            self._read_count = 0
+            self._read_failures = 0
+            self._read_log_time = now
+
         #frame = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
         if not ok or objframe is None:
             return False, None
@@ -109,24 +129,24 @@ class BaslerSource:
         if self._closed:
             return
 
-        self._closed = True
-
         try:
             if self.camera.IsGrabbing():
                 self.camera.StopGrabbing()
-        except Exception as e:
+        except BaseException as e:
             print(f"⚠️ StopGrabbing failed: {e}")
 
         try:
             if self.camera.IsOpen():
                 self.camera.Close()
-        except Exception as e:
+        except BaseException as e:
             print(f"⚠️ Camera close failed: {e}")
 
         try:
             del self.camera
-        except Exception:
+        except BaseException:
             pass
+
+        self._closed = True
 
     def getTemperatur(self, camera) -> str:
         try:
