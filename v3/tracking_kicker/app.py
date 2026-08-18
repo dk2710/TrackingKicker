@@ -115,6 +115,7 @@ class KickerApp:
         self.goal_video_path: Optional[str] = None
         self.goal_video_speed = 0.0
         self.goal_video_frame_count = 0
+        self.goal_video_fps = GOAL_VIDEO_FPS
         self.goal_video_thread: Optional[threading.Thread] = None
 
         # Events gehören jetzt zur App
@@ -200,7 +201,7 @@ class KickerApp:
             "video_url": video_url,
             "video_filename": video_filename,
             "video_frame_count": frame_count,
-            "video_fps": GOAL_VIDEO_FPS,
+            "video_fps": self.goal_video_fps,
         })
 
     def _start_goal_video_preparation(self, force=False):
@@ -322,6 +323,21 @@ class KickerApp:
         first_frame = frames[0].frame
         height, width = first_frame.shape[:2]
 
+        # Die Kamera-FPS aus den echten Zeitstempeln bestimmen. So wird ein
+        # 30-FPS- oder ungleichmaessiger Stream nicht kuenstlich mit 60 FPS
+        # abgespielt.
+        timestamps = np.asarray(
+            [float(frame.timestamp) for frame in frames],
+            dtype=np.float64,
+        )
+        elapsed = timestamps[-1] - timestamps[0]
+        if elapsed > 0 and len(frames) > 1:
+            video_fps = (len(frames) - 1) / elapsed
+            video_fps = max(1.0, min(float(GOAL_VIDEO_FPS), video_fps))
+        else:
+            video_fps = float(GOAL_VIDEO_FPS)
+        self.goal_video_fps = video_fps
+
         # Das Analysevideo muss nicht in voller Kameraaufloesung kodiert
         # werden. Eine kleinere Ausgabe beschleunigt die VP8-Kodierung auf
         # dem Raspberry Pi deutlich.
@@ -333,7 +349,7 @@ class KickerApp:
         writer = cv2.VideoWriter(
             str(video_path),
             fourcc,
-            GOAL_VIDEO_FPS,
+            video_fps,
             (output_width, output_height)
         )
 
