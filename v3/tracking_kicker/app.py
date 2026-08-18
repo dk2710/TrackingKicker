@@ -1064,7 +1064,7 @@ class KickerApp:
                 continue
 
             try:
-                thread.join(timeout=1)
+                thread.join(timeout=0.3)
             except Exception:
                 pass
 

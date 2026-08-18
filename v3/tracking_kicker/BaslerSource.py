@@ -71,7 +71,9 @@ class BaslerSource:
 
         grab = None
         try:
-            grab = self.camera.RetrieveResult(1000, pylon.TimeoutHandling_Return)
+            # Kurzes Timeout, damit Ctrl+C/SIGTERM nicht bis zu einer
+            # Sekunde auf einen blockierten USB-Grab warten muss.
+            grab = self.camera.RetrieveResult(100, pylon.TimeoutHandling_Return)
             if grab is None:
                 self._log_grab_error("RetrieveResult liefert None")
                 return False, None
