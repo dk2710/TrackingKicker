@@ -121,23 +121,59 @@ class BaslerSource:
                 pass
             return False, None
 
+    def _configure_reconnected_camera(self, camera) -> None:
+        """Wendet alle Kameraeinstellungen nach einem Reconnect erneut an."""
+        cfg = self.cfg
+        camera.ExposureAuto.Value = "Off"
+        camera.PixelFormat.Value = "BayerRG8"
+        camera.GainAuto.Value = "Off"
+        self.try_set(camera, "ExposureTime", cfg.exposure_time)
+        self.try_set(camera, "Gain", cfg.gain)
+        camera.Height.Value = cfg.height
+        camera.OffsetY.Value = cfg.offset_y
+        camera.Width.Value = cfg.width
+        camera.OffsetX.Value = cfg.offset_x
+        try:
+            camera.MaxNumBuffer = 64
+        except Exception:
+            pass
+        if getattr(cfg, "force_fps", 0) and cfg.force_fps > 0:
+            self.try_set(camera, "AcquisitionFrameRateEnable", True)
+            self.try_set(camera, "AcquisitionFrameRate", float(cfg.force_fps))
+
     def _recover_grab_stream(self) -> None:
-        """Synchronisiert den pylon-Stream nach USB-/Block-ID-Fehlern neu."""
+        """Baut die pylon-Kamera nach einem USB-/Block-ID-Fehler neu auf."""
         now = time.perf_counter()
-        if now - self._last_grab_recovery_time < 2.0:
+        if now - self._last_grab_recovery_time < 5.0:
             return
 
         self._last_grab_recovery_time = now
-        print("[CAM-RECOVER] Grab-Stream wird neu synchronisiert")
+        print("[CAM-RECOVER] Kamera wird komplett neu verbunden")
         try:
-            if self.camera.IsGrabbing():
-                self.camera.StopGrabbing()
-            time.sleep(0.05)
-            self.camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+            old_camera = self.camera
+            try:
+                if old_camera.IsGrabbing():
+                    old_camera.StopGrabbing()
+            except BaseException:
+                pass
+            try:
+                if old_camera.IsOpen():
+                    old_camera.Close()
+            except BaseException:
+                pass
+            del old_camera
+
+            time.sleep(0.2)
+            device = pylon.TlFactory.GetInstance().CreateFirstDevice()
+            new_camera = pylon.InstantCamera(device)
+            new_camera.Open()
+            self._configure_reconnected_camera(new_camera)
+            new_camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+            self.camera = new_camera
             self._consecutive_grab_failures = 0
-            print("[CAM-RECOVER] Grab-Stream wieder gestartet")
+            print("[CAM-RECOVER] Kamera neu verbunden und Grab-Stream gestartet")
         except BaseException as e:
-            print(f"[CAM-RECOVER] Neustart fehlgeschlagen: {e}")
+            print(f"[CAM-RECOVER] Kamera-Reconnect fehlgeschlagen: {e}")
 
     @staticmethod
     def _grab_error_code(grab) -> str:
@@ -167,7 +203,7 @@ class BaslerSource:
         if not ok or objframe is None:
             self._read_failures += 1
             self._consecutive_grab_failures += 1
-            if self._consecutive_grab_failures >= 5:
+            if self._consecutive_grab_failures >= 10:
                 self._recover_grab_stream()
         else:
             self._read_count += 1
