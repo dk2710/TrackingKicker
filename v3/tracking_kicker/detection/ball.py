@@ -12,12 +12,14 @@ class BallDetector:
         area_min: float = 60.0,
         area_max: float = 12000.0,
         debug: bool = False,
+        detection_scale: float = 0.5,
     ):
         self.hsv_low = hsv_low
         self.hsv_high = hsv_high
         self.area_min = area_min
         self.area_max = area_max
         self.debug = debug
+        self.detection_scale = detection_scale
 
         self.expected_r: Optional[float] = None
         self._last_xy: Optional[Tuple[int, int]] = None
@@ -83,7 +85,24 @@ class BallDetector:
     # Detection
     # ---------------------------------------------------------
     def detect(self, frame: Frame):
-        mask = self._mask_ball(frame.frame)
+        image = frame.frame
+        scale = self.detection_scale
+
+        # Die Vollbild-Erkennung ist auf dem Orange Pi sehr teuer. Die
+        # Detektion erfolgt halbaufgeloest; die Koordinaten werden unten
+        # wieder auf die Originalaufloesung hochgerechnet.
+        if 0.0 < scale < 1.0:
+            image = cv2.resize(
+                image,
+                None,
+                fx=scale,
+                fy=scale,
+                interpolation=cv2.INTER_AREA,
+            )
+        else:
+            scale = 1.0
+
+        mask = self._mask_ball(image)
         cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         if not cnts:
@@ -96,7 +115,7 @@ class BallDetector:
             (x, y), r = cv2.minEnclosingCircle(c)
 
             # Radius-Filter
-            if not (5 < r < 25):
+            if not (5 * scale < r < 25 * scale):
                 continue
 
             # Circularity
@@ -118,7 +137,11 @@ class BallDetector:
         _, (x, y, r) = max(candidates, key=lambda t: cv2.contourArea(t[0]))
 
         # Hier speicherst du ALLES in einem Feld
-        frame.ball = (int(x), int(y), int(r))
+        frame.ball = (
+            int(x / scale),
+            int(y / scale),
+            int(r / scale),
+        )
 
         return True
 
