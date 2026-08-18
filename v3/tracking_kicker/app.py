@@ -1,5 +1,6 @@
 
 import cv2
+import copy
 import os
 import time
 import threading
@@ -8,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from queue import Queue, Empty
 from typing import Any, Dict, Optional
-from flask import Flask, jsonify, send_file
+from flask import Flask, jsonify, send_from_directory, url_for
 
 import numpy as np
 import traceback
@@ -37,6 +38,10 @@ Analyse_Video_Path = (Path(__file__).resolve().parents[1] / "videos").resolve()
 Analyse_Video_Path.mkdir(parents=True, exist_ok=True)
 
 HEADLESS = os.environ.get("HEADLESS", "0") == "1"
+GOAL_VIDEO_DURATION_SECONDS = 3
+GOAL_VIDEO_FPS = 60
+GOAL_VIDEO_FRAME_LIMIT = GOAL_VIDEO_DURATION_SECONDS * GOAL_VIDEO_FPS
+GOAL_VIDEO_MAX_WIDTH = 640
 
 
 # -------------------------------------------------
@@ -92,6 +97,11 @@ class KickerApp:
         self.processed_queue = Queue(maxsize=2)
 
         self.history_lock = threading.Lock()
+        self.goal_video_lock = threading.Lock()
+        self.goal_video_ready = threading.Event()
+        self.goal_video_path: Optional[str] = None
+        self.goal_video_speed = 0.0
+        self.goal_video_thread: Optional[threading.Thread] = None
 
         # Events gehören jetzt zur App
         self.stop_event = threading.Event()
@@ -121,6 +131,12 @@ class KickerApp:
             self.api_goal,
             methods=["GET"]
         )
+        self.api.add_url_rule(
+            "/goal/video/<path:filename>",
+            "goal_video",
+            self.api_goal_video,
+            methods=["GET"]
+        )
         self.detector = BallDetector(debug=False)
 
         self.analyzer = KickerAnalyzer(
@@ -144,65 +160,139 @@ class KickerApp:
         )
 
     def api_goal(self):
+        # Das Video wird im Hintergrund vorbereitet. Die HTTP-Anfrage muss
+        # nicht mehr auf Analyse oder Videokodierung warten.
+        self._start_goal_video_preparation()
 
-        goal_detector = BallDetector(debug=False)
+        with self.goal_video_lock:
+            video_path = self.goal_video_path
+            speed = self.goal_video_speed
 
-        goal_analyzer = KickerAnalyzer(
-            goals_cfg=vision.goals,
-            field_cfg=vision.field,
+        if video_path is None:
+            return jsonify({
+                "status": "preparing",
+                "message": "Goal-Video wird noch vorbereitet",
+                "retry_after_ms": 250,
+            }), 202
+
+        video_filename = Path(video_path).name
+        # Relative URL zur Vermeidung von falschem Host, 127.0.0.1 und
+        # Mixed-Content-Problemen bei einem HTTPS-Frontend.
+        video_url = url_for("goal_video", filename=video_filename)
+
+        return jsonify({
+            "ball_speed_kmh": speed,
+            "video_url": video_url,
+            "video_filename": video_filename,
+        })
+
+    def _start_goal_video_preparation(self, force=False):
+        with self.goal_video_lock:
+            if (
+                self.goal_video_thread is not None
+                and self.goal_video_thread.is_alive()
+            ):
+                return
+
+            # Beim Polling kein neues Video starten, solange bereits ein
+            # fertiges Video vorhanden ist.
+            if self.goal_video_path is not None and not force:
+                return
+
+            with self.history_lock:
+                source_frames = list(self.history_frames)
+
+            # Den kompletten 3-Sekunden-Puffer verwenden. Falls die Quelle
+            # mehr als 60 FPS liefert, werden Frames gleichmaessig uebersprungen.
+            if len(source_frames) > GOAL_VIDEO_FRAME_LIMIT:
+                selected_indices = np.linspace(
+                    0,
+                    len(source_frames) - 1,
+                    GOAL_VIDEO_FRAME_LIMIT,
+                    dtype=int,
+                )
+                source_frames = [source_frames[i] for i in selected_indices]
+
+            frames = []
+            for source_frame in source_frames:
+                frame = copy.copy(source_frame)
+                frame.frame = source_frame.frame.copy()
+                frames.append(frame)
+
+            self.goal_video_path = None
+            self.goal_video_speed = float(self.analyzer.speed_display)
+            self.goal_video_ready.clear()
+
+            self.goal_video_thread = threading.Thread(
+                target=self._prepare_goal_video,
+                args=(frames, self.goal_video_speed),
+                daemon=True,
+            )
+            self.goal_video_thread.start()
+
+    def _prepare_goal_video(self, frames, speed):
+        try:
+            video_path = self.create_goal_video(frames)
+            with self.goal_video_lock:
+                self.goal_video_path = video_path
+                self.goal_video_speed = speed
+        except Exception as exc:
+            print(f"Goal-Video Vorbereitung fehlgeschlagen: {exc}")
+        finally:
+            self.goal_video_ready.set()
+
+    def api_goal_video(self, filename):
+        return send_from_directory(
+            str(Analyse_Video_Path),
+            Path(filename).name,
+            mimetype="video/webm",
+            as_attachment=False,
         )
-        frames = list(self.history_frames)
-
-        for frame in frames:
-            frame.frame = cv2.cvtColor(frame.frame, cv2.COLOR_BayerRG2BGR)
-            frame.frame = self.dist.apply(frame.frame)
-
-            goal_detector.detect(frame)
-            goal_analyzer.process_frame(frame)
-
-
-        speed = goal_analyzer.speed_display
-        video_path = self.create_goal_video(frames)
-
-        response = send_file(
-            video_path,
-            mimetype="video/mp4",
-            as_attachment=True
-        )
-
-        response.headers["Ball-Speed"] = str(speed)
-        #response.headers["Goal-Side"] = "red"
-        #response.headers["Analysis-FPS"] = "60"
-
-        return response
 
     def create_goal_video(self, frames):
 
         if not frames:
             raise ValueError("Keine Frames vorhanden")
 
-        output_dir = Path("videos")
-        output_dir.mkdir(exist_ok=True)
+        output_dir = Analyse_Video_Path
+        output_dir.mkdir(parents=True, exist_ok=True)
 
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-        video_path = output_dir / f"goal_{timestamp}.mp4"
+        # VP8/WebM ist direkt mit Chrome und Edge kompatibel.
+        video_path = output_dir / f"goal_{timestamp}.webm"
 
         first_frame = frames[0].frame
         height, width = first_frame.shape[:2]
 
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        # Das Analysevideo muss nicht in voller Kameraaufloesung kodiert
+        # werden. Eine kleinere Ausgabe beschleunigt die VP8-Kodierung auf
+        # dem Raspberry Pi deutlich.
+        output_width = min(width, GOAL_VIDEO_MAX_WIDTH)
+        output_height = int(round(height * output_width / width))
+
+        fourcc = cv2.VideoWriter_fourcc(*"VP80")
 
         writer = cv2.VideoWriter(
             str(video_path),
             fourcc,
-            60.0,
-            (width, height)
+            GOAL_VIDEO_FPS,
+            (output_width, output_height)
         )
+
+        if not writer.isOpened():
+            raise RuntimeError("WebM/VP8-Video konnte nicht erstellt werden")
 
         try:
             for frame in frames:
-                writer.write(frame.frame)
+                image = frame.frame
+                if image.shape[1] != output_width:
+                    image = cv2.resize(
+                        image,
+                        (output_width, output_height),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                writer.write(image)
 
         finally:
             writer.release()
@@ -411,6 +501,7 @@ class KickerApp:
                     goal = self.analyzer.process_frame(frame)
 
                 if goal is True:
+                    self._start_goal_video_preparation(force=True)
                     self.play_last_seconds()
 
                 if now - last_log >= 1.0:

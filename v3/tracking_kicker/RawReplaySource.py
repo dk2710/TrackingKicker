@@ -21,9 +21,25 @@ class RawReplaySource:
         else:
             self.fps = 60.0
 
+        self._frame_dt = 1.0 / self.fps
+        self._loop_duration = (
+            float(self.times[-1]) + self._frame_dt
+            if len(self.times) > 0
+            else self._frame_dt
+        )
+        self._time_offset = 0.0
+
     def read(self):
-        if self._i >= len(self.frames):
+        if len(self.frames) == 0:
             return False, None
+
+        # Replay automatisch von vorne starten, sobald das Video endet.
+        # Der Zeitstempel bleibt dabei monoton, damit die Historie und die
+        # Geschwindigkeitsanalyse keinen Sprung zurueck auf 0 sehen.
+        if self._i >= len(self.frames):
+            self._time_offset += self._loop_duration
+            self._i = 0
+            self._t0 = time.perf_counter()
 
         # 🎯 Zielzeit für Playback (Realtime-Synchronisation)
         target_time = self._t0 + self.times[self._i]
@@ -38,7 +54,7 @@ class RawReplaySource:
         objFrame.frame = self.frames[self._i]
 
         # ✅ WICHTIG: Zeit aus dem VIDEO!
-        objFrame.timestamp = self.times[self._i]
+        objFrame.timestamp = self._time_offset + self.times[self._i]
 
         self._i += 1
         return True, objFrame
@@ -46,6 +62,7 @@ class RawReplaySource:
     def reset(self):
         self._i = 0
         self._t0 = time.perf_counter()
+        self._time_offset = 0.0
 
     def release(self):
         pass
