@@ -40,6 +40,24 @@ VIDEO_PATH = config.videos_dir / "test.npz"
 Analyse_Video_Path = (Path(__file__).resolve().parents[1] / "videos").resolve()
 Analyse_Video_Path.mkdir(parents=True, exist_ok=True)
 
+# Alte, vom frueheren Segment-Encoder erzeugte Dateien sind keine gueltigen
+# aktuellen Goal-Videos mehr. Beim Start werden nur diese automatisch
+# erzeugten Artefakte entfernt; goal_latest.webm bleibt erhalten.
+for _old_goal_file in Analyse_Video_Path.iterdir():
+    if (
+        _old_goal_file.is_file()
+        and _old_goal_file.name != "goal_latest.webm"
+        and (
+            _old_goal_file.name.startswith("goal_ring_")
+            or _old_goal_file.name.startswith("goal_")
+        )
+        and _old_goal_file.suffix in {".webm", ".csv"}
+    ):
+        try:
+            _old_goal_file.unlink()
+        except OSError as _cleanup_error:
+            print(f"[GOAL] Alte Videodatei nicht entfernbar: {_old_goal_file}: {_cleanup_error}")
+
 # Auf Geraeten ohne Monitor darf OpenCV keine HighGUI-Funktionen aufrufen.
 # Die Einstellung aus config.json kann per HEADLESS=0 bewusst ueberschrieben
 # werden, sofern ein Display vorhanden ist.
@@ -200,14 +218,18 @@ class KickerApp:
         )
 
     def api_goal(self):
-        with self.rolling_video_lock:
-            video_path = self.rolling_video_path
-            video_age = time.monotonic() - self.rolling_video_ready_time
+        # Es gibt nur noch ein Goal-Video: den letzten 3-Sekunden-Puffer.
+        with self.goal_video_lock:
+            video_path = self.goal_video_path
+            preparing = (
+                self.goal_video_thread is not None
+                and self.goal_video_thread.is_alive()
+            )
 
         # Ein altes Ringsegment darf nach einem Kamerastillstand nicht erneut
         # als aktuelles Torvideo ausgeliefert werden. Bei laufender Kamera
         # wird spätestens alle drei Sekunden ein neues Segment veröffentlicht.
-        if video_path is not None and video_age > GOAL_VIDEO_DURATION_SECONDS + 3:
+        if preparing:
             video_path = None
 
         speed = float(self.analyzer.speed_display)
@@ -216,7 +238,7 @@ class KickerApp:
         if video_path is None:
             return jsonify({
                 "status": "preparing",
-                "message": "Ringpuffer wird noch aufgebaut",
+                "message": "Die letzten 3 Sekunden werden vorbereitet",
                 "retry_after_ms": 250,
             }), 202
 
@@ -466,10 +488,10 @@ class KickerApp:
         output_dir = Analyse_Video_Path
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-
-        # VP8/WebM ist direkt mit Chrome und Edge kompatibel.
-        video_path = output_dir / f"goal_{timestamp}.webm"
+        # VP8/WebM ist direkt mit Chrome und Edge kompatibel. Ein fester
+        # Dateiname sorgt dafuer, dass immer nur der letzte Rueckblick
+        # vorhanden ist.
+        video_path = output_dir / "goal_latest.webm"
 
         first_frame = frames[0].frame
         height, width = first_frame.shape[:2]
@@ -776,8 +798,6 @@ class KickerApp:
                         pass
 
                 self.display_queue.put(frame.frame)
-                self._queue_rolling_video_frame(frame.frame, now)
-
                 goal = False
 
                 if meas is True:
@@ -786,6 +806,9 @@ class KickerApp:
                     stage_time["analyze"] += time.perf_counter() - stage_start
 
                 if goal is True:
+                    # Bei jedem Tor den aktuellen 3-Sekunden-Puffer neu
+                    # kodieren und goal_latest.webm atomar ersetzen.
+                    self._start_goal_video_preparation(force=True)
                     self.play_last_seconds()
 
                 if now - last_log >= 1.0:
@@ -990,15 +1013,9 @@ class KickerApp:
                 daemon=True
             )
 
-            self.t_roll = threading.Thread(
-                target=self._rolling_video_encoder_loop,
-                daemon=True,
-            )
-
             self.t_cam.start()
             self.t_proc.start()
             self.t_rec.start()
-            self.t_roll.start()
             self.t_api.start()
 
             print("⌨️  Taste 'r' = Aufnahme Start/Stop | ESC/q = Ende | P = Neustart")
