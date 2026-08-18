@@ -279,9 +279,20 @@ class KickerApp:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
             )
+            print(
+                f"[RING] FFmpeg gestartet: {width}x{height} "
+                f"@ {GOAL_VIDEO_FPS} FPS"
+            )
 
             pending = first_image
+            published_name = None
             while not self.stop_event.is_set():
+                if process.poll() is not None:
+                    error_output = process.stderr.read().decode(errors="replace")
+                    raise RuntimeError(
+                        f"FFmpeg beendet (code={process.returncode}): {error_output}"
+                    )
+
                 process.stdin.write(np.ascontiguousarray(pending).tobytes())
                 try:
                     pending = self.rolling_video_queue.get(timeout=0.5)
@@ -295,10 +306,16 @@ class KickerApp:
                         latest_path = Path(latest_name)
                         if not latest_path.is_absolute():
                             latest_path = Analyse_Video_Path / latest_path
-                        if latest_path.exists() and latest_path.stat().st_size > 0:
+                        if (
+                            latest_path.exists()
+                            and latest_path.stat().st_size > 0
+                            and latest_path.name != published_name
+                        ):
                             with self.rolling_video_lock:
                                 self.rolling_video_path = str(latest_path)
                                 self.rolling_video_list = playlist
+                            print(f"[RING] Segment bereit: {latest_path.name}")
+                            published_name = latest_path.name
         except Exception as exc:
             print(f"⚠️ Rolling-Video-Encoder beendet: {exc}")
         finally:
