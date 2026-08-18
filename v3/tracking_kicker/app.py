@@ -1043,6 +1043,13 @@ class KickerApp:
             self.stop_event.set()
             self.record_event.clear()
 
+            # Kamera vor dem Thread-Join freigeben, damit ein blockiertes
+            # RetrieveResult bzw. eine Grab-Recovery sofort abgebrochen wird.
+            try:
+                self.video.release()
+            except BaseException as e:
+                print(f"[SHUTDOWN] Videoquelle konnte nicht sofort freigegeben werden: {e}")
+
             self._join_threads()
 
             try:
