@@ -124,6 +124,7 @@ class KickerApp:
         self.rolling_video_lock = threading.Lock()
         self.rolling_video_path: Optional[str] = None
         self.rolling_video_list: Optional[Path] = None
+        self.rolling_video_ready_time = 0.0
         self.rolling_video_thread: Optional[threading.Thread] = None
         self.rolling_last_submit = 0.0
         self.t_api = None
@@ -180,6 +181,11 @@ class KickerApp:
             "status": "ok"
         })
 
+    def _invalidate_rolling_video(self):
+        with self.rolling_video_lock:
+            self.rolling_video_path = None
+            self.rolling_video_ready_time = 0.0
+
     def _request_shutdown(self, signum=None, _frame=None):
         signal_name = signal.Signals(signum).name if signum else "shutdown"
         print(f"\n🛑 Stop angefordert ({signal_name})")
@@ -196,6 +202,13 @@ class KickerApp:
     def api_goal(self):
         with self.rolling_video_lock:
             video_path = self.rolling_video_path
+            video_age = time.monotonic() - self.rolling_video_ready_time
+
+        # Ein altes Ringsegment darf nach einem Kamerastillstand nicht erneut
+        # als aktuelles Torvideo ausgeliefert werden. Bei laufender Kamera
+        # wird spätestens alle drei Sekunden ein neues Segment veröffentlicht.
+        if video_path is not None and video_age > GOAL_VIDEO_DURATION_SECONDS + 3:
+            video_path = None
 
         speed = float(self.analyzer.speed_display)
         frame_count = GOAL_VIDEO_FRAME_LIMIT
@@ -314,6 +327,7 @@ class KickerApp:
                             with self.rolling_video_lock:
                                 self.rolling_video_path = str(latest_path)
                                 self.rolling_video_list = playlist
+                                self.rolling_video_ready_time = time.monotonic()
                             print(f"[RING] Segment bereit: {latest_path.name}")
                             published_name = latest_path.name
         except Exception as exc:
@@ -614,6 +628,7 @@ class KickerApp:
                 ret, objframe = self.video.read()
 
                 if not ret or objframe is None:
+                    self._invalidate_rolling_video()
                     continue
 
                 # Frame für die letzten 3 Sekunden speichern
