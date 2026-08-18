@@ -5,6 +5,7 @@ import os
 import signal
 import subprocess
 import shutil
+import sys
 import time
 import threading
 from collections import deque
@@ -16,6 +17,11 @@ from flask import Flask, jsonify, send_from_directory, url_for
 
 import numpy as np
 import traceback
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 from .config import AppConfig
 from .RawReplaySource import RawReplaySource
@@ -76,6 +82,24 @@ GOAL_VIDEO_DURATION_SECONDS = 3
 GOAL_VIDEO_FPS = 60
 GOAL_VIDEO_FRAME_LIMIT = GOAL_VIDEO_DURATION_SECONDS * GOAL_VIDEO_FPS
 GOAL_VIDEO_MAX_WIDTH = 640
+
+_app_lock_handle = None
+
+
+def _acquire_app_lock() -> bool:
+    """Verhindert, dass zwei Prozesse dieselbe Basler gleichzeitig oeffnen."""
+    global _app_lock_handle
+    if fcntl is None:
+        return True
+    try:
+        _app_lock_handle = open("/tmp/tracking_kicker.lock", "w")
+        fcntl.flock(_app_lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _app_lock_handle.write(str(os.getpid()))
+        _app_lock_handle.flush()
+        return True
+    except (BlockingIOError, OSError):
+        print("[APP] Bereits eine TrackingKicker-Instanz aktiv; zweiter Start beendet.")
+        return False
 
 
 # -------------------------------------------------
@@ -1126,6 +1150,9 @@ def _create_camera_with_retry(camera_config):
 
 
 if __name__ == "__main__":
+    if not _acquire_app_lock():
+        sys.exit(1)
+
     while True:
         source = None
         restart_requested = False
