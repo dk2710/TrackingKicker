@@ -1079,6 +1079,24 @@ class KickerApp:
 # -------------------------------------------------
 # Main
 # -------------------------------------------------
+def _create_camera_with_retry(camera_config):
+    last_error = None
+    for attempt in range(1, 16):
+        try:
+            return BaslerSource(camera_config)
+        except Exception as exc:
+            last_error = exc
+            print(
+                f"[CAM-START] Kamera nicht verfuegbar "
+                f"(Versuch {attempt}/15): {exc}"
+            )
+            if attempt < 15:
+                time.sleep(2.0)
+    raise RuntimeError(
+        f"Basler-Kamera konnte nach 15 Versuchen nicht geoeffnet werden: {last_error}"
+    )
+
+
 if __name__ == "__main__":
     while True:
         source = None
@@ -1087,15 +1105,20 @@ if __name__ == "__main__":
         try:
             if config.use_camera:
                 try:
-                    source = BaslerSource(config.camera)
+                    source = _create_camera_with_retry(config.camera)
                     print("📷 Quelle: Basler Kamera")
 
                 except Exception as e:
                     print(f"❌ Kamera nicht verfügbar: {e}")
                     print("➡️ Fallback auf RawReplaySource")
-                    source = RawReplaySource(str(VIDEO_PATH))
+                    raise RuntimeError(
+                        "Basler-Kamera konnte nicht geoeffnet werden; "
+                        "Replay-Fallback ist nicht verfuegbar."
+                    ) from e
 
             else:
+                if not VIDEO_PATH.exists():
+                    raise FileNotFoundError(f"Replay-Datei fehlt: {VIDEO_PATH}")
                 source = RawReplaySource(str(VIDEO_PATH))
 
             app = KickerApp(source)
