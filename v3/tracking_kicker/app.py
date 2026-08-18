@@ -277,7 +277,8 @@ class KickerApp:
                 "-video_size", f"{width}x{height}",
                 "-framerate", str(GOAL_VIDEO_FPS), "-i", "-",
                 "-an", "-c:v", "libvpx", "-deadline", "realtime",
-                "-cpu-used", "8", "-g", str(GOAL_VIDEO_FPS),
+                "-cpu-used", "8", "-threads", "2",
+                "-g", str(GOAL_VIDEO_FPS),
                 "-crf", "20", "-b:v", "0", "-pix_fmt", "yuv420p",
                 "-f", "segment", "-segment_time", str(GOAL_VIDEO_DURATION_SECONDS),
                 "-segment_wrap", "3", "-reset_timestamps", "1",
@@ -285,6 +286,13 @@ class KickerApp:
                 "-segment_list_size", "3", "-segment_format", "webm",
                 str(pattern),
             ]
+
+            # FFmpeg darf die Kamera-/Analyse-Threads auf dem Orange Pi
+            # nicht verdrängen. Nutze, falls vorhanden, die grossen
+            # CPU-Kerne 4-7; taskset ist auf dem Pi optional.
+            taskset = shutil.which("taskset")
+            if taskset:
+                command = [taskset, "-c", "4-7"] + command
 
             process = subprocess.Popen(
                 command,
