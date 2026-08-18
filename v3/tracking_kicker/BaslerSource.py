@@ -19,6 +19,8 @@ class BaslerSource:
         self._read_count = 0
         self._read_failures = 0
         self._read_log_time = time.perf_counter()
+        self._last_grab_error = None
+        self._last_grab_error_time = 0.0
         self._closed = False # Dafür da um die Kamera zu stoppen
 
         # --- Basler öffnen ---
@@ -53,20 +55,34 @@ class BaslerSource:
 #------------------------------------------------ --------------------------------------------------------------------------------
 
     def _grab_raw_once(self) -> Tuple[bool, Optional[Frame]]:
-        if self._closed or not self.camera.IsGrabbing():
+        if self._closed:
+            return False, None
+        if not self.camera.IsGrabbing():
+            self._log_grab_error("Kamera grabbt nicht (IsGrabbing=False)")
             return False, None
 
         grab = None
         try:
             grab = self.camera.RetrieveResult(1000, pylon.TimeoutHandling_Return)
             if grab is None:
+                self._log_grab_error("RetrieveResult liefert None")
                 return False, None
 
             if not grab.IsValid():
+                self._log_grab_error(
+                    "Grab-Ergebnis ist ungueltig: "
+                    f"code={self._grab_error_code(grab)} "
+                    f"text={self._grab_error_text(grab)}"
+                )
                 grab.Release()
                 return False, None
 
             if not grab.GrabSucceeded():
+                self._log_grab_error(
+                    "Grab fehlgeschlagen: "
+                    f"code={self._grab_error_code(grab)} "
+                    f"text={self._grab_error_text(grab)}"
+                )
                 grab.Release()
                 return False, None
 
@@ -85,6 +101,27 @@ class BaslerSource:
             except:
                 pass
             return False, None
+
+    @staticmethod
+    def _grab_error_code(grab) -> str:
+        try:
+            return str(grab.GetErrorCode())
+        except Exception:
+            return "unbekannt"
+
+    @staticmethod
+    def _grab_error_text(grab) -> str:
+        try:
+            return str(grab.GetErrorDescription())
+        except Exception:
+            return "unbekannt"
+
+    def _log_grab_error(self, message: str) -> None:
+        now = time.perf_counter()
+        if message != self._last_grab_error or now - self._last_grab_error_time >= 1.0:
+            print(f"[CAM-ERR] {message}")
+            self._last_grab_error = message
+            self._last_grab_error_time = now
 
     def read(self) -> Tuple[bool, Optional[Frame]]:
         ok, objframe = self._grab_raw_once()
