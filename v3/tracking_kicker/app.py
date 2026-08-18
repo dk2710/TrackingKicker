@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from queue import Queue, Empty
 from typing import Any, Dict, Optional
-from flask import Flask, jsonify, send_from_directory, url_for
+from flask import Flask, jsonify, request, send_from_directory, url_for
 
 import numpy as np
 import traceback
@@ -163,6 +163,9 @@ class KickerApp:
         self.goal_video_frame_count = 0
         self.goal_video_fps = GOAL_VIDEO_FPS
         self.goal_video_thread: Optional[threading.Thread] = None
+        self.goal_video_generation = 0
+        self.goal_video_result_delivered = False
+        self.goal_video_error: Optional[str] = None
         self.rolling_video_queue = Queue(maxsize=1)
         self.rolling_video_lock = threading.Lock()
         self.rolling_video_path: Optional[str] = None
@@ -242,7 +245,93 @@ class KickerApp:
             use_reloader=False
         )
 
+    def _api_goal_fast(self):
+        """Start/poll the latest three-second goal video without blocking."""
+        refresh = request.args.get("refresh", "").lower() in {
+            "1", "true", "yes", "on"
+        }
+        requested_generation = request.args.get("generation", type=int)
+
+        with self.goal_video_lock:
+            video_path = self.goal_video_path
+            preparing = (
+                self.goal_video_thread is not None
+                and self.goal_video_thread.is_alive()
+            )
+            generation = self.goal_video_generation
+            result_delivered = self.goal_video_result_delivered
+            error = self.goal_video_error
+
+        # A bare request starts a new snapshot only after the previous result
+        # was consumed. A generation/status request only polls and never
+        # starts a second encoder job.
+        should_start = refresh or (
+            requested_generation is None
+            and not preparing
+            and (video_path is None or result_delivered)
+        )
+        if should_start:
+            generation = self._start_goal_video_preparation(force=True)
+            preparing = True
+
+        if requested_generation is not None and requested_generation != generation:
+            requested_generation = generation
+
+        if preparing or video_path is None:
+            response = {
+                "status": "preparing",
+                "video_ready": False,
+                "video_generation": generation,
+                "ball_speed_kmh": float(self.goal_video_speed),
+                "retry_after_ms": 100,
+                "status_url": url_for("goal", generation=generation),
+            }
+            if error:
+                response["error"] = error
+            return jsonify(response), 202
+
+        if error:
+            return jsonify({
+                "status": "error",
+                "video_ready": False,
+                "video_generation": generation,
+                "message": error,
+            }), 503
+
+        # With a bare polling client, expose the completed generation once.
+        # The next bare request then starts a fresh three-second snapshot.
+        with self.goal_video_lock:
+            self.goal_video_result_delivered = True
+
+        speed = float(self.goal_video_speed)
+        frame_count = self.goal_video_frame_count or GOAL_VIDEO_FRAME_LIMIT
+        video_filename = Path(video_path).name
+        try:
+            # Keep the filename stable but make every encoded version a new
+            # URL so browsers cannot replay a cached old WebM.
+            video_version = Path(video_path).stat().st_mtime_ns
+        except OSError:
+            video_version = time.time_ns()
+
+        return jsonify({
+            "status": "ready",
+            "video_ready": True,
+            "video_generation": generation,
+            "ball_speed_kmh": speed,
+            "video_url": url_for(
+                "goal_video",
+                filename=video_filename,
+                v=video_version,
+            ),
+            "video_filename": video_filename,
+            "video_frame_count": frame_count,
+            "video_fps": self.goal_video_fps,
+        }), 200
+
     def api_goal(self):
+        return self._api_goal_fast()
+
+    def _api_goal_legacy(self):
         # Es gibt nur noch ein Goal-Video: den letzten 3-Sekunden-Puffer.
         with self.goal_video_lock:
             video_path = self.goal_video_path
@@ -317,7 +406,11 @@ class KickerApp:
         frames = []
         for image, timestamp in source_frames:
             frame = Frame()
-            frame.frame = image.copy()
+            # Die Arrays im replay_buffer werden nach dem Einfuegen nicht
+            # mehr veraendert. Nur die Referenz zu uebernehmen macht den
+            # API-Aufruf schnell; _prepare_goal_video kopiert vor dem
+            # eigentlichen FFmpeg-Schreibvorgang im Hintergrund.
+            frame.frame = image
             frame.timestamp = timestamp
             frames.append(frame)
         return frames
@@ -426,7 +519,7 @@ class KickerApp:
                 self.goal_video_thread is not None
                 and self.goal_video_thread.is_alive()
             ):
-                return
+                return self.goal_video_generation
 
             # Beim Polling kein neues Video starten, solange bereits ein
             # fertiges Video vorhanden ist.
@@ -454,16 +547,20 @@ class KickerApp:
 
             self.goal_video_path = None
             self.goal_video_speed = float(self.analyzer.speed_display)
+            self.goal_video_error = None
+            self.goal_video_generation += 1
+            self.goal_video_result_delivered = False
             self.goal_video_ready.clear()
 
             self.goal_video_thread = threading.Thread(
                 target=self._prepare_goal_video,
-                args=(frames, self.goal_video_speed),
+                args=(frames, self.goal_video_speed, self.goal_video_generation),
                 daemon=True,
             )
             self.goal_video_thread.start()
+            return self.goal_video_generation
 
-    def _prepare_goal_video(self, frames, speed):
+    def _prepare_goal_video(self, frames, speed, generation):
         try:
             # Erst mit dem vollstaendigen 3-Sekunden-Puffer kodieren. Wenn
             # der Tor-Trigger sehr frueh kommt, weiter auf neue Kameraframes
@@ -500,21 +597,31 @@ class KickerApp:
 
             video_path = self.create_goal_video(frames)
             with self.goal_video_lock:
-                self.goal_video_path = video_path
-                self.goal_video_speed = speed
-                self.goal_video_frame_count = len(frames)
+                if generation == self.goal_video_generation:
+                    self.goal_video_path = video_path
+                    self.goal_video_speed = speed
+                    self.goal_video_frame_count = len(frames)
         except Exception as exc:
+            with self.goal_video_lock:
+                if generation == self.goal_video_generation:
+                    self.goal_video_error = str(exc)
             print(f"Goal-Video Vorbereitung fehlgeschlagen: {exc}")
         finally:
             self.goal_video_ready.set()
 
     def api_goal_video(self, filename):
-        return send_from_directory(
+        response = send_from_directory(
             str(Analyse_Video_Path),
             Path(filename).name,
             mimetype="video/webm",
             as_attachment=False,
         )
+        response.headers["Cache-Control"] = (
+            "no-store, no-cache, must-revalidate, max-age=0"
+        )
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
 
     def create_goal_video(self, frames):
 
