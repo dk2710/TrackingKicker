@@ -3,6 +3,8 @@ import cv2
 import copy
 import os
 import signal
+import subprocess
+import shutil
 import time
 import threading
 from collections import deque
@@ -118,10 +120,17 @@ class KickerApp:
         self.goal_video_frame_count = 0
         self.goal_video_fps = GOAL_VIDEO_FPS
         self.goal_video_thread: Optional[threading.Thread] = None
+        self.rolling_video_queue = Queue(maxsize=1)
+        self.rolling_video_lock = threading.Lock()
+        self.rolling_video_path: Optional[str] = None
+        self.rolling_video_list: Optional[Path] = None
+        self.rolling_video_thread: Optional[threading.Thread] = None
+        self.rolling_last_submit = 0.0
         self.t_api = None
         self.t_cam = None
         self.t_proc = None
         self.t_rec = None
+        self.t_roll = None
 
         # Events gehören jetzt zur App
         self.stop_event = threading.Event()
@@ -185,19 +194,16 @@ class KickerApp:
         )
 
     def api_goal(self):
-        # Das Video wird im Hintergrund vorbereitet. Die HTTP-Anfrage muss
-        # nicht mehr auf Analyse oder Videokodierung warten.
-        self._start_goal_video_preparation()
+        with self.rolling_video_lock:
+            video_path = self.rolling_video_path
 
-        with self.goal_video_lock:
-            video_path = self.goal_video_path
-            speed = self.goal_video_speed
-            frame_count = self.goal_video_frame_count
+        speed = float(self.analyzer.speed_display)
+        frame_count = GOAL_VIDEO_FRAME_LIMIT
 
         if video_path is None:
             return jsonify({
                 "status": "preparing",
-                "message": "Goal-Video wird noch vorbereitet",
+                "message": "Ringpuffer wird noch aufgebaut",
                 "retry_after_ms": 250,
             }), 202
 
@@ -213,6 +219,102 @@ class KickerApp:
             "video_frame_count": frame_count,
             "video_fps": self.goal_video_fps,
         })
+
+    def _queue_rolling_video_frame(self, image, now):
+        if now - self.rolling_last_submit < 1.0 / GOAL_VIDEO_FPS:
+            return
+
+        image = image.copy()
+        if image.ndim == 2:
+            image = cv2.cvtColor(image, cv2.COLOR_BayerRG2BGR)
+        elif image.ndim == 3 and image.shape[2] == 1:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+
+        width = min(image.shape[1], GOAL_VIDEO_MAX_WIDTH)
+        height = int(round(image.shape[0] * width / image.shape[1]))
+        height -= height % 2
+        if image.shape[1] != width or image.shape[0] != height:
+            image = cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
+
+        try:
+            if self.rolling_video_queue.full():
+                self.rolling_video_queue.get_nowait()
+            self.rolling_video_queue.put_nowait(image)
+            self.rolling_last_submit = now
+        except Empty:
+            pass
+
+    def _rolling_video_encoder_loop(self):
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            print("⚠️ FFmpeg nicht gefunden; Ringpuffer ist deaktiviert")
+            return
+
+        process = None
+        try:
+            first_image = self.rolling_video_queue.get(timeout=10.0)
+            height, width = first_image.shape[:2]
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            pattern = Analyse_Video_Path / f"goal_ring_{stamp}_%03d.webm"
+            playlist = Analyse_Video_Path / f"goal_ring_{stamp}.csv"
+
+            command = [
+                ffmpeg, "-y", "-loglevel", "error",
+                "-f", "rawvideo", "-pix_fmt", "bgr24",
+                "-video_size", f"{width}x{height}",
+                "-framerate", str(GOAL_VIDEO_FPS), "-i", "-",
+                "-an", "-c:v", "libvpx", "-deadline", "realtime",
+                "-cpu-used", "8", "-g", str(GOAL_VIDEO_FPS),
+                "-crf", "20", "-b:v", "0", "-pix_fmt", "yuv420p",
+                "-f", "segment", "-segment_time", str(GOAL_VIDEO_DURATION_SECONDS),
+                "-segment_wrap", "3", "-reset_timestamps", "1",
+                "-segment_list", str(playlist), "-segment_list_type", "csv",
+                "-segment_list_size", "3", "-segment_format", "webm",
+                str(pattern),
+            ]
+
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+
+            pending = first_image
+            while not self.stop_event.is_set():
+                process.stdin.write(np.ascontiguousarray(pending).tobytes())
+                try:
+                    pending = self.rolling_video_queue.get(timeout=0.5)
+                except Empty:
+                    continue
+
+                if playlist.exists():
+                    rows = [line for line in playlist.read_text().splitlines() if line.strip()]
+                    if rows:
+                        latest_name = rows[-1].split(",", 1)[0]
+                        latest_path = Path(latest_name)
+                        if not latest_path.is_absolute():
+                            latest_path = Analyse_Video_Path / latest_path
+                        if latest_path.exists() and latest_path.stat().st_size > 0:
+                            with self.rolling_video_lock:
+                                self.rolling_video_path = str(latest_path)
+                                self.rolling_video_list = playlist
+        except Exception as exc:
+            print(f"⚠️ Rolling-Video-Encoder beendet: {exc}")
+        finally:
+            if process is not None:
+                try:
+                    process.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    process.terminate()
+                    process.wait(timeout=2)
+                except Exception:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
 
     def _start_goal_video_preparation(self, force=False):
         with self.goal_video_lock:
@@ -333,19 +435,9 @@ class KickerApp:
         first_frame = frames[0].frame
         height, width = first_frame.shape[:2]
 
-        # Die Kamera-FPS aus den echten Zeitstempeln bestimmen. So wird ein
-        # 30-FPS- oder ungleichmaessiger Stream nicht kuenstlich mit 60 FPS
-        # abgespielt.
-        timestamps = np.asarray(
-            [float(frame.timestamp) for frame in frames],
-            dtype=np.float64,
-        )
-        elapsed = timestamps[-1] - timestamps[0]
-        if elapsed > 0 and len(frames) > 1:
-            video_fps = (len(frames) - 1) / elapsed
-            video_fps = max(1.0, min(float(GOAL_VIDEO_FPS), video_fps))
-        else:
-            video_fps = float(GOAL_VIDEO_FPS)
+        # Das Zielvideo hat bewusst eine feste Zeitbasis: 180 Frames bei
+        # 60 FPS ergeben exakt 3 Sekunden, unabhaengig von der Kamera-FPS.
+        video_fps = float(GOAL_VIDEO_FPS)
         self.goal_video_fps = video_fps
 
         # Das Analysevideo muss nicht in voller Kameraaufloesung kodiert
@@ -353,41 +445,72 @@ class KickerApp:
         # dem Raspberry Pi deutlich.
         output_width = min(width, GOAL_VIDEO_MAX_WIDTH)
         output_height = int(round(height * output_width / width))
+        output_height -= output_height % 2
 
-        fourcc = cv2.VideoWriter_fourcc(*"VP80")
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            raise RuntimeError(
+                "FFmpeg nicht gefunden. Bitte installieren: sudo apt install ffmpeg"
+            )
 
-        writer = cv2.VideoWriter(
-            str(video_path),
-            fourcc,
-            video_fps,
-            (output_width, output_height)
+        temp_path = video_path.with_suffix(".tmp.webm")
+        command = [
+            ffmpeg,
+            "-y",
+            "-loglevel", "error",
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-video_size", f"{output_width}x{output_height}",
+            "-framerate", str(GOAL_VIDEO_FPS),
+            "-i", "-",
+            "-an",
+            "-c:v", "libvpx",
+            "-deadline", "realtime",
+            "-cpu-used", "8",
+            "-crf", "10",
+            "-b:v", "0",
+            "-pix_fmt", "yuv420p",
+            "-f", "webm",
+            str(temp_path),
+        ]
+
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
-
-        if not writer.isOpened():
-            raise RuntimeError("WebM/VP8-Video konnte nicht erstellt werden")
 
         try:
             for frame in frames:
                 image = frame.frame
 
-                # Bei der Basler-Kamera kann der Snapshot noch als ein-
-                # kanaliges BayerRG8-Bild vorliegen. VideoWriter benoetigt
-                # fuer die Ausgabe ein 3-kanaliges BGR-Bild.
+                # FFmpeg bekommt immer ein 3-kanaliges BGR-Bild.
                 if image.ndim == 2:
                     image = cv2.cvtColor(image, cv2.COLOR_BayerRG2BGR)
                 elif image.ndim == 3 and image.shape[2] == 1:
                     image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
 
-                if image.shape[1] != output_width:
+                if image.shape[1] != output_width or image.shape[0] != output_height:
                     image = cv2.resize(
                         image,
                         (output_width, output_height),
                         interpolation=cv2.INTER_AREA,
                     )
-                writer.write(image)
+                process.stdin.write(np.ascontiguousarray(image).tobytes())
 
-        finally:
-            writer.release()
+            process.stdin.close()
+            error_output = process.stderr.read().decode(errors="replace")
+            return_code = process.wait()
+        except BaseException:
+            process.kill()
+            process.wait()
+            raise
+
+        if return_code != 0:
+            raise RuntimeError(f"FFmpeg-Videoerzeugung fehlgeschlagen: {error_output}")
+
+        temp_path.replace(video_path)
 
         print(f"✅ Goal Video erstellt: {video_path}")
 
@@ -613,6 +736,7 @@ class KickerApp:
                         pass
 
                 self.display_queue.put(frame.frame)
+                self._queue_rolling_video_frame(frame.frame, now)
 
                 goal = False
 
@@ -622,7 +746,6 @@ class KickerApp:
                     stage_time["analyze"] += time.perf_counter() - stage_start
 
                 if goal is True:
-                    self._start_goal_video_preparation(force=True)
                     self.play_last_seconds()
 
                 if now - last_log >= 1.0:
@@ -827,9 +950,15 @@ class KickerApp:
                 daemon=True
             )
 
+            self.t_roll = threading.Thread(
+                target=self._rolling_video_encoder_loop,
+                daemon=True,
+            )
+
             self.t_cam.start()
             self.t_proc.start()
             self.t_rec.start()
+            self.t_roll.start()
             self.t_api.start()
 
             print("⌨️  Taste 'r' = Aufnahme Start/Stop | ESC/q = Ende | P = Neustart")
@@ -898,7 +1027,7 @@ class KickerApp:
         return restart_requested
 
     def _join_threads(self):
-        for thread in [self.t_cam, self.t_proc, self.t_rec, self.t_api]:
+        for thread in [self.t_cam, self.t_proc, self.t_rec, self.t_roll, self.t_api]:
             if thread is None:
                 continue
 
