@@ -26,6 +26,7 @@ except ImportError:
 from .config import AppConfig
 from .RawReplaySource import RawReplaySource
 from .BaslerSource import BaslerSource
+from .Objects.Frames import Frame
 from .calibration import CalibrationPipeline
 from .detection import BallDetector
 from .analysis import KickerAnalyzer
@@ -308,6 +309,19 @@ class KickerApp:
         except Empty:
             pass
 
+    def _snapshot_replay_frames(self):
+        """Liefert konsistent entzerrte Frames fuer das Goal-Video."""
+        with self.replay_lock:
+            source_frames = list(self.replay_buffer)
+
+        frames = []
+        for image, timestamp in source_frames:
+            frame = Frame()
+            frame.frame = image.copy()
+            frame.timestamp = timestamp
+            frames.append(frame)
+        return frames
+
     def _rolling_video_encoder_loop(self):
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg is None:
@@ -419,8 +433,11 @@ class KickerApp:
             if self.goal_video_path is not None and not force:
                 return
 
-            with self.history_lock:
-                source_frames = list(self.history_frames)
+            # Der Replaypuffer wird erst nach Bayer-Konvertierung und
+            # Distortion-Korrektur gefuellt. Die rohe history_frames-Liste
+            # darf hier nicht verwendet werden, da sie mit den Live-Frames
+            # geteilt und spaeter mutiert wird.
+            source_frames = self._snapshot_replay_frames()
 
             # Den kompletten 3-Sekunden-Puffer verwenden. Falls die Quelle
             # mehr als 60 FPS liefert, werden Frames gleichmaessig uebersprungen.
@@ -433,11 +450,7 @@ class KickerApp:
                 )
                 source_frames = [source_frames[i] for i in selected_indices]
 
-            frames = []
-            for source_frame in source_frames:
-                frame = copy.copy(source_frame)
-                frame.frame = source_frame.frame.copy()
-                frames.append(frame)
+            frames = source_frames
 
             self.goal_video_path = None
             self.goal_video_speed = float(self.analyzer.speed_display)
@@ -458,8 +471,7 @@ class KickerApp:
             deadline = time.perf_counter() + 5.0
             while len(frames) < GOAL_VIDEO_FRAME_LIMIT and time.perf_counter() < deadline:
                 time.sleep(0.02)
-                with self.history_lock:
-                    current_frames = list(self.history_frames)
+                current_frames = self._snapshot_replay_frames()
                 if len(current_frames) >= GOAL_VIDEO_FRAME_LIMIT:
                     frames = current_frames
                     break
@@ -580,13 +592,6 @@ class KickerApp:
                     image = cv2.cvtColor(image, cv2.COLOR_BayerRG2BGR)
                 elif image.ndim == 3 and image.shape[2] == 1:
                     image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-
-                # Die History kann Rohbilder enthalten, waehrend das
-                # Livebild bereits in processing_loop entzerrt wird. Das
-                # Goal-Video muss denselben Distortion-Schritt erhalten.
-                # Erst danach verkleinern, damit die Kalibrierung weiterhin
-                # auf der Originalaufloesung (1100x650) arbeitet.
-                image = self.dist.apply(image)
 
                 if image.shape[1] != output_width or image.shape[0] != output_height:
                     image = cv2.resize(
