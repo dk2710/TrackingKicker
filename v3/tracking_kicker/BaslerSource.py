@@ -47,6 +47,14 @@ class BaslerSource:
         self.camera.Width.Value = cfg.width
         self.camera.OffsetX.Value = cfg.offset_x
 
+        # Die konfigurierte Bildrate bisher nur zu protokollieren reicht
+        # nicht: Die Kamera lief dadurch mit ca. 209 FPS. Das kann am
+        # USB-Hub zu Payload-Verlusten und Block-ID-Spruengen fuehren.
+        # Begrenze die Kamera deshalb explizit auf die konfigurierte Rate.
+        if getattr(cfg, "force_fps", 0) and cfg.force_fps > 0:
+            self.try_set(self.camera, "AcquisitionFrameRateEnable", True)
+            self.try_set(self.camera, "AcquisitionFrameRate", float(cfg.force_fps))
+
         strategy = pylon.GrabStrategy_LatestImageOnly
         self.camera.StartGrabbing(strategy)
         time.sleep(0.05)
