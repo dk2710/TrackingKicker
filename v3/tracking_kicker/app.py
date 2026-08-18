@@ -343,6 +343,15 @@ class KickerApp:
         try:
             for frame in frames:
                 image = frame.frame
+
+                # Bei der Basler-Kamera kann der Snapshot noch als ein-
+                # kanaliges BayerRG8-Bild vorliegen. VideoWriter benoetigt
+                # fuer die Ausgabe ein 3-kanaliges BGR-Bild.
+                if image.ndim == 2:
+                    image = cv2.cvtColor(image, cv2.COLOR_BayerRG2BGR)
+                elif image.ndim == 3 and image.shape[2] == 1:
+                    image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+
                 if image.shape[1] != output_width:
                     image = cv2.resize(
                         image,
