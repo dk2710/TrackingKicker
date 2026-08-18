@@ -229,18 +229,23 @@ class KickerApp:
         # Ein altes Ringsegment darf nach einem Kamerastillstand nicht erneut
         # als aktuelles Torvideo ausgeliefert werden. Bei laufender Kamera
         # wird spätestens alle drei Sekunden ein neues Segment veröffentlicht.
-        if preparing:
-            video_path = None
+        if not preparing:
+            self._start_goal_video_preparation(force=True)
+            preparing = True
 
-        speed = float(self.analyzer.speed_display)
+        if preparing:
+            self.goal_video_ready.wait(timeout=6.0)
+            with self.goal_video_lock:
+                video_path = self.goal_video_path
+
+        speed = float(self.goal_video_speed)
         frame_count = GOAL_VIDEO_FRAME_LIMIT
 
         if video_path is None:
             return jsonify({
-                "status": "preparing",
-                "message": "Die letzten 3 Sekunden werden vorbereitet",
-                "retry_after_ms": 250,
-            }), 202
+                "status": "error",
+                "message": "Die letzten 3 Sekunden konnten nicht als Video erstellt werden",
+            }), 503
 
         video_filename = Path(video_path).name
         # Relative URL zur Vermeidung von falschem Host, 127.0.0.1 und
@@ -800,15 +805,13 @@ class KickerApp:
                 self.display_queue.put(frame.frame)
                 goal = False
 
-                if meas is True:
-                    stage_start = time.perf_counter()
-                    goal = self.analyzer.process_frame(frame)
-                    stage_time["analyze"] += time.perf_counter() - stage_start
+                # Auch Frames ohne Ball muessen an den Analyzer gehen: Nur
+                # so kann er ein Tor bestaetigen, wenn der Ball verschwindet.
+                stage_start = time.perf_counter()
+                goal = self.analyzer.process_frame(frame)
+                stage_time["analyze"] += time.perf_counter() - stage_start
 
-                if goal is True:
-                    # Bei jedem Tor den aktuellen 3-Sekunden-Puffer neu
-                    # kodieren und goal_latest.webm atomar ersetzen.
-                    self._start_goal_video_preparation(force=True)
+                if goal and any(goal):
                     self.play_last_seconds()
 
                 if now - last_log >= 1.0:

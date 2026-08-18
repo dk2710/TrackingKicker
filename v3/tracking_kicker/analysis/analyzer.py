@@ -177,7 +177,7 @@ class KickerAnalyzer:
             # Wenn weniger als 2 echte Punkte → keine Messung möglich
             if len(valid_points) < 2:
                 self.speed_kmh_s = 0.0
-                return
+                return goalL, goalR
 
             # Start = erster echter Punkt
             start_index, start = valid_points[0]
