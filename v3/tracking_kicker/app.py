@@ -114,6 +114,7 @@ class KickerApp:
         self.goal_video_ready = threading.Event()
         self.goal_video_path: Optional[str] = None
         self.goal_video_speed = 0.0
+        self.goal_video_frame_count = 0
         self.goal_video_thread: Optional[threading.Thread] = None
 
         # Events gehören jetzt zur App
@@ -180,6 +181,7 @@ class KickerApp:
         with self.goal_video_lock:
             video_path = self.goal_video_path
             speed = self.goal_video_speed
+            frame_count = self.goal_video_frame_count
 
         if video_path is None:
             return jsonify({
@@ -197,6 +199,8 @@ class KickerApp:
             "ball_speed_kmh": speed,
             "video_url": video_url,
             "video_filename": video_filename,
+            "video_frame_count": frame_count,
+            "video_fps": GOAL_VIDEO_FPS,
         })
 
     def _start_goal_video_preparation(self, force=False):
@@ -245,10 +249,45 @@ class KickerApp:
 
     def _prepare_goal_video(self, frames, speed):
         try:
+            # Erst mit dem vollstaendigen 3-Sekunden-Puffer kodieren. Wenn
+            # der Tor-Trigger sehr frueh kommt, weiter auf neue Kameraframes
+            # warten, statt ein zu kurzes Video zu veroeffentlichen.
+            deadline = time.perf_counter() + 5.0
+            while len(frames) < GOAL_VIDEO_FRAME_LIMIT and time.perf_counter() < deadline:
+                time.sleep(0.02)
+                with self.history_lock:
+                    current_frames = list(self.history_frames)
+                if len(current_frames) >= GOAL_VIDEO_FRAME_LIMIT:
+                    frames = current_frames
+                    break
+
+            if len(frames) < GOAL_VIDEO_FRAME_LIMIT:
+                raise RuntimeError(
+                    f"Zu wenige Frames fuer Goal-Video: {len(frames)}/"
+                    f"{GOAL_VIDEO_FRAME_LIMIT}"
+                )
+
+            if len(frames) > GOAL_VIDEO_FRAME_LIMIT:
+                selected_indices = np.linspace(
+                    0,
+                    len(frames) - 1,
+                    GOAL_VIDEO_FRAME_LIMIT,
+                    dtype=int,
+                )
+                frames = [frames[i] for i in selected_indices]
+
+            copied_frames = []
+            for source_frame in frames:
+                frame = copy.copy(source_frame)
+                frame.frame = source_frame.frame.copy()
+                copied_frames.append(frame)
+            frames = copied_frames
+
             video_path = self.create_goal_video(frames)
             with self.goal_video_lock:
                 self.goal_video_path = video_path
                 self.goal_video_speed = speed
+                self.goal_video_frame_count = len(frames)
         except Exception as exc:
             print(f"Goal-Video Vorbereitung fehlgeschlagen: {exc}")
         finally:
@@ -266,6 +305,11 @@ class KickerApp:
 
         if not frames:
             raise ValueError("Keine Frames vorhanden")
+        if len(frames) != GOAL_VIDEO_FRAME_LIMIT:
+            raise ValueError(
+                f"Goal-Video braucht {GOAL_VIDEO_FRAME_LIMIT} Frames, "
+                f"erhalten: {len(frames)}"
+            )
 
         output_dir = Analyse_Video_Path
         output_dir.mkdir(parents=True, exist_ok=True)
