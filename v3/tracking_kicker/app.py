@@ -581,6 +581,13 @@ class KickerApp:
                 elif image.ndim == 3 and image.shape[2] == 1:
                     image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
 
+                # Die History kann Rohbilder enthalten, waehrend das
+                # Livebild bereits in processing_loop entzerrt wird. Das
+                # Goal-Video muss denselben Distortion-Schritt erhalten.
+                # Erst danach verkleinern, damit die Kalibrierung weiterhin
+                # auf der Originalaufloesung (1100x650) arbeitet.
+                image = self.dist.apply(image)
+
                 if image.shape[1] != output_width or image.shape[0] != output_height:
                     image = cv2.resize(
                         image,
