@@ -3,6 +3,7 @@ from typing import Optional, Tuple, Dict
 
 
 import time
+import threading
 
 from pypylon import pylon, genicam
 
@@ -143,6 +144,8 @@ class BaslerSource:
 
     def _recover_grab_stream(self) -> None:
         """Baut die pylon-Kamera nach einem USB-/Block-ID-Fehler neu auf."""
+        if self._closed:
+            return
         now = time.perf_counter()
         if now - self._last_grab_recovery_time < 5.0:
             return
@@ -162,6 +165,9 @@ class BaslerSource:
             except BaseException:
                 pass
             del old_camera
+
+            if self._closed:
+                return
 
             time.sleep(0.2)
             device = pylon.TlFactory.GetInstance().CreateFirstDevice()
@@ -245,6 +251,37 @@ class BaslerSource:
         # Weitere Grab-Aufrufe und automatische Recovery waehrend des
         # Herunterfahrens sofort unterbinden.
         self._closed = True
+
+        camera = self.camera
+
+        def close_camera():
+            try:
+                if camera.IsGrabbing():
+                    camera.StopGrabbing()
+            except BaseException as e:
+                print(f"[SHUTDOWN] StopGrabbing fehlgeschlagen: {e}")
+            try:
+                if camera.IsOpen():
+                    camera.Close()
+            except BaseException as e:
+                print(f"[SHUTDOWN] Camera close fehlgeschlagen: {e}")
+
+        cleanup = threading.Thread(
+            target=close_camera,
+            name="basler-cleanup",
+            daemon=True,
+        )
+        cleanup.start()
+        cleanup.join(timeout=1.0)
+        if cleanup.is_alive():
+            print("[SHUTDOWN] Kamera-USB-Stop reagiert nicht; Prozess wird nicht blockiert")
+        else:
+            print("[SHUTDOWN] Basler sauber gestoppt und geschlossen")
+
+        # Der alte synchrone Cleanup bleibt als Fallback im Quelltext, wird
+        # aber nicht mehr erreicht. Ein kaputter USB-Stop darf den Prozess
+        # nicht festhalten.
+        return
 
         try:
             if self.camera.IsGrabbing():
