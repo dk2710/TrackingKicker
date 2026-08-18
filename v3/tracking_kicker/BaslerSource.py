@@ -209,8 +209,12 @@ class BaslerSource:
         if not ok or objframe is None:
             self._read_failures += 1
             self._consecutive_grab_failures += 1
-            if self._consecutive_grab_failures >= 10:
-                self._recover_grab_stream()
+            # Kein automatisches Close/CreateFirstDevice im Grab-Thread:
+            # Wenn waehrend dieses Reconnects SIGINT kommt, konkurrieren
+            # Recovery und Shutdown auf demselben pylon-Handle. Das kann den
+            # USB-Handle der Kamera fuer den naechsten Prozess festhalten.
+            # Der Stream wird deshalb ausschliesslich im kontrollierten
+            # release()-Pfad geschlossen.
         else:
             self._read_count += 1
 
