@@ -1276,6 +1276,56 @@ def _create_camera_with_retry(camera_config):
     )
 
 
+def _find_replay_video() -> Path:
+    """Find a usable NPZ replay for camera-less operation."""
+    candidates = []
+
+    # test.npz bleibt der bevorzugte, explizite Fallback.
+    if VIDEO_PATH.exists():
+        candidates.append(VIDEO_PATH)
+
+    # Auf dem Pi werden Aufnahmen vom Recording-Thread in v3/videos abgelegt;
+    # lokal liegen sie haeufig noch unter tracking_kicker/videos.
+    replay_directories = [config.videos_dir, Analyse_Video_Path]
+    if config.debug_video:
+        configured_path = Path(config.debug_video)
+        if not configured_path.is_absolute():
+            for directory in replay_directories:
+                candidates.append(directory / configured_path)
+        else:
+            candidates.append(configured_path)
+
+    for directory in replay_directories:
+        candidates.extend(directory.glob("session_raw_*.npz"))
+
+    existing = []
+    seen = set()
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate in seen or not candidate.is_file():
+            continue
+        seen.add(candidate)
+        existing.append(candidate)
+
+    if not existing:
+        searched = ", ".join(str(path) for path in replay_directories)
+        raise FileNotFoundError(
+            "Kein Fallback-Video gefunden. Erwartet test.npz oder "
+            f"session_raw_*.npz in: {searched}"
+        )
+
+    # Falls test.npz fehlt, die zuletzt gespeicherte Session verwenden.
+    if VIDEO_PATH.resolve() in existing:
+        return VIDEO_PATH.resolve()
+    return max(existing, key=lambda path: path.stat().st_mtime_ns)
+
+
+def _create_replay_fallback():
+    replay_path = _find_replay_video()
+    print(f"[REPLAY] Fallback-Quelle: {replay_path}")
+    return RawReplaySource(str(replay_path))
+
+
 if __name__ == "__main__":
     if not _acquire_app_lock():
         sys.exit(1)
@@ -1293,15 +1343,10 @@ if __name__ == "__main__":
                 except Exception as e:
                     print(f"❌ Kamera nicht verfügbar: {e}")
                     print("➡️ Fallback auf RawReplaySource")
-                    raise RuntimeError(
-                        "Basler-Kamera konnte nicht geoeffnet werden; "
-                        "Replay-Fallback ist nicht verfuegbar."
-                    ) from e
+                    source = _create_replay_fallback()
 
             else:
-                if not VIDEO_PATH.exists():
-                    raise FileNotFoundError(f"Replay-Datei fehlt: {VIDEO_PATH}")
-                source = RawReplaySource(str(VIDEO_PATH))
+                source = _create_replay_fallback()
 
             app = KickerApp(source)
 
