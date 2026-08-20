@@ -32,7 +32,8 @@ class KickerAnalyzer:
         self.ball_history = []  # Liste aus (timestamp, world_x, world_y)
         self.history_size = 8  # über 8 Frames mitteln
 
-        # Buffer für die letzten 20 Frames
+        # Geschwindigkeitsfenster: ausschliesslich die letzte Sekunde.
+        self.speed_analysis_seconds = 1.0
         self.world_buffer = []
         self.time_buffer = []
 
@@ -149,7 +150,7 @@ class KickerAnalyzer:
         self._ensure_homography(frame.frame.shape)
 
 
-        WINDOW = 10
+        # Das Geschwindigkeitsfenster wird zeitbasiert unten begrenzt.
 
         # Ball erkannt?
         if frame.ball is not None:
@@ -163,13 +164,17 @@ class KickerAnalyzer:
         # Zeitstempel immer speichern
         self.time_buffer.append(frame.timestamp)
 
-        # Buffer begrenzen
-        if len(self.world_buffer) > WINDOW:
+        # Buffer auf die letzte Sekunde begrenzen
+        while (
+                len(self.time_buffer) > 2
+                and self.time_buffer[-1] - self.time_buffer[0]
+                > self.speed_analysis_seconds
+        ):
             self.world_buffer.pop(0)
             self.time_buffer.pop(0)
 
-        # Nur messen, wenn 20 Frames im Fenster sind
-        if len(self.world_buffer) == WINDOW:
+        # Messen, sobald mindestens zwei Punkte im Ein-Sekunden-Fenster liegen
+        if len(self.world_buffer) >= 2:
 
             # Alle echten Ballpunkte extrahieren
             valid_points = [(i, p) for i, p in enumerate(self.world_buffer) if p is not None]
@@ -193,7 +198,7 @@ class KickerAnalyzer:
             # Zeit zwischen diesen beiden Frames
             dt = self.time_buffer[end_index] - self.time_buffer[start_index]
 
-            if dt > 0:
+            if dt >= self.min_dt:
                 inst_cm_s = dist_cm / dt
                 inst_kmh = inst_cm_s * 0.036
 

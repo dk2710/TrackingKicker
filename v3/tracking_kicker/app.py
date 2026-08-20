@@ -80,8 +80,9 @@ HEADLESS = (
     else _headless_env == "1"
 ) or _no_linux_display
 GOAL_VIDEO_DURATION_SECONDS = 3
-GOAL_VIDEO_FPS = 60
-GOAL_VIDEO_FRAME_LIMIT = GOAL_VIDEO_DURATION_SECONDS * GOAL_VIDEO_FPS
+# 60 Gesamtframes fuer drei Sekunden entsprechen 20 FPS.
+GOAL_VIDEO_FRAME_LIMIT = 60
+GOAL_VIDEO_FPS = GOAL_VIDEO_FRAME_LIMIT / GOAL_VIDEO_DURATION_SECONDS
 GOAL_VIDEO_MAX_WIDTH = 640
 
 _app_lock_handle = None
@@ -184,13 +185,9 @@ class KickerApp:
         self.record_event = threading.Event()
 
         # Replay gehört jetzt zur App
-        self.replay_buffer = deque(maxlen=int(60 * config.replay_seconds))
+        self.replay_buffer = deque(maxlen=int(240 * config.replay_seconds))
         self.replay_lock = threading.Lock()
         self.history_frames = deque()
-
-        self._replay_last_store = 0.0
-        self._replay_interval = 1.0 / 60.0
-        self._max_replay_frames = int(60 * config.replay_seconds)
 
         self.api = Flask(__name__)
         self.last_analysis = {}
@@ -399,21 +396,50 @@ class KickerApp:
             pass
 
     def _snapshot_replay_frames(self):
-        """Liefert konsistent entzerrte Frames fuer das Goal-Video."""
+        """Liefert unveraenderte Rohframes aus den letzten drei Sekunden."""
         with self.replay_lock:
             source_frames = list(self.replay_buffer)
 
         frames = []
         for image, timestamp in source_frames:
             frame = Frame()
-            # Die Arrays im replay_buffer werden nach dem Einfuegen nicht
-            # mehr veraendert. Nur die Referenz zu uebernehmen macht den
-            # API-Aufruf schnell; _prepare_goal_video kopiert vor dem
-            # eigentlichen FFmpeg-Schreibvorgang im Hintergrund.
+            # Das Array wird im Kamera-Loop nie mehr veraendert. Die Referenz
+            # macht den API-Aufruf schnell; kopiert wird erst nach der
+            # Auswahl der 60 Zielbilder im Hintergrund.
             frame.frame = image
             frame.timestamp = timestamp
             frames.append(frame)
         return frames
+
+    @staticmethod
+    def _select_goal_frames(source_frames):
+        """Reduziert beliebig viele Rohframes gleichmaessig auf 60 Bilder."""
+        if len(source_frames) <= GOAL_VIDEO_FRAME_LIMIT:
+            return list(source_frames)
+
+        selected_indices = np.linspace(
+            0,
+            len(source_frames) - 1,
+            GOAL_VIDEO_FRAME_LIMIT,
+            dtype=int,
+        )
+        return [source_frames[i] for i in selected_indices]
+
+    def _prepare_selected_frames(self, source_frames):
+        """Wendet Farbe und Entzerrung erst nach der Frame-Auswahl an."""
+        prepared = []
+        for source_frame in source_frames:
+            frame = copy.copy(source_frame)
+            image = source_frame.frame.copy()
+
+            if image.ndim == 2:
+                image = cv2.cvtColor(image, cv2.COLOR_BayerRG2BGR)
+            elif image.ndim == 3 and image.shape[2] == 1:
+                image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+
+            frame.frame = self.dist.apply(image)
+            prepared.append(frame)
+        return prepared
 
     def _rolling_video_encoder_loop(self):
         ffmpeg = shutil.which("ffmpeg")
@@ -526,27 +552,8 @@ class KickerApp:
             if self.goal_video_path is not None and not force:
                 return
 
-            # Der Replaypuffer wird erst nach Bayer-Konvertierung und
-            # Distortion-Korrektur gefuellt. Die rohe history_frames-Liste
-            # darf hier nicht verwendet werden, da sie mit den Live-Frames
-            # geteilt und spaeter mutiert wird.
-            source_frames = self._snapshot_replay_frames()
-
-            # Den kompletten 3-Sekunden-Puffer verwenden. Falls die Quelle
-            # mehr als 60 FPS liefert, werden Frames gleichmaessig uebersprungen.
-            if len(source_frames) > GOAL_VIDEO_FRAME_LIMIT:
-                selected_indices = np.linspace(
-                    0,
-                    len(source_frames) - 1,
-                    GOAL_VIDEO_FRAME_LIMIT,
-                    dtype=int,
-                )
-                source_frames = [source_frames[i] for i in selected_indices]
-
-            frames = source_frames
-
             self.goal_video_path = None
-            self.goal_video_speed = float(self.analyzer.speed_display)
+            self.goal_video_speed = float(self.analyzer.speed_kmh_s)
             self.goal_video_error = None
             self.goal_video_generation += 1
             self.goal_video_result_delivered = False
@@ -554,24 +561,33 @@ class KickerApp:
 
             self.goal_video_thread = threading.Thread(
                 target=self._prepare_goal_video,
-                args=(frames, self.goal_video_speed, self.goal_video_generation),
+                args=(self.goal_video_speed, self.goal_video_generation),
                 daemon=True,
             )
             self.goal_video_thread.start()
             return self.goal_video_generation
 
-    def _prepare_goal_video(self, frames, speed, generation):
+    def _prepare_goal_video(self, speed, generation):
         try:
-            # Erst mit dem vollstaendigen 3-Sekunden-Puffer kodieren. Wenn
-            # der Tor-Trigger sehr frueh kommt, weiter auf neue Kameraframes
-            # warten, statt ein zu kurzes Video zu veroeffentlichen.
+            # Erst auf einen echten Drei-Sekunden-Zeitraum warten. Die
+            # Reduzierung auf 60 Bilder passiert danach, noch bevor Farbe
+            # und Distortion-Korrektur berechnet werden.
             deadline = time.perf_counter() + 5.0
-            while len(frames) < GOAL_VIDEO_FRAME_LIMIT and time.perf_counter() < deadline:
-                time.sleep(0.02)
+            frames = []
+            while time.perf_counter() < deadline:
                 current_frames = self._snapshot_replay_frames()
-                if len(current_frames) >= GOAL_VIDEO_FRAME_LIMIT:
-                    frames = current_frames
+                span = (
+                    current_frames[-1].timestamp - current_frames[0].timestamp
+                    if len(current_frames) >= 2
+                    else 0.0
+                )
+                if (
+                    len(current_frames) >= GOAL_VIDEO_FRAME_LIMIT
+                    and span >= GOAL_VIDEO_DURATION_SECONDS
+                ):
+                    frames = self._select_goal_frames(current_frames)
                     break
+                time.sleep(0.02)
 
             if len(frames) < GOAL_VIDEO_FRAME_LIMIT:
                 raise RuntimeError(
@@ -579,21 +595,7 @@ class KickerApp:
                     f"{GOAL_VIDEO_FRAME_LIMIT}"
                 )
 
-            if len(frames) > GOAL_VIDEO_FRAME_LIMIT:
-                selected_indices = np.linspace(
-                    0,
-                    len(frames) - 1,
-                    GOAL_VIDEO_FRAME_LIMIT,
-                    dtype=int,
-                )
-                frames = [frames[i] for i in selected_indices]
-
-            copied_frames = []
-            for source_frame in frames:
-                frame = copy.copy(source_frame)
-                frame.frame = source_frame.frame.copy()
-                copied_frames.append(frame)
-            frames = copied_frames
+            frames = self._prepare_selected_frames(frames)
 
             video_path = self.create_goal_video(frames)
             with self.goal_video_lock:
@@ -644,8 +646,8 @@ class KickerApp:
         first_frame = frames[0].frame
         height, width = first_frame.shape[:2]
 
-        # Das Zielvideo hat bewusst eine feste Zeitbasis: 180 Frames bei
-        # 60 FPS ergeben exakt 3 Sekunden, unabhaengig von der Kamera-FPS.
+        # Das Zielvideo hat bewusst eine feste Zeitbasis: 60 Frames bei
+        # 20 FPS ergeben exakt 3 Sekunden, unabhaengig von der Kamera-FPS.
         video_fps = float(GOAL_VIDEO_FPS)
         self.goal_video_fps = video_fps
 
@@ -818,11 +820,19 @@ class KickerApp:
                     continue
 
                 # Frame für die letzten 3 Sekunden speichern
-                self.history_frames.append(objframe)
+                with self.replay_lock:
+                    self.replay_buffer.append(
+                        (objframe.frame.copy(), objframe.timestamp)
+                    )
 
                 # Alles älter als 3 Sekunden entfernen
-                while self.history_frames and objframe.timestamp - self.history_frames[0].timestamp > 3:
-                    self.history_frames.popleft()
+                with self.replay_lock:
+                    while (
+                        self.replay_buffer
+                        and objframe.timestamp - self.replay_buffer[0][1]
+                        > GOAL_VIDEO_DURATION_SECONDS
+                    ):
+                        self.replay_buffer.popleft()
 
                 if self.frame_queue.full():
                     try:
@@ -862,16 +872,6 @@ class KickerApp:
                 frame.frame = self.dist.apply(
                     frame.frame
                 )
-
-                with self.history_lock:
-
-                    self.history_frames.append(frame)
-
-                    while (
-                            self.history_frames
-                            and frame.timestamp - self.history_frames[0].timestamp > 3
-                    ):
-                        self.history_frames.popleft()
 
                 if self.processed_queue.full():
                     try:
@@ -929,15 +929,6 @@ class KickerApp:
 
                 now = time.perf_counter()
                 n += 1
-
-                if now - self._replay_last_store >= self._replay_interval:
-                    with self.replay_lock:
-                        self.replay_buffer.append((frame.frame.copy(), frame.timestamp))
-
-                        if len(self.replay_buffer) > self._max_replay_frames:
-                            self.replay_buffer.popleft()
-
-                    self._replay_last_store = now
 
                 stage_start = time.perf_counter()
                 meas = self.detector.detect(frame)
@@ -1095,13 +1086,24 @@ class KickerApp:
 
             frames = list(self.replay_buffer)
 
+        raw_frames = []
+        for image, timestamp in self._select_goal_frames(frames):
+            replay_frame = Frame()
+            replay_frame.frame = image
+            replay_frame.timestamp = timestamp
+            raw_frames.append(replay_frame)
+        frames = [
+            (frame.frame, frame.timestamp)
+            for frame in self._prepare_selected_frames(raw_frames)
+        ]
+
         if HEADLESS:
             print("⚠️ HEADLESS aktiv → lokales Replay wird nicht angezeigt")
             return
 
         gui_named_window("Replay (letzte Sekunden)")
 
-        target_fps = 120
+        target_fps = GOAL_VIDEO_FPS
         target_dt = 1.0 / target_fps
 
         t_start = frames[0][1]
