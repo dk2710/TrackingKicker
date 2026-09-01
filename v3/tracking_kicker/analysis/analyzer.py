@@ -1,65 +1,74 @@
-from xml.etree.ElementTree import tostring
-
 import cv2
 import math
+import time
+from typing import Optional, Tuple
+
 import numpy as np
-import time as time
-from typing import Any, Dict, Optional, Tuple
 
-from v3.tracking_kicker.model.Vision import FieldConfig, GoalsConfig
 from v3.tracking_kicker.analysis.rod_control import RodControlTracker
-
+from v3.tracking_kicker.model.Vision import FieldConfig, GoalsConfig
 
 
 class KickerAnalyzer:
+    """Stateful goal and ball-position analysis with goal-only speed checks.
+
+    Every frame can still provide ``frame.ball`` for the normal position and
+    goal analysis. Speed is calculated only after a goal was confirmed and
+    only from observations which the detector marked as belonging to the
+    same track.
+    """
+
     def __init__(self, goals_cfg: GoalsConfig, field_cfg: FieldConfig | None = None):
-
-        self.prev_ball_frame = None
         self.goals_cfg = goals_cfg
+        self.field_cfg = field_cfg
 
-        # Ball motion (nur aus Messungen!)
+        # Ball motion used by the live overlay.
         self.prev_xy: Optional[Tuple[int, int]] = None
-        self.vx_s: float = 0.0  # px/s
-        self.vy_s: float = 0.0  # px/s
-        self.speed_s: float = 0.0
+        self.vx_s = 0.0
+        self.vy_s = 0.0
+        self.speed_s = 0.0
 
-        self._speed_display = 0
-        self._speed_window_start = time.perf_counter()
-        self._speed_window = 0.1
-        self.min_dt = 0.015  # 15 ms
-        self.prev_ball_time = None
-
-        self.ball_history = []  # Liste aus (timestamp, world_x, world_y)
-        self.history_size = 8  # über 8 Frames mitteln
-
-        # Geschwindigkeitsfenster: ausschliesslich die letzte Sekunde.
+        self._speed_display = 0.0
         self.speed_analysis_seconds = 1.0
+        # Keep a little more than the analysis window. Goal confirmation can
+        # happen after a short run of missing frames.
+        self.speed_buffer_seconds = 2.0
+        # Two frames at 180 FPS are about 5.6 ms apart. Values below 2.5 ms
+        # are treated as duplicate/bad timestamps, while a gap above 250 ms
+        # is too large for a reliable instantaneous speed segment.
+        self.min_dt = 0.0025
+        self.max_dt = 0.25
+        # Deliberately generous for a table-football shot. This rejects
+        # contour jumps while retaining very fast real shots.
+        self.max_plausible_speed_kmh = 350.0
+
+        # Public buffers are kept for compatibility with the existing code.
         self.world_buffer = []
         self.time_buffer = []
+        # Only detector-validated observations are stored here. Raw
+        # frame.ball remains available to the general position analysis.
+        self.ball_observations = []  # (timestamp, world_x, world_y)
+        self.last_speed_pair_count = 0
+        self.last_rejected_speed_pair_count = 0
 
         self._speed_peak = 0.0
         self._speed_peak_time = time.perf_counter()
-        self._speed_peak_hold = 1 # 0.5 Sekunden halten
+        self._speed_peak_hold = 1.0
 
-        # Score
+        # Score and goal state.
         self.score_left = 0
         self.score_right = 0
-
-
         self._pending_side = None  # "left" | "right" | None
-        self._pending_start_time = 0.0
-        self._pending_seen_ball = False
+        self._pending_start_time: Optional[float] = None
         self._goal_locked = False
 
-        #Zeitmessung
-        self._last_t: float | None = None
+        # The application uses this event as the payload for its POST.
+        self._goal_event_id = 0
+        self.last_goal_event = None
+        self._last_goal_timestamp: Optional[float] = None
 
-
-        #Bereicherkennung
-        self.field_cfg = field_cfg
         self.rod_control = None
         self.H_img2cm = None
-        self.prev_world = None
         self.speed_kmh_s = 0.0
 
         if self.field_cfg is not None and getattr(self.field_cfg, "rods", None) is not None:
@@ -67,58 +76,101 @@ class KickerAnalyzer:
                 rods_x_norm=self.field_cfg.rods.xs_norm
             )
 
+    def _emit_goal(self, side: str, timestamp: Optional[float]) -> None:
+        """Create one goal event at the first frame seen inside the goal."""
+        if side == "left":
+            self.score_left += 1
+        else:
+            self.score_right += 1
 
-    def _update_goals(self, ball, frame_shape):
-        goalL = goalR = False
+        goal_time = float(timestamp) if timestamp is not None else time.perf_counter()
+        self._goal_event_id += 1
+        self._last_goal_timestamp = goal_time
+        self.last_goal_event = {
+            "event_id": self._goal_event_id,
+            "event": "goal",
+            "side": side,
+            "goal_side": side,
+            "goal": side,
+            "position": side,
+            "goal_position": side,
+            "goal_timestamp": goal_time,
+            "speed_kmh": 0.0,
+            "ball_speed_kmh": 0.0,
+            "speed": 0.0,
+            "score_left": self.score_left,
+            "score_right": self.score_right,
+        }
+
+    def _update_goals(
+        self,
+        ball,
+        frame_shape,
+        timestamp: Optional[float] = None,
+    ):
+        goal_left = goal_right = False
 
         if ball is None:
-            # Ball weg → mögliches Tor bestätigen
+            # A missing ball confirms a previously observed entry into a goal.
             if self._pending_side is not None and not self._goal_locked:
-                if self._pending_side == "left":
-                    self.score_left += 1
-                    goalL = True
-                else:
-                    self.score_right += 1
-                    goalR = True
-
+                side = self._pending_side
+                self._emit_goal(
+                    side,
+                    self._pending_start_time
+                    if self._pending_start_time is not None
+                    else timestamp,
+                )
+                goal_left = side == "left"
+                goal_right = side == "right"
                 self._goal_locked = True
                 self._pending_side = None
-
-            return goalL, goalR
+                self._pending_start_time = None
+            return goal_left, goal_right
 
         x, y, r = ball
+        in_left = self._ball_in_goal_roi(x, y, r, "left", frame_shape)
+        in_right = self._ball_in_goal_roi(x, y, r, "right", frame_shape)
 
-        inL = self._ball_in_goal_roi(x, y, r, "left", frame_shape)
-        inR = self._ball_in_goal_roi(x, y, r, "right", frame_shape)
-
-        # LOCKED: warten bis Ball wieder im Feld ist
+        # Wait until the ball has left both goal ROIs before accepting another
+        # goal. This prevents several notifications for one shot.
         if self._goal_locked:
-            if not inL and not inR:
+            if not in_left and not in_right:
                 self._goal_locked = False
             return False, False
 
-        # Ball betritt Tor
         if self._pending_side is None:
-            if inL:
+            if in_left:
                 self._pending_side = "left"
-            elif inR:
+                self._pending_start_time = timestamp
+            elif in_right:
                 self._pending_side = "right"
+                self._pending_start_time = timestamp
             return False, False
 
-        # Ball war im Tor, ist jetzt draußen → TOR
-        if self._pending_side == "left" and not inL:
-            self.score_left += 1
-            goalL = True
+        # The ball was in the goal and is now outside it: confirm the goal.
+        if self._pending_side == "left" and not in_left:
+            self._emit_goal(
+                "left",
+                self._pending_start_time
+                if self._pending_start_time is not None
+                else timestamp,
+            )
+            goal_left = True
+        elif self._pending_side == "right" and not in_right:
+            self._emit_goal(
+                "right",
+                self._pending_start_time
+                if self._pending_start_time is not None
+                else timestamp,
+            )
+            goal_right = True
+
+        if goal_left or goal_right:
             self._goal_locked = True
             self._pending_side = None
+            self._pending_start_time = None
 
-        elif self._pending_side == "right" and not inR:
-            self.score_right += 1
-            goalR = True
-            self._goal_locked = True
-            self._pending_side = None
-
-        return goalL, goalR
+        return goal_left, goal_right
 
     def _draw_arrow(self, frame: np.ndarray, x: int, y: int) -> None:
         speed = math.hypot(self.vx_s, self.vy_s)
@@ -127,186 +179,256 @@ class KickerAnalyzer:
 
         ux = self.vx_s / speed
         uy = self.vy_s / speed
-
-        arrow_len = int(max(20, min(160, speed * 0.03)))  # anpassen falls nötig
+        arrow_len = int(max(20, min(160, speed * 0.03)))
         x2 = int(round(x + ux * arrow_len))
         y2 = int(round(y + uy * arrow_len))
-
         cv2.arrowedLine(frame, (x, y), (x2, y2), (0, 255, 0), 3, tipLength=0.3)
 
-    def process_frame(self, frame):
-        h, w = frame.frame.shape[:2]
+    def _append_observation(
+        self,
+        timestamp: float,
+        ball,
+        frame_shape,
+        speed_valid: bool = True,
+    ) -> None:
+        # A raw ball position is useful to the normal analysis, but it must
+        # not enter the goal-speed history if the detector saw a contour jump
+        # or an invalid frame interval.
+        if ball is None or not speed_valid:
+            return
 
-        # Torerkennung
-        goalL, goalR = self._update_goals(frame.ball, frame.frame.shape)
+        x, y, _ = ball
+        world = self._img_to_cm(x, y)
+        if world is None:
+            return
 
-        # Rod-Control
-        if self.rod_control is not None and frame.ball is not None:
-            x, y, r = frame.ball
-            x_norm = x / w
-            self.rod_control.update(x_norm)
+        timestamp = float(timestamp)
+        observation = (timestamp, world[0], world[1])
+        self.ball_observations.append(observation)
 
-        # Homography vorbereiten
-        self._ensure_homography(frame.frame.shape)
-
-
-        # Das Geschwindigkeitsfenster wird zeitbasiert unten begrenzt.
-
-        # Ball erkannt?
-        if frame.ball is not None:
-            x, y, r = frame.ball
-            world = self._img_to_cm(x, y)
-            self.world_buffer.append(world)
-        else:
-            # Ball nicht erkannt → None eintragen
-            self.world_buffer.append(None)
-
-        # Zeitstempel immer speichern
-        self.time_buffer.append(frame.timestamp)
-
-        # Buffer auf die letzte Sekunde begrenzen
-        while (
-                len(self.time_buffer) > 2
-                and self.time_buffer[-1] - self.time_buffer[0]
-                > self.speed_analysis_seconds
+        # Recovery frames are normally fed in order. Sorting here also makes
+        # the method safe if a late frame arrives from a bounded queue.
+        if len(self.ball_observations) >= 2 and (
+            self.ball_observations[-2][0] > self.ball_observations[-1][0]
         ):
-            self.world_buffer.pop(0)
+            self.ball_observations.sort(key=lambda item: item[0])
+
+        cutoff = timestamp - self.speed_buffer_seconds
+        self.ball_observations = [
+            item for item in self.ball_observations if item[0] >= cutoff
+        ]
+
+        # Compatibility buffers contain only valid observations. The actual
+        # frame timestamp still determines the speed interval below.
+        self.world_buffer.append(world)
+        self.time_buffer.append(timestamp)
+        while self.time_buffer and self.time_buffer[0] < cutoff:
             self.time_buffer.pop(0)
+            self.world_buffer.pop(0)
 
-        # Messen, sobald mindestens zwei Punkte im Ein-Sekunden-Fenster liegen
-        if len(self.world_buffer) >= 2:
+    def calculate_speed_kmh(self, reference_timestamp: float) -> float:
+        """Return the fastest validated segment in the preceding second.
 
-            # Alle echten Ballpunkte extrahieren
-            valid_points = [(i, p) for i, p in enumerate(self.world_buffer) if p is not None]
+        Two valid detections are sufficient for a fast shot. Every segment is
+        independently checked for a sensible timestamp interval and a
+        physically plausible distance. A single invalid contour jump can
+        therefore no longer create a huge speed value.
+        """
+        end_time = float(reference_timestamp)
+        start_time = end_time - self.speed_analysis_seconds
+        points = sorted([
+            item for item in self.ball_observations
+            if start_time <= item[0] <= end_time
+        ], key=lambda item: item[0])
 
-            # Wenn weniger als 2 echte Punkte → keine Messung möglich
-            if len(valid_points) < 2:
-                self.speed_kmh_s = 0.0
-                return goalL, goalR
+        speeds = []
+        rejected = 0
+        for first, second in zip(points, points[1:]):
+            dt = second[0] - first[0]
+            if not (self.min_dt <= dt <= self.max_dt):
+                rejected += 1
+                continue
 
-            # Start = erster echter Punkt
-            start_index, start = valid_points[0]
+            distance_cm = math.hypot(
+                second[1] - first[1],
+                second[2] - first[2],
+            )
+            speed = distance_cm / dt * 0.036
+            if not math.isfinite(speed) or speed > self.max_plausible_speed_kmh:
+                rejected += 1
+                continue
+            speeds.append(speed)
 
-            # End = letzter echter Punkt
-            end_index, end = valid_points[-1]
+        self.last_speed_pair_count = len(speeds)
+        self.last_rejected_speed_pair_count = rejected
+        if not speeds:
+            return 0.0
+        return max(speeds)
 
-            # Distanz
-            dX = end[0] - start[0]
-            dY = end[1] - start[1]
-            dist_cm = math.hypot(dX, dY)
+    def observe_recovered_frame(self, frame) -> None:
+        """Add a late-detected ball without replaying goal state out of order.
 
-            # Zeit zwischen diesen beiden Frames
-            dt = self.time_buffer[end_index] - self.time_buffer[start_index]
+        A skipped frame can be older than the live frame that has already been
+        processed. Its position is still useful for speed, but feeding it
+        through the stateful goal machine again would make the state travel
+        backwards in time. Goal confirmation for such a frame is therefore
+        handled explicitly by :meth:`confirm_recovered_goal`.
+        """
+        self._ensure_homography(frame.frame.shape)
+        timestamp = float(getattr(frame, "timestamp", time.perf_counter()))
+        self._append_observation(
+            timestamp,
+            frame.ball,
+            frame.frame.shape,
+            speed_valid=getattr(frame, "ball_track_valid", True),
+        )
 
-            if dt >= self.min_dt:
-                inst_cm_s = dist_cm / dt
-                inst_kmh = inst_cm_s * 0.036
+    def confirm_recovered_goal(self, side: str, landing_timestamp: float):
+        """Confirm a goal found in a retroactively analysed frame."""
+        if self._goal_locked:
+            return False, False
+        if self._pending_side is not None and self._pending_side != side:
+            return False, False
 
-                # ECHTEN Wert speichern
-                self.speed_kmh_s = inst_kmh
+        self._emit_goal(side, landing_timestamp)
+        self._pending_side = None
+        self._pending_start_time = None
+        self._goal_locked = True
+        self._finalize_goal_speed()
+        return side == "left", side == "right"
 
-                # --- PEAK HOLD LOGIK ---
-                now = time.perf_counter()
+    def _finalize_goal_speed(self) -> None:
+        if self._last_goal_timestamp is None:
+            return
+        goal_speed = self.calculate_speed_kmh(self._last_goal_timestamp)
+        self.speed_kmh_s = goal_speed
+        self._speed_display = goal_speed
+        if self.last_goal_event is not None:
+                self.last_goal_event["speed_kmh"] = float(goal_speed)
+                self.last_goal_event["ball_speed_kmh"] = float(goal_speed)
+                self.last_goal_event["speed"] = float(goal_speed)
+                self.last_goal_event["speed_pair_count"] = self.last_speed_pair_count
+                self.last_goal_event["speed_rejected_pair_count"] = self.last_rejected_speed_pair_count
 
-                # Peak aktualisieren, wenn neuer Wert größer ist
-                if inst_kmh > self._speed_peak:
-                    self._speed_peak = inst_kmh
-                    self._speed_peak_time = now
+    def process_frame(self, frame):
+        _, w = frame.frame.shape[:2]
+        timestamp = float(getattr(frame, "timestamp", time.perf_counter()))
 
-                    print("X 1.", end[0], "X 3.", start[0], )
-                    print("Y 1.", end[1], "Y 3.", start[1], )
-                    print("dist_cm:", dist_cm)
-                    print("dt:", self.time_buffer[end_index], self.time_buffer[start_index])
-                    print("inst_kmh:", inst_kmh)
+        goal_left, goal_right = self._update_goals(
+            frame.ball,
+            frame.frame.shape,
+            timestamp,
+        )
 
-                # Peak zurücksetzen, wenn 0.5s vergangen sind
-                if now - self._speed_peak_time > self._speed_peak_hold:
-                    self._speed_peak = inst_kmh
+        if self.rod_control is not None and frame.ball is not None:
+            x, _, _ = frame.ball
+            self.rod_control.update(x / w)
 
-                # Anzeige = Peak (optional geglättet)
-                a = 0.2
-                self._speed_display = (1 - a) * self._speed_display + a * self._speed_peak
+        self._ensure_homography(frame.frame.shape)
+        self._append_observation(
+            timestamp,
+            frame.ball,
+            frame.frame.shape,
+            speed_valid=getattr(frame, "ball_track_valid", True),
+        )
 
+        if goal_left or goal_right:
+            # The event timestamp is the first in-goal frame, not the later
+            # frame in which the ball disappeared.
+            self._finalize_goal_speed()
 
-        return goalL, goalR
+        return goal_left, goal_right
 
     def draw_overlay(self, frame, draw_goal_boxes=False):
-        h, w = frame.frame.shape[:2]
+        _, w = frame.frame.shape[:2]
 
-        # Tor-ROIs optional zeichnen
         if draw_goal_boxes:
             for side, color in [("left", (0, 0, 255)), ("right", (255, 0, 0))]:
-                g = self.goals_cfg.left if side == "left" else self.goals_cfg.right
-                x0 = int(g.x0 * w)
-                y0 = int(g.y0 * h)
-                x1 = int(g.x1 * w)
-                y1 = int(g.y1 * h)
+                goal = self.goals_cfg.left if side == "left" else self.goals_cfg.right
+                x0 = int(goal.x0 * w)
+                y0 = int(goal.y0 * frame.frame.shape[0])
+                x1 = int(goal.x1 * w)
+                y1 = int(goal.y1 * frame.frame.shape[0])
                 cv2.rectangle(frame.frame, (x0, y0), (x1, y1), color, 4)
 
-        # Ball zeichnen
         if frame.ball is not None:
             x, y, r = frame.ball
             cv2.circle(frame.frame, (int(x), int(y)), max(2, int(r)), (0, 255, 255), 3)
             self._draw_arrow(frame.frame, int(x), int(y))
 
-        # Rod-Control anzeigen
         if self.rod_control is not None:
-            for i, cnt in enumerate(self.rod_control.get_counts()):
+            for i, count in enumerate(self.rod_control.get_counts()):
                 cv2.putText(
                     frame.frame,
-                    f"Rod {i + 1}: {cnt}",
+                    f"Rod {i + 1}: {count}",
                     (20, 100 + i * 22),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6,
                     (255, 255, 0),
-                    2
+                    2,
                 )
 
-        # Score
-        cv2.putText(frame.frame, f"GOALS LEFT: {self.score_left} RIGHT: {self.score_right}",
-                    (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-
-        # Speed
-        cv2.putText(frame.frame, f"Speed: {self._speed_display} km/h",
-                    (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.putText(
+            frame.frame,
+            f"GOALS LEFT: {self.score_left} RIGHT: {self.score_right}",
+            (20, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.9,
+            (255, 255, 255),
+            2,
+        )
+        cv2.putText(
+            frame.frame,
+            (
+                f"Last goal: {self._speed_display:.1f} km/h"
+                if self._last_goal_timestamp is not None
+                else "Last goal: --"
+            ),
+            (20, 65),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2,
+        )
 
     def _ensure_homography(self, frame_shape) -> None:
         if self.field_cfg is None or self.H_img2cm is not None:
             return
 
         h, w = frame_shape[:2]
-        corners_norm = self.field_cfg.corners_norm  # [OL, OR, UR, UL]
-        fw = float(self.field_cfg.size_cm.w)
-        fh = float(self.field_cfg.size_cm.h)
-
-        src = np.array([[cn[0] * w, cn[1] * h] for cn in corners_norm], dtype=np.float32)
-        dst = np.array([[0.0, 0.0], [fw, 0.0], [fw, fh], [0.0, fh]], dtype=np.float32)
-
+        corners_norm = self.field_cfg.corners_norm
+        field_width = float(self.field_cfg.size_cm.w)
+        field_height = float(self.field_cfg.size_cm.h)
+        src = np.array(
+            [[corner[0] * w, corner[1] * h] for corner in corners_norm],
+            dtype=np.float32,
+        )
+        dst = np.array(
+            [[0.0, 0.0], [field_width, 0.0],
+             [field_width, field_height], [0.0, field_height]],
+            dtype=np.float32,
+        )
         self.H_img2cm = cv2.getPerspectiveTransform(src, dst)
 
     def _img_to_cm(self, x: int, y: int) -> Optional[Tuple[float, float]]:
         if self.H_img2cm is None:
             return None
-        pt = np.array([[[float(x), float(y)]]], dtype=np.float32)
-        #SPEICHERUNG DER X UND Y WERTE FÜR POSITION
-        out = cv2.perspectiveTransform(pt, self.H_img2cm)[0][0]
+        point = np.array([[[float(x), float(y)]]], dtype=np.float32)
+        out = cv2.perspectiveTransform(point, self.H_img2cm)[0][0]
         return float(out[0]), float(out[1])
 
     def _ball_in_goal_roi(self, x, y, r, side, frame_shape) -> bool:
         h, w = frame_shape[:2]
-        g = self.goals_cfg.left if side == "left" else self.goals_cfg.right
-
-        x0 = int(g.x0 * w);
-        y0 = int(g.y0 * h)
-        x1 = int(g.x1 * w);
-        y1 = int(g.y1 * h)
-
+        goal = self.goals_cfg.left if side == "left" else self.goals_cfg.right
+        x0 = int(goal.x0 * w)
+        y0 = int(goal.y0 * h)
+        x1 = int(goal.x1 * w)
+        y1 = int(goal.y1 * h)
         xmin, xmax = sorted((x0, x1))
         ymin, ymax = sorted((y0, y1))
-
         return (
-                (x + r >= xmin) and (x - r <= xmax) and
-                (y + r >= ymin) and (y - r <= ymax)
+            (x + r >= xmin) and (x - r <= xmax)
+            and (y + r >= ymin) and (y - r <= ymax)
         )
 
     def _ball_zone(self, x: int, frame_shape) -> int | None:
@@ -314,15 +436,12 @@ class KickerAnalyzer:
             return None
 
         _, w = frame_shape[:2]
-        xn = x / w
-
+        x_norm = x / w
         rods = sorted(self.field_cfg.rods.xs_norm)
-
-        for i, rx in enumerate(rods):
-            if xn < rx:
+        for i, rod_x in enumerate(rods):
+            if x_norm < rod_x:
                 return i
-
-        return len(rods)  # letzte Zone
+        return len(rods)
 
     @property
     def speed_display(self):

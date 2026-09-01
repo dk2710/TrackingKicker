@@ -1,10 +1,12 @@
 
 import cv2
 import copy
+import json
 import os
 import signal
 import subprocess
 import shutil
+import ssl
 import sys
 import time
 import threading
@@ -14,9 +16,15 @@ from pathlib import Path
 from queue import Queue, Empty
 from typing import Any, Dict, Optional
 from flask import Flask, jsonify, request, send_from_directory, url_for
+from urllib import request as urllib_request
 
 import numpy as np
 import traceback
+
+try:
+    import requests
+except ImportError:  # pragma: no cover - fallback is used on minimal installs
+    requests = None
 
 try:
     import fcntl
@@ -80,10 +88,24 @@ HEADLESS = (
     else _headless_env == "1"
 ) or _no_linux_display
 GOAL_VIDEO_DURATION_SECONDS = 3
+# Fuer die Geschwindigkeits-/Tor-Nachanalyse werden alle Rohframes aus der
+# letzten Sekunde bis einschliesslich des ersten Frames im Tor abgelegt.
+GOAL_PRE_NPZ_DURATION_SECONDS = 1.0
 # 60 Gesamtframes fuer drei Sekunden entsprechen 20 FPS.
 GOAL_VIDEO_FRAME_LIMIT = 60
 GOAL_VIDEO_FPS = GOAL_VIDEO_FRAME_LIMIT / GOAL_VIDEO_DURATION_SECONDS
 GOAL_VIDEO_MAX_WIDTH = 640
+
+# Die Live-Analyse darf alte Frames ueberspringen, aber nicht dauerhaft
+# verlieren. Nach dieser Anzahl an Live-Frames ohne Ball werden die bisher
+# uebersprungenen Rohframes einmal chronologisch nachanalysiert.
+RETRO_TRIGGER_NO_BALL_FRAMES = 80
+RETRO_BUFFER_MAX_FRAMES = 240
+
+# digiKicker kann die URL bei einer anderen Installation per Umgebungsvariable
+# aendern. Der Standard entspricht der vom Frontend genannten URL.
+DIGIKICKER_POST_DEFAULT_URL = "https://localhost/goal"
+DIGIKICKER_POST_TIMEOUT_SECONDS = 2.0
 
 _app_lock_handle = None
 
@@ -189,6 +211,35 @@ class KickerApp:
         self.replay_lock = threading.Lock()
         self.history_frames = deque()
 
+        # Rohframes aus der Live-Queue, die wegen der Analysegeschwindigkeit
+        # uebersprungen wurden. Die vorhandenen Bildreferenzen werden direkt
+        # weiterverwendet, damit kein zweiter grosser Bildspeicher entsteht.
+        self.skipped_frame_lock = threading.Lock()
+        self.skipped_frame_buffer = deque(maxlen=RETRO_BUFFER_MAX_FRAMES)
+        self._frame_sequence = 0
+        self._last_visible_frame_id = None
+        self._no_ball_live_frames = 0
+        self._retro_analysis_count = 0
+
+        # Ergebnis des letzten Tors fuer API, POST und Goal-Video.
+        self.last_analysis_lock = threading.Lock()
+        self._last_posted_goal_event_id = 0
+        self.digikicker_post_url = os.environ.get(
+            "DIGIKICKER_POST_URL",
+            DIGIKICKER_POST_DEFAULT_URL,
+        ).strip()
+        self.digikicker_post_verify_tls = os.environ.get(
+            "DIGIKICKER_POST_VERIFY_TLS",
+            "0",
+        ).lower() in {"1", "true", "yes", "on"}
+        try:
+            self.digikicker_post_timeout = float(os.environ.get(
+                "DIGIKICKER_POST_TIMEOUT",
+                str(DIGIKICKER_POST_TIMEOUT_SECONDS),
+            ))
+        except ValueError:
+            self.digikicker_post_timeout = DIGIKICKER_POST_TIMEOUT_SECONDS
+
         self.api = Flask(__name__)
         self.last_analysis = {}
 
@@ -210,7 +261,15 @@ class KickerApp:
             self.api_goal_video,
             methods=["GET"]
         )
-        self.detector = BallDetector(debug=False)
+        camera_fps = getattr(config.camera, "force_fps", 180) or 180
+        table_width_cm = 120.0
+        if vision.field is not None:
+            table_width_cm = float(vision.field.size_cm.w)
+        self.detector = BallDetector(
+            debug=False,
+            expected_fps=float(camera_fps),
+            table_width_cm=table_width_cm,
+        )
 
         self.analyzer = KickerAnalyzer(
             goals_cfg=vision.goals,
@@ -223,6 +282,341 @@ class KickerApp:
         return jsonify({
             "status": "ok"
         })
+
+    def _remember_skipped_frame(self, frame) -> None:
+        """Keep a frame removed from the live queue for later re-analysis."""
+        if frame is None:
+            return
+        with self.skipped_frame_lock:
+            self.skipped_frame_buffer.append(frame)
+
+    def _take_skipped_frames(self, up_to_frame_id=None):
+        """Take skipped frames up to the current live frame in time order."""
+        with self.skipped_frame_lock:
+            if up_to_frame_id is None:
+                selected = list(self.skipped_frame_buffer)
+                self.skipped_frame_buffer.clear()
+                return selected
+
+            selected = []
+            remaining = deque(maxlen=RETRO_BUFFER_MAX_FRAMES)
+            for skipped in self.skipped_frame_buffer:
+                skipped_id = getattr(skipped, "frame_id", None)
+                if skipped_id is None or skipped_id <= up_to_frame_id:
+                    selected.append(skipped)
+                else:
+                    remaining.append(skipped)
+            self.skipped_frame_buffer = remaining
+
+        selected.sort(
+            key=lambda item: (
+                getattr(item, "frame_id", 0),
+                getattr(item, "timestamp", 0.0),
+            )
+        )
+        return selected
+
+    def _has_skipped_frame_before(self, frame_id) -> bool:
+        with self.skipped_frame_lock:
+            if frame_id is None:
+                return bool(self.skipped_frame_buffer)
+            return any(
+                getattr(skipped, "frame_id", frame_id) <= frame_id
+                for skipped in self.skipped_frame_buffer
+            )
+
+    def _prepare_and_detect(self, source_frame):
+        """Copy, correct and detect one raw frame from the replay buffer."""
+        frame = copy.copy(source_frame)
+        frame.frame = source_frame.frame.copy()
+        if frame.frame.ndim == 2:
+            frame.frame = cv2.cvtColor(frame.frame, cv2.COLOR_BayerRG2BGR)
+        elif frame.frame.ndim == 3 and frame.frame.shape[2] == 1:
+            frame.frame = cv2.cvtColor(frame.frame, cv2.COLOR_GRAY2BGR)
+        frame.frame = self.dist.apply(frame.frame)
+        self.detector.detect(frame)
+        return frame
+
+    def _reanalyze_skipped_frames(self, current_frame_id):
+        """Run detection on skipped frames before the current live frame."""
+        skipped_frames = self._take_skipped_frames(current_frame_id)
+        if not skipped_frames:
+            return []
+
+        recovered = []
+        for skipped in skipped_frames:
+            try:
+                recovered.append(self._prepare_and_detect(skipped))
+            except Exception as exc:
+                print(f"[RETRO] Frame konnte nicht analysiert werden: {exc}")
+
+        self._retro_analysis_count += len(recovered)
+        return recovered
+
+    def _process_recovered_frames(self, recovered_frames, current_frame):
+        """Use recovered positions for speed and explicitly confirm a goal.
+
+        Some recovered frames are older than a live frame already handled by
+        the analyzer. They must not be sent through the stateful goal machine
+        a second time. Their ball observations are added in timestamp order;
+        a detected entry into a goal is then confirmed against the current
+        missing/outside frame.
+        """
+        goal_candidate = None
+        for recovered_frame in recovered_frames:
+            self.analyzer.observe_recovered_frame(recovered_frame)
+            ball = recovered_frame.ball
+            if ball is not None:
+                recovered_id = getattr(recovered_frame, "frame_id", None)
+                if (
+                    recovered_id is not None
+                    and (
+                        self._last_visible_frame_id is None
+                        or recovered_id > self._last_visible_frame_id
+                    )
+                ):
+                    self._last_visible_frame_id = recovered_id
+            if ball is None or goal_candidate is not None:
+                continue
+
+            x, y, radius = ball
+            frame_shape = recovered_frame.frame.shape
+            if self.analyzer._ball_in_goal_roi(
+                x, y, radius, "left", frame_shape
+            ):
+                goal_candidate = (
+                    "left",
+                    float(recovered_frame.timestamp),
+                )
+            elif self.analyzer._ball_in_goal_roi(
+                x, y, radius, "right", frame_shape
+            ):
+                goal_candidate = (
+                    "right",
+                    float(recovered_frame.timestamp),
+                )
+
+        if goal_candidate is None:
+            return False, False
+
+        side, landing_timestamp = goal_candidate
+        current_ball = getattr(current_frame, "ball", None)
+        current_is_still_in_goal = False
+        if current_ball is not None:
+            x, y, radius = current_ball
+            current_is_still_in_goal = self.analyzer._ball_in_goal_roi(
+                x,
+                y,
+                radius,
+                side,
+                current_frame.frame.shape,
+            )
+
+        # The current trigger is either a missing ball or a ball which has
+        # returned outside the goal. In both cases the recovered entry is now
+        # a complete goal event. If it is still inside, wait for the ordinary
+        # goal state machine to see it leave.
+        if current_ball is None or not current_is_still_in_goal:
+            return self.analyzer.confirm_recovered_goal(side, landing_timestamp)
+        return False, False
+
+    def _post_goal_result(self, payload: Dict[str, Any]) -> None:
+        """POST a completed goal result to digiKicker without blocking vision."""
+        if not self.digikicker_post_url:
+            print("[DIGIKICKER] POST deaktiviert (keine URL konfiguriert)")
+            return
+
+        headers = {
+            "Content-Type": "application/json",
+            # Das Frontend-Log nennt 127.0.0.1 als Origin.
+            "Origin": "127.0.0.1",
+        }
+        try:
+            if requests is not None:
+                response = requests.post(
+                    self.digikicker_post_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=self.digikicker_post_timeout,
+                    verify=self.digikicker_post_verify_tls,
+                )
+                response.raise_for_status()
+                print(
+                    f"[DIGIKICKER] Tor-POST erfolgreich: "
+                    f"{response.status_code} {self.digikicker_post_url}"
+                )
+                return
+
+            # Fallback fuer Installationen ohne requests.
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            post_request = urllib_request.Request(
+                self.digikicker_post_url,
+                data=body,
+                headers=headers,
+                method="POST",
+            )
+            ssl_context = None
+            if not self.digikicker_post_verify_tls:
+                ssl_context = ssl._create_unverified_context()
+            with urllib_request.urlopen(
+                post_request,
+                timeout=self.digikicker_post_timeout,
+                context=ssl_context,
+            ) as response:
+                if response.status >= 400:
+                    raise RuntimeError(f"HTTP {response.status}")
+                print(
+                    f"[DIGIKICKER] Tor-POST erfolgreich: "
+                    f"{response.status} {self.digikicker_post_url}"
+                )
+        except Exception as exc:
+            # Ein nicht erreichbares Frontend darf die Kameraanalyse nicht
+            # stoppen. Ein spaeteres Tor erzeugt automatisch den naechsten POST.
+            print(f"[DIGIKICKER] Tor-POST fehlgeschlagen: {exc}")
+
+    def _handle_goal(self, goal) -> None:
+        if not goal or not any(goal):
+            return
+
+        event = dict(self.analyzer.last_goal_event or {})
+        side = "left" if goal[0] else "right"
+        speed = float(event.get("speed_kmh", self.analyzer.speed_kmh_s))
+        event.update({
+            "event": "goal",
+            "side": event.get("side", side),
+            "goal_side": event.get("goal_side", side),
+            "goal": event.get("goal", side),
+            "position": event.get("position", side),
+            "goal_position": event.get("goal_position", side),
+            "speed_kmh": speed,
+            "ball_speed_kmh": speed,
+            "speed": speed,
+        })
+
+        event_id = event.get("event_id")
+        if event_id is not None and event_id == self._last_posted_goal_event_id:
+            return
+        if event_id is not None:
+            self._last_posted_goal_event_id = event_id
+
+        with self.last_analysis_lock:
+            self.last_analysis = event
+
+        # Fuer jedes Tor sofort den vollstaendigen Rohframe-Zeitraum vor dem
+        # Einschlag sichern. Das geschieht vor dem asynchronen POST, damit
+        # die Torzeit und damit die Auswahl der Frames unveraendert bleiben.
+        self._start_goal_npz_save(event)
+
+        # Das POST wird bewusst in einem Daemon-Thread versendet, damit ein
+        # langsames oder nicht erreichbares HTTPS-Frontend keine Frames kostet.
+        threading.Thread(
+            target=self._post_goal_result,
+            args=(event.copy(),),
+            name="digikicker-goal-post",
+            daemon=True,
+        ).start()
+
+        print(
+            f"[GOAL] {event['side']} | "
+            f"Geschwindigkeit={speed:.2f} km/h | "
+            f"Score {self.analyzer.score_left}:{self.analyzer.score_right}"
+        )
+
+        if not HEADLESS:
+            self.play_last_seconds()
+
+    def _start_goal_npz_save(self, event: Dict[str, Any]) -> None:
+        """Start saving every raw frame from the second before a goal.
+
+        ``replay_buffer`` is filled in ``camera_loop`` before frames enter
+        the processing queue, so it also contains frames which were skipped
+        by the live analysis. The snapshot is bounded by the goal timestamp,
+        not by the later frame on which the goal state is finally confirmed.
+        """
+        try:
+            goal_timestamp = float(event["goal_timestamp"])
+        except (KeyError, TypeError, ValueError):
+            print("[GOAL-NPZ] Keine gueltige Torzeit; Speicherung uebersprungen")
+            return
+
+        start_timestamp = goal_timestamp - GOAL_PRE_NPZ_DURATION_SECONDS
+        with self.replay_lock:
+            selected = [
+                (image, float(timestamp))
+                for image, timestamp in self.replay_buffer
+                if start_timestamp <= float(timestamp) <= goal_timestamp
+            ]
+
+        if not selected:
+            print(
+                "[GOAL-NPZ] Keine Rohframes im Zeitfenster "
+                f"{start_timestamp:.6f}..{goal_timestamp:.6f}"
+            )
+            return
+
+        frames = [image for image, _ in selected]
+        timestamps = [timestamp for _, timestamp in selected]
+        npz_event = dict(event)
+
+        threading.Thread(
+            target=self._save_goal_npz_async,
+            args=(frames, timestamps, goal_timestamp, npz_event),
+            name="goal-npz-save",
+            daemon=True,
+        ).start()
+
+        print(
+            f"[GOAL-NPZ] Speicherung gestartet: {len(frames)} Rohframes "
+            f"({GOAL_PRE_NPZ_DURATION_SECONDS:.1f}s vor Tor)"
+        )
+
+    def _save_goal_npz_async(
+        self,
+        frames,
+        timestamps,
+        goal_timestamp: float,
+        event: Dict[str, Any],
+    ) -> None:
+        """Write one complete pre-goal raw-frame window as an NPZ file."""
+        if not frames or not timestamps:
+            return
+
+        try:
+            first_timestamp = float(timestamps[0])
+            relative_times = np.asarray(
+                [float(timestamp) - first_timestamp for timestamp in timestamps],
+                dtype=np.float64,
+            )
+            goal_time = float(goal_timestamp) - first_timestamp
+            filename = Analyse_Video_Path / (
+                "goal_pre_"
+                f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S-%f')}.npz"
+            )
+
+            # Die Kopie wird erst hier erzeugt, damit der Kamera-Thread beim
+            # Ausloesen des Speicherns moeglichst wenig blockiert.
+            frame_array = np.stack([np.asarray(frame).copy() for frame in frames])
+            np.savez(
+                filename,
+                frames=frame_array,
+                # RawReplaySource kann diese Zeitachse direkt wiedergeben.
+                times=relative_times,
+                # Zusaetzliche absolute Zeitstempel erleichtern die spaetere
+                # Auswertung, ohne das bestehende Replay-Format zu brechen.
+                timestamps=np.asarray(timestamps, dtype=np.float64),
+                goal_time=np.asarray(goal_time, dtype=np.float64),
+                goal_position=np.asarray(event.get("goal_position", "")),
+                speed_kmh=np.asarray(
+                    float(event.get("speed_kmh", 0.0)),
+                    dtype=np.float64,
+                ),
+            )
+            print(
+                f"[GOAL-NPZ] SAVE DONE: {filename} "
+                f"({len(frames)} Frames, Torzeit={goal_time:.6f}s)"
+            )
+        except Exception as exc:
+            print(f"[GOAL-NPZ] Speichern fehlgeschlagen: {exc}")
 
     def _invalidate_rolling_video(self):
         with self.rolling_video_lock:
@@ -275,6 +669,8 @@ class KickerApp:
             requested_generation = generation
 
         if preparing or video_path is None:
+            with self.last_analysis_lock:
+                latest_goal = dict(self.last_analysis)
             response = {
                 "status": "preparing",
                 "video_ready": False,
@@ -283,6 +679,9 @@ class KickerApp:
                 "retry_after_ms": 100,
                 "status_url": url_for("goal", generation=generation),
             }
+            if latest_goal:
+                response["goal_position"] = latest_goal.get("goal_position")
+                response["goal_side"] = latest_goal.get("side")
             if error:
                 response["error"] = error
             return jsonify(response), 202
@@ -302,6 +701,8 @@ class KickerApp:
 
         speed = float(self.goal_video_speed)
         frame_count = self.goal_video_frame_count or GOAL_VIDEO_FRAME_LIMIT
+        with self.last_analysis_lock:
+            latest_goal = dict(self.last_analysis)
         video_filename = Path(video_path).name
         try:
             # Keep the filename stable but make every encoded version a new
@@ -310,7 +711,7 @@ class KickerApp:
         except OSError:
             video_version = time.time_ns()
 
-        return jsonify({
+        response = {
             "status": "ready",
             "video_ready": True,
             "video_generation": generation,
@@ -323,7 +724,11 @@ class KickerApp:
             "video_filename": video_filename,
             "video_frame_count": frame_count,
             "video_fps": self.goal_video_fps,
-        }), 200
+        }
+        if latest_goal:
+            response["goal_position"] = latest_goal.get("goal_position")
+            response["goal_side"] = latest_goal.get("side")
+        return jsonify(response), 200
 
     def api_goal(self):
         return self._api_goal_fast()
@@ -553,7 +958,11 @@ class KickerApp:
                 return
 
             self.goal_video_path = None
-            self.goal_video_speed = float(self.analyzer.speed_kmh_s)
+            with self.last_analysis_lock:
+                latest_goal = dict(self.last_analysis)
+            self.goal_video_speed = float(
+                latest_goal.get("speed_kmh", self.analyzer.speed_kmh_s)
+            )
             self.goal_video_error = None
             self.goal_video_generation += 1
             self.goal_video_result_delivered = False
@@ -819,6 +1228,11 @@ class KickerApp:
                     self._invalidate_rolling_video()
                     continue
 
+                # Die Sequenznummer gilt fuer alle Rohframes, auch wenn ein
+                # Frame spaeter aus der kleinen Live-Queue entfernt wird.
+                self._frame_sequence += 1
+                objframe.frame_id = self._frame_sequence
+
                 # Frame für die letzten 3 Sekunden speichern
                 with self.replay_lock:
                     self.replay_buffer.append(
@@ -836,7 +1250,8 @@ class KickerApp:
 
                 if self.frame_queue.full():
                     try:
-                        self.frame_queue.get_nowait()
+                        skipped = self.frame_queue.get_nowait()
+                        self._remember_skipped_frame(skipped)
                         dropped += 1
                     except Empty:
                         pass
@@ -909,12 +1324,13 @@ class KickerApp:
             try:
                 frame = self.frame_queue.get(timeout=0.5)
 
-                # Bei einer 200-FPS-Kamera nicht mit alten Frames hinterher-
-                # laufen. Fuer die Live-Analyse ist immer der aktuellste
-                # verfuegbare Frame relevant.
+                # Fuer die Live-Ansicht bleibt nur der aktuellste Frame
+                # relevant. Die uebersprungenen Frames werden aber nicht mehr
+                # verworfen, sondern kommen in den Rueckwaertspuffer.
                 while True:
                     try:
-                        frame = self.frame_queue.get_nowait()
+                        skipped = self.frame_queue.get_nowait()
+                        self._remember_skipped_frame(skipped)
                         skipped_processing_frames += 1
                     except Empty:
                         break
@@ -934,6 +1350,70 @@ class KickerApp:
                 meas = self.detector.detect(frame)
                 stage_time["detect"] += time.perf_counter() - stage_start
 
+                no_ball_before = self._no_ball_live_frames
+                current_frame_id = getattr(frame, "frame_id", None)
+                raw_frame_gap = None
+                if (
+                    current_frame_id is not None
+                    and self._last_visible_frame_id is not None
+                ):
+                    raw_frame_gap = current_frame_id - self._last_visible_frame_id
+
+                if frame.ball is None:
+                    self._no_ball_live_frames += 1
+                else:
+                    # Ein sichtbarer Ball beendet die normale Fehlerserie.
+                    self._no_ball_live_frames = 0
+
+                recover_due_to_missing_ball = (
+                    frame.ball is None
+                    and (
+                        self._no_ball_live_frames >= RETRO_TRIGGER_NO_BALL_FRAMES
+                        or (
+                            raw_frame_gap is not None
+                            and raw_frame_gap >= RETRO_TRIGGER_NO_BALL_FRAMES
+                        )
+                    )
+                )
+                # Falls der Ball nach einer kurzen Detektionsluecke wieder
+                # auftaucht, werden die inzwischen uebersprungenen Frames
+                # ebenfalls vor dem aktuellen Frame chronologisch eingeordnet.
+                recover_due_to_ball_return = (
+                    frame.ball is not None
+                    and (
+                        no_ball_before >= 3
+                        or (raw_frame_gap is not None and raw_frame_gap >= 3)
+                    )
+                )
+                should_recover = (
+                    recover_due_to_missing_ball or recover_due_to_ball_return
+                ) and self._has_skipped_frame_before(current_frame_id)
+
+                if should_recover:
+                    recovered_frames = self._reanalyze_skipped_frames(current_frame_id)
+                    stage_start = time.perf_counter()
+                    recovered_goal = self._process_recovered_frames(
+                        recovered_frames,
+                        frame,
+                    )
+                    stage_time["analyze"] += time.perf_counter() - stage_start
+                    self._handle_goal(recovered_goal)
+
+                    # Der aktuelle Frame ist jetzt der naechste chronologische
+                    # Frame. Eine fehlende Detektion zaehlt erneut ab 1.
+                    if frame.ball is None:
+                        self._no_ball_live_frames = 1
+
+                if frame.ball is not None and current_frame_id is not None:
+                    self._last_visible_frame_id = current_frame_id
+
+                # Auch ein Frame ohne Ball muss in den Analyzer: Nur so kann
+                # ein Tor nach dem Verschwinden des Balles bestaetigt werden.
+                stage_start = time.perf_counter()
+                goal = self.analyzer.process_frame(frame)
+                stage_time["analyze"] += time.perf_counter() - stage_start
+                self._handle_goal(goal)
+
                 stage_start = time.perf_counter()
                 self.analyzer.draw_overlay(frame)
                 stage_time["overlay"] += time.perf_counter() - stage_start
@@ -945,16 +1425,6 @@ class KickerApp:
                         pass
 
                 self.display_queue.put(frame.frame)
-                goal = False
-
-                # Auch Frames ohne Ball muessen an den Analyzer gehen: Nur
-                # so kann er ein Tor bestaetigen, wenn der Ball verschwindet.
-                stage_start = time.perf_counter()
-                goal = self.analyzer.process_frame(frame)
-                stage_time["analyze"] += time.perf_counter() - stage_start
-
-                if goal and any(goal):
-                    self.play_last_seconds()
 
                 if now - last_log >= 1.0:
                     dt = now - last_log
@@ -967,7 +1437,8 @@ class KickerApp:
                         f"detect={stage_time['detect'] / n * 1000:.1f}ms "
                         f"overlay={stage_time['overlay'] / n * 1000:.1f}ms "
                         f"analyze={stage_time['analyze'] / n * 1000:.1f}ms "
-                        f"uebersprungen={skipped_processing_frames}"
+                        f"uebersprungen={skipped_processing_frames} "
+                        f"retro={self._retro_analysis_count}"
                     )
 
                     last_log = now

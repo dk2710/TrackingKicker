@@ -13,7 +13,7 @@
     "offset_x": 240,
     "exposure_time": 4000.0,
     "gain": 10.0,
-    "grab_strategy_latest_only": true,
+    "grab_strategy_latest_only": false,
     "k1": -0.08800000000000002,
     "k2": 0.020000000000000018,
     "k3": -0.0030000000000000027,

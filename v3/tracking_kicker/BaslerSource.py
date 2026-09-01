@@ -52,10 +52,11 @@ class BaslerSource:
 
         # Mehr Host-Puffer verhindern, dass ein kurzzeitig blockierter
         # Processing-Thread den pylon-Stream sofort ueberlaeuft. Die
-        # Analyse verwirft weiterhin alte Frames und wird nicht gedrosselt.
+        # uebersprungenen Frames werden von app.py fuer die Retroanalyse
+        # zwischengespeichert.
         try:
-            self.camera.MaxNumBuffer = 64
-            print("✅ pylon MaxNumBuffer = 64")
+            self.camera.MaxNumBuffer = 256
+            print("pylon MaxNumBuffer = 256")
         except Exception as e:
             print(f"⚠️ MaxNumBuffer nicht setzbar: {e}")
 
@@ -64,7 +65,11 @@ class BaslerSource:
             self.try_set(self.camera, "AcquisitionFrameRateEnable", True)
             self.try_set(self.camera, "AcquisitionFrameRate", float(cfg.force_fps))
 
-        strategy = pylon.GrabStrategy_LatestImageOnly
+        # LatestImageOnly wuerde die fuer schnelle Schuesse wichtigen
+        # Zwischenbilder bereits in pylon verwerfen. OneByOne liefert jedes
+        # Kamerabild an camera_loop; die Live-Queue entscheidet erst danach,
+        # welche Bilder sofort bzw. rueckwirkend analysiert werden.
+        strategy = pylon.GrabStrategy_OneByOne
         self.camera.StartGrabbing(strategy)
         time.sleep(0.05)
         self.loggingonce(self.camera)
@@ -135,7 +140,7 @@ class BaslerSource:
         camera.Width.Value = cfg.width
         camera.OffsetX.Value = cfg.offset_x
         try:
-            camera.MaxNumBuffer = 64
+            camera.MaxNumBuffer = 256
         except Exception:
             pass
         if getattr(cfg, "force_fps", 0) and cfg.force_fps > 0:
@@ -174,7 +179,7 @@ class BaslerSource:
             new_camera = pylon.InstantCamera(device)
             new_camera.Open()
             self._configure_reconnected_camera(new_camera)
-            new_camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+            new_camera.StartGrabbing(pylon.GrabStrategy_OneByOne)
             self.camera = new_camera
             self._consecutive_grab_failures = 0
             print("[CAM-RECOVER] Kamera neu verbunden und Grab-Stream gestartet")
