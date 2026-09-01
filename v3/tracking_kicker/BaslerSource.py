@@ -11,6 +11,10 @@ from v3.tracking_kicker.model.Camera import Camera
 from v3.tracking_kicker.Objects.Frames import Frame
 
 
+CAMERA_MAX_NUM_BUFFER = 256
+CAMERA_RECOVERY_FAILURE_THRESHOLD = 5
+
+
 class BaslerSource:
     def __init__(
         self,
@@ -55,21 +59,21 @@ class BaslerSource:
         # uebersprungenen Frames werden von app.py fuer die Retroanalyse
         # zwischengespeichert.
         try:
-            self.camera.MaxNumBuffer = 256
-            print("pylon MaxNumBuffer = 256")
+            self.camera.MaxNumBuffer = CAMERA_MAX_NUM_BUFFER
+            print(f"pylon MaxNumBuffer = {CAMERA_MAX_NUM_BUFFER}")
         except Exception as e:
             print(f"⚠️ MaxNumBuffer nicht setzbar: {e}")
 
-        # Hohe Kamerarate fuer die schnelle Ballerkennung beibehalten.
+        # Eine stabile Kamerarate ist wichtiger als eine nominell hoehere
+        # Rate, bei der GigE-Payloads verworfen werden.
         if getattr(cfg, "force_fps", 0) and cfg.force_fps > 0:
             self.try_set(self.camera, "AcquisitionFrameRateEnable", True)
             self.try_set(self.camera, "AcquisitionFrameRate", float(cfg.force_fps))
 
-        # LatestImageOnly wuerde die fuer schnelle Schuesse wichtigen
-        # Zwischenbilder bereits in pylon verwerfen. OneByOne liefert jedes
-        # Kamerabild an camera_loop; die Live-Queue entscheidet erst danach,
-        # welche Bilder sofort bzw. rueckwirkend analysiert werden.
-        strategy = pylon.GrabStrategy_OneByOne
+        # OneByOne liefert fuer die Tor-/Geschwindigkeitsanalyse jedes vom
+        # Netzwerk gelieferte Bild. LatestImageOnly bleibt als konfigurierbare
+        # Option fuer reine Livebild-/Tuninglaeufe verfuegbar.
+        strategy = self._grab_strategy()
         self.camera.StartGrabbing(strategy)
         time.sleep(0.05)
         self.loggingonce(self.camera)
@@ -140,12 +144,18 @@ class BaslerSource:
         camera.Width.Value = cfg.width
         camera.OffsetX.Value = cfg.offset_x
         try:
-            camera.MaxNumBuffer = 256
+            camera.MaxNumBuffer = CAMERA_MAX_NUM_BUFFER
         except Exception:
             pass
         if getattr(cfg, "force_fps", 0) and cfg.force_fps > 0:
             self.try_set(camera, "AcquisitionFrameRateEnable", True)
             self.try_set(camera, "AcquisitionFrameRate", float(cfg.force_fps))
+
+    def _grab_strategy(self):
+        """Return the configured pylon grab strategy."""
+        if getattr(self.cfg, "grab_strategy_latest_only", False):
+            return pylon.GrabStrategy_LatestImageOnly
+        return pylon.GrabStrategy_OneByOne
 
     def _recover_grab_stream(self) -> None:
         """Baut die pylon-Kamera nach einem USB-/Block-ID-Fehler neu auf."""
@@ -179,7 +189,7 @@ class BaslerSource:
             new_camera = pylon.InstantCamera(device)
             new_camera.Open()
             self._configure_reconnected_camera(new_camera)
-            new_camera.StartGrabbing(pylon.GrabStrategy_OneByOne)
+            new_camera.StartGrabbing(self._grab_strategy())
             self.camera = new_camera
             self._consecutive_grab_failures = 0
             print("[CAM-RECOVER] Kamera neu verbunden und Grab-Stream gestartet")
@@ -214,12 +224,12 @@ class BaslerSource:
         if not ok or objframe is None:
             self._read_failures += 1
             self._consecutive_grab_failures += 1
-            # Kein automatisches Close/CreateFirstDevice im Grab-Thread:
-            # Wenn waehrend dieses Reconnects SIGINT kommt, konkurrieren
-            # Recovery und Shutdown auf demselben pylon-Handle. Das kann den
-            # USB-Handle der Kamera fuer den naechsten Prozess festhalten.
-            # Der Stream wird deshalb ausschliesslich im kontrollierten
-            # release()-Pfad geschlossen.
+            # Die Grab-Schleife ist der einzige Thread, der read() aufruft;
+            # nach mehreren Payload-/Blockfehlern kann sie den Stream deshalb
+            # kontrolliert neu aufbauen. release() setzt _closed und verhindert
+            # einen Reconnect waehrend des Herunterfahrens.
+            if self._consecutive_grab_failures >= CAMERA_RECOVERY_FAILURE_THRESHOLD:
+                self._recover_grab_stream()
         else:
             self._read_count += 1
 

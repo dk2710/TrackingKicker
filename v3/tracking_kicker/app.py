@@ -97,10 +97,11 @@ GOAL_VIDEO_FPS = GOAL_VIDEO_FRAME_LIMIT / GOAL_VIDEO_DURATION_SECONDS
 GOAL_VIDEO_MAX_WIDTH = 640
 
 # Die Live-Analyse darf alte Frames ueberspringen, aber nicht dauerhaft
-# verlieren. Nach dieser Anzahl an Live-Frames ohne Ball werden die bisher
+# verlieren. Nach dieser Anzahl an Live-Frames ohne Ball werden die letzten
 # uebersprungenen Rohframes einmal chronologisch nachanalysiert.
 RETRO_TRIGGER_NO_BALL_FRAMES = 80
-RETRO_BUFFER_MAX_FRAMES = 240
+RETRO_MAX_REANALYZE_FRAMES = RETRO_TRIGGER_NO_BALL_FRAMES
+RETRO_BUFFER_MAX_FRAMES = 160
 
 # digiKicker kann die URL bei einer anderen Installation per Umgebungsvariable
 # aendern. Der Standard entspricht der vom Frontend genannten URL.
@@ -218,6 +219,7 @@ class KickerApp:
         self.skipped_frame_buffer = deque(maxlen=RETRO_BUFFER_MAX_FRAMES)
         self._frame_sequence = 0
         self._last_visible_frame_id = None
+        self._last_retro_frame_id = None
         self._no_ball_live_frames = 0
         self._retro_analysis_count = 0
 
@@ -308,6 +310,12 @@ class KickerApp:
                     remaining.append(skipped)
             self.skipped_frame_buffer = remaining
 
+        # Eine Rueckanalyse darf die Live-Analyse nicht fuer mehrere Sekunden
+        # blockieren. Die aeltesten Frames sind fuer den aktuellen
+        # Torverdacht weniger relevant als die letzten Frames vor dem Trigger.
+        if len(selected) > RETRO_MAX_REANALYZE_FRAMES:
+            selected = selected[-RETRO_MAX_REANALYZE_FRAMES:]
+
         selected.sort(
             key=lambda item: (
                 getattr(item, "frame_id", 0),
@@ -338,7 +346,7 @@ class KickerApp:
         return frame
 
     def _reanalyze_skipped_frames(self, current_frame_id):
-        """Run detection on skipped frames before the current live frame."""
+        """Run bounded detection on skipped frames before the live frame."""
         skipped_frames = self._take_skipped_frames(current_frame_id)
         if not skipped_frames:
             return []
@@ -1372,6 +1380,11 @@ class KickerApp:
                         or (
                             raw_frame_gap is not None
                             and raw_frame_gap >= RETRO_TRIGGER_NO_BALL_FRAMES
+                            and (
+                                self._last_retro_frame_id is None
+                                or current_frame_id - self._last_retro_frame_id
+                                >= RETRO_TRIGGER_NO_BALL_FRAMES
+                            )
                         )
                     )
                 )
@@ -1382,7 +1395,14 @@ class KickerApp:
                     frame.ball is not None
                     and (
                         no_ball_before >= 3
-                        or (raw_frame_gap is not None and raw_frame_gap >= 3)
+                        or (
+                            raw_frame_gap is not None
+                            and raw_frame_gap >= 3
+                            and (
+                                self._last_retro_frame_id is None
+                                or current_frame_id - self._last_retro_frame_id >= 3
+                            )
+                        )
                     )
                 )
                 should_recover = (
@@ -1390,6 +1410,7 @@ class KickerApp:
                 ) and self._has_skipped_frame_before(current_frame_id)
 
                 if should_recover:
+                    self._last_retro_frame_id = current_frame_id
                     recovered_frames = self._reanalyze_skipped_frames(current_frame_id)
                     stage_start = time.perf_counter()
                     recovered_goal = self._process_recovered_frames(

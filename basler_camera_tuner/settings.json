@@ -1,0 +1,22 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 5010
+  },
+  "camera": {
+    "force_fps": 120.0,
+    "width": 1100,
+    "height": 650,
+    "offset_x": 240,
+    "offset_y": 266,
+    "exposure_time": 4000.0,
+    "gain": 10.0,
+    "pixel_format": "BayerRG8",
+    "exposure_auto": "Off",
+    "gain_auto": "Off",
+    "grab_strategy": "latest_image_only",
+    "max_num_buffer": 64,
+    "packet_size": 0,
+    "inter_packet_delay": 0
+  }
+}
