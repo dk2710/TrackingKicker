@@ -17,6 +17,10 @@ class BallDetector:
         expected_fps: float = 180.0,
         max_speed_kmh: float = 350.0,
         table_width_cm: float = 120.0,
+        radius_min_px: float = 5.0,
+        radius_max_px: float = 25.0,
+        circularity_min: float = 0.5,
+        solidity_min: float = 0.85,
     ):
         self.hsv_low = hsv_low
         self.hsv_high = hsv_high
@@ -24,6 +28,10 @@ class BallDetector:
         self.area_max = area_max
         self.debug = debug
         self.detection_scale = detection_scale
+        self.radius_min_px = float(radius_min_px)
+        self.radius_max_px = float(radius_max_px)
+        self.circularity_min = float(circularity_min)
+        self.solidity_min = float(solidity_min)
 
         # Die Konturerkennung liefert pro Frame Kandidaten, verfolgt aber
         # nicht automatisch denselben Kandidaten weiter. Diese Zustandsdaten
@@ -147,19 +155,35 @@ class BallDetector:
 
         for c in cnts:
             (x, y), r = cv2.minEnclosingCircle(c)
+            contour_area = cv2.contourArea(c)
+
+            # area_min/max sind auf die Originalbildgroesse bezogen. Die
+            # Kontur wurde eventuell verkleinert, deshalb wird der Grenzwert
+            # entsprechend der Flaeche skaliert.
+            area_scale = scale * scale
+            if not (
+                self.area_min * area_scale
+                <= contour_area
+                <= self.area_max * area_scale
+            ):
+                continue
 
             # Radius-Filter
-            if not (5 * scale < r < 25 * scale):
+            if not (
+                self.radius_min_px * scale
+                < r
+                < self.radius_max_px * scale
+            ):
                 continue
 
             # Circularity
             circ = self._circularity(c)
-            if circ < 0.5:
+            if circ < self.circularity_min:
                 continue
 
             # Solidity
             sol = self._solidity(c)
-            if sol < 0.85:
+            if sol < self.solidity_min:
                 continue
 
             candidates.append((c, (x, y, r)))

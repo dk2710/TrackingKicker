@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import fields
 from typing import Any, Dict, Optional
 
 import cv2
 import numpy as np
 from pypylon import pylon
 
-from .settings import CameraSettings
+from .settings import BallDetectionSettings, CameraSettings
 
 
 class BaslerCamera:
@@ -22,8 +23,13 @@ class BaslerCamera:
     RECOVERY_FAILURE_THRESHOLD = 5
     RETRY_SECONDS = 2.0
 
-    def __init__(self, settings: CameraSettings):
+    def __init__(
+        self,
+        settings: CameraSettings,
+        ball_settings: Optional[BallDetectionSettings] = None,
+    ):
         self.settings = settings
+        self.ball_settings = ball_settings or BallDetectionSettings()
         self.camera = None
         self._camera_lock = threading.RLock()
         self._latest_lock = threading.Lock()
@@ -31,6 +37,8 @@ class BaslerCamera:
         self._capture_thread: Optional[threading.Thread] = None
 
         self._latest_jpeg: Optional[bytes] = None
+        self._latest_ball_jpeg: Optional[bytes] = None
+        self._latest_mask_jpeg: Optional[bytes] = None
         self._latest_frame: Optional[np.ndarray] = None
         self._frame_number = 0
         self._received_frames = 0
@@ -39,6 +47,7 @@ class BaslerCamera:
         self._last_error = ""
         self._model = ""
         self._last_frame_time = 0.0
+        self._last_ball = None
 
     # ------------------------------------------------------------------
     # Camera lifecycle
@@ -98,6 +107,54 @@ class BaslerCamera:
             setattr(self.settings, name, value)
 
         return self.reconnect()
+
+    def update_ball_settings(self, values: Dict[str, Any]) -> None:
+        """Update the live color/contour preview without reopening the camera."""
+        valid_names = {item.name for item in fields(BallDetectionSettings)}
+        updated = dict(vars(self.ball_settings))
+        for name, value in values.items():
+            if name not in valid_names:
+                continue
+            current = updated[name]
+            try:
+                if isinstance(current, int):
+                    value = int(value)
+                else:
+                    value = float(value)
+            except (TypeError, ValueError):
+                raise ValueError(f"Ungueltiger Wert fuer {name}: {value!r}")
+            updated[name] = value
+
+        candidate = BallDetectionSettings(**updated)
+
+        integer_ranges = {
+            "hsv_low_h": (0, 179), "hsv_high_h": (0, 179),
+            "hsv_low_s": (0, 255), "hsv_high_s": (0, 255),
+            "hsv_low_v": (0, 255), "hsv_high_v": (0, 255),
+        }
+        for name, (minimum, maximum) in integer_ranges.items():
+            value = getattr(candidate, name)
+            if not minimum <= value <= maximum:
+                raise ValueError(f"{name} muss zwischen {minimum} und {maximum} liegen")
+
+        if candidate.hsv_low_h > candidate.hsv_high_h:
+            raise ValueError("hsv_low_h darf nicht groesser als hsv_high_h sein")
+        if candidate.hsv_low_s > candidate.hsv_high_s:
+            raise ValueError("hsv_low_s darf nicht groesser als hsv_high_s sein")
+        if candidate.hsv_low_v > candidate.hsv_high_v:
+            raise ValueError("hsv_low_v darf nicht groesser als hsv_high_v sein")
+        if candidate.area_min < 0 or candidate.area_max <= candidate.area_min:
+            raise ValueError("area_max muss groesser als area_min sein")
+        if candidate.radius_min_px < 0 or candidate.radius_max_px <= candidate.radius_min_px:
+            raise ValueError("radius_max_px muss groesser als radius_min_px sein")
+        if not 0.05 <= candidate.detection_scale <= 1.0:
+            raise ValueError("detection_scale muss zwischen 0.05 und 1.0 liegen")
+        if not 0.0 <= candidate.circularity_min <= 1.0:
+            raise ValueError("circularity_min muss zwischen 0 und 1 liegen")
+        if not 0.0 <= candidate.solidity_min <= 1.0:
+            raise ValueError("solidity_min muss zwischen 0 und 1 liegen")
+
+        self.ball_settings = candidate
 
     # ------------------------------------------------------------------
     # Configuration: this is deliberately explicit so every reconnect uses
@@ -272,18 +329,24 @@ class BaslerCamera:
         elif image.ndim == 3 and image.shape[2] == 1:
             image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
 
+        ball_preview, mask_preview, ball = self._create_ball_preview(image)
         ok, encoded = cv2.imencode(
             ".jpg",
             image,
             [int(cv2.IMWRITE_JPEG_QUALITY), 85],
         )
-        if not ok:
+        preview_ok, ball_encoded = cv2.imencode(".jpg", ball_preview)
+        mask_ok, mask_encoded = cv2.imencode(".jpg", mask_preview)
+        if not ok or not preview_ok or not mask_ok:
             return
 
         now = time.monotonic()
         with self._latest_lock:
             self._latest_frame = image
             self._latest_jpeg = encoded.tobytes()
+            self._latest_ball_jpeg = ball_encoded.tobytes()
+            self._latest_mask_jpeg = mask_encoded.tobytes()
+            self._last_ball = ball
             self._frame_number += 1
             self._received_frames += 1
             self._last_frame_time = now
@@ -291,6 +354,14 @@ class BaslerCamera:
     def latest_jpeg(self) -> Optional[bytes]:
         with self._latest_lock:
             return self._latest_jpeg
+
+    def latest_ball_jpeg(self) -> Optional[bytes]:
+        with self._latest_lock:
+            return self._latest_ball_jpeg
+
+    def latest_mask_jpeg(self) -> Optional[bytes]:
+        with self._latest_lock:
+            return self._latest_mask_jpeg
 
     def latest_frame(self) -> Optional[np.ndarray]:
         with self._latest_lock:
@@ -322,7 +393,102 @@ class BaslerCamera:
             "last_frame_age_seconds": last_frame_age,
             "last_error": self._last_error,
             "settings": dict(vars(self.settings)),
+            "ball_detection": dict(vars(self.ball_settings)),
+            "detected_ball": self._last_ball,
         }
+
+    def _create_ball_preview(self, image: np.ndarray):
+        settings = self.ball_settings
+        scale = settings.detection_scale
+        detection_image = image
+        if 0.0 < scale < 1.0:
+            detection_image = cv2.resize(
+                image,
+                None,
+                fx=scale,
+                fy=scale,
+                interpolation=cv2.INTER_AREA,
+            )
+
+        hsv = cv2.cvtColor(
+            cv2.GaussianBlur(detection_image, (5, 5), 0),
+            cv2.COLOR_BGR2HSV,
+        )
+        lower = np.array(
+            [settings.hsv_low_h, settings.hsv_low_s, settings.hsv_low_v],
+            dtype=np.uint8,
+        )
+        upper = np.array(
+            [settings.hsv_high_h, settings.hsv_high_s, settings.hsv_high_v],
+            dtype=np.uint8,
+        )
+        mask = cv2.inRange(hsv, lower, upper)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        contours, _ = cv2.findContours(
+            mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        candidates = []
+        area_scale = scale * scale
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if not settings.area_min * area_scale <= area <= settings.area_max * area_scale:
+                continue
+            (x, y), radius = cv2.minEnclosingCircle(contour)
+            if not settings.radius_min_px * scale < radius < settings.radius_max_px * scale:
+                continue
+            perimeter = cv2.arcLength(contour, True)
+            circularity = 4.0 * np.pi * area / (perimeter * perimeter) if perimeter > 1e-6 else 0.0
+            if circularity < settings.circularity_min:
+                continue
+            hull_area = cv2.contourArea(cv2.convexHull(contour))
+            solidity = area / hull_area if hull_area > 1e-6 else 0.0
+            if solidity < settings.solidity_min:
+                continue
+            candidates.append((area, x / scale, y / scale, radius / scale))
+
+        preview = image.copy()
+        selected_ball = None
+        if candidates:
+            _, x, y, radius = max(candidates, key=lambda candidate: candidate[0])
+            selected_ball = [round(x), round(y), round(radius)]
+            cv2.circle(
+                preview,
+                (int(round(x)), int(round(y))),
+                max(2, int(round(radius))),
+                (0, 255, 255),
+                3,
+            )
+            cv2.putText(
+                preview,
+                f"BALL x={int(x)} y={int(y)} r={int(radius)}",
+                (15, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.75,
+                (0, 255, 255),
+                2,
+            )
+        cv2.putText(
+            preview,
+            f"Kandidaten: {len(candidates)}",
+            (15, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (255, 255, 255),
+            2,
+        )
+
+        if mask.shape[:2] != image.shape[:2]:
+            mask = cv2.resize(
+                mask,
+                (image.shape[1], image.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+        return preview, mask_bgr, selected_ball
 
     def _set_error(self, message: str) -> None:
         self._last_error = str(message)

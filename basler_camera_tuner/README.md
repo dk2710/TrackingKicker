@@ -36,6 +36,42 @@ angewendet.
 - `packet_size`, `inter_packet_delay`: optionale GigE-Transportparameter;
   `0` lässt den Kamerawert unverändert.
 
+## Ballerkennung einstellen
+
+Im Bereich **Ballerkennung (HSV)** werden die Farbgrenzen der Ballmaske
+eingestellt:
+
+- `H Min`/`H Max` (**0–179**) bestimmen den Farbton. Blau liegt typischerweise
+  ungefähr zwischen 100 und 120, kann aber durch Licht und Weißabgleich
+  abweichen.
+- `S Min`/`S Max` (**0–255**) bestimmen die Farbsättigung. Ein höheres `S Min`
+  blendet graue Tischbereiche aus.
+- `V Min`/`V Max` (**0–255**) bestimmen die Helligkeit. Ein höheres `V Min`
+  blendet dunkle Schatten aus; ein niedrigeres `V Min` hilft bei dunklem Licht.
+
+In der **Farbmaske** sind weiße Pixel diejenigen, die den HSV-Bereich erfüllen.
+Im **Ball-Overlay** werden daraus nur Konturen akzeptiert, die zusätzlich zu
+den geometrischen Filtern passen. Die gelbe Markierung zeigt die ausgewählte
+Ballkontur.
+
+- `Fläche Min`/`Fläche Max`: Größe der Kontur in Pixeln im Originalbild.
+- `Radius Min`/`Radius Max`: erwarteter Ballradius in Pixeln.
+- `Rundheit Min`: filtert längliche oder unregelmäßige Konturen aus.
+- `Solidität Min`: filtert Konturen mit großen Löchern oder Einbuchtungen aus.
+- `Erkennungsskalierung`: verkleinert das Bild nur für die Erkennung. `0.5`
+  ist schneller; `1.0` ist genauer, benötigt aber mehr CPU.
+
+Zum Einstellen zuerst nur den HSV-Bereich verändern, bis der Ball weiß und
+der übrige Tisch möglichst schwarz in der Farbmaske erscheint. Danach können
+Fläche, Radius, Rundheit und Solidität angepasst werden. Die Werte werden in
+`settings.json` gespeichert. Der Tracker verwendet dieselben Werte in
+`v3/tracking_kicker/config.json` unter `ball_detection`.
+
+Mit **Für Tracker übernehmen** werden die aktuellen Ballwerte direkt in
+`v3/tracking_kicker/config.json` im Format `hsv_low: [H, S, V]` und
+`hsv_high: [H, S, V]` gespeichert. Danach muss der Tracker neu gestartet
+werden, damit er die neuen Werte lädt.
+
 Jede Änderung stoppt den Stream, öffnet die Kamera neu, ruft
 `_configure_reconnected_camera()` auf und startet den Stream mit den neuen
 Werten. Dadurch entspricht das Verhalten auch dem Reconnect im Tracker.

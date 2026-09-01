@@ -10,6 +10,8 @@ from v3.tracking_kicker.model.Camera import Camera
 @dataclass
 class AppConfig:
     camera: Camera | None = None
+    # Einstellungen fuer die farbbasierte Ballkontur-Erkennung.
+    ball_detection: Dict[str, Any] = field(default_factory=dict)
     # === Runtime ===
     headless: bool = False
     replay_seconds: int = 3
@@ -46,8 +48,13 @@ class AppConfig:
         # Camera
         cam_data = data.pop("camera", None)
         camera = Camera(**cam_data) if cam_data else None
+        ball_detection = data.pop("ball_detection", {})
 
-        return cls(camera=camera, **data)
+        return cls(
+            camera=camera,
+            ball_detection=ball_detection,
+            **data,
+        )
 
     def save(self, path: Path | None = None):
         path = path or self.config_path

@@ -268,9 +268,18 @@ class KickerApp:
         if vision.field is not None:
             table_width_cm = float(vision.field.size_cm.w)
         self.detector = BallDetector(
+            hsv_low=tuple(config.ball_detection.get("hsv_low", (100, 110, 90))),
+            hsv_high=tuple(config.ball_detection.get("hsv_high", (112, 255, 255))),
+            area_min=float(config.ball_detection.get("area_min", 60.0)),
+            area_max=float(config.ball_detection.get("area_max", 12000.0)),
             debug=False,
+            detection_scale=float(config.ball_detection.get("detection_scale", 0.5)),
             expected_fps=float(camera_fps),
             table_width_cm=table_width_cm,
+            radius_min_px=float(config.ball_detection.get("radius_min_px", 5.0)),
+            radius_max_px=float(config.ball_detection.get("radius_max_px", 25.0)),
+            circularity_min=float(config.ball_detection.get("circularity_min", 0.5)),
+            solidity_min=float(config.ball_detection.get("solidity_min", 0.85)),
         )
 
         self.analyzer = KickerAnalyzer(

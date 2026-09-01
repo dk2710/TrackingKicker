@@ -18,5 +18,20 @@
     "max_num_buffer": 64,
     "packet_size": 0,
     "inter_packet_delay": 0
+  },
+  "ball_detection": {
+    "hsv_low_h": 100,
+    "hsv_low_s": 110,
+    "hsv_low_v": 90,
+    "hsv_high_h": 112,
+    "hsv_high_s": 255,
+    "hsv_high_v": 255,
+    "area_min": 60.0,
+    "area_max": 12000.0,
+    "detection_scale": 0.5,
+    "radius_min_px": 5.0,
+    "radius_max_px": 25.0,
+    "circularity_min": 0.5,
+    "solidity_min": 0.85
   }
 }
