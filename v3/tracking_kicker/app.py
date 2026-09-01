@@ -371,13 +371,13 @@ class KickerApp:
         return recovered
 
     def _process_recovered_frames(self, recovered_frames, current_frame):
-        """Use recovered positions for speed and explicitly confirm a goal.
+        """Use recovered positions for speed and register a goal candidate.
 
         Some recovered frames are older than a live frame already handled by
         the analyzer. They must not be sent through the stateful goal machine
         a second time. Their ball observations are added in timestamp order;
-        a detected entry into a goal is then confirmed against the current
-        missing/outside frame.
+        a detected entry into a goal is registered, and the live state machine
+        still requires one full second without a detected ball.
         """
         goal_candidate = None
         for recovered_frame in recovered_frames:
@@ -429,10 +429,9 @@ class KickerApp:
                 current_frame.frame.shape,
             )
 
-        # The current trigger is either a missing ball or a ball which has
-        # returned outside the goal. In both cases the recovered entry is now
-        # a complete goal event. If it is still inside, wait for the ordinary
-        # goal state machine to see it leave.
+        # Register the candidate even when the current frame is missing. The
+        # following live process_frame() starts the one-second absence timer;
+        # confirm_recovered_goal() deliberately does not emit immediately.
         if current_ball is None or not current_is_still_in_goal:
             return self.analyzer.confirm_recovered_goal(side, landing_timestamp)
         return False, False

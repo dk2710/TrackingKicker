@@ -9,6 +9,9 @@ from v3.tracking_kicker.analysis.rod_control import RodControlTracker
 from v3.tracking_kicker.model.Vision import FieldConfig, GoalsConfig
 
 
+GOAL_CONFIRMATION_MISSING_SECONDS = 1.0
+
+
 class KickerAnalyzer:
     """Stateful goal and ball-position analysis with goal-only speed checks.
 
@@ -60,6 +63,7 @@ class KickerAnalyzer:
         self.score_right = 0
         self._pending_side = None  # "left" | "right" | None
         self._pending_start_time: Optional[float] = None
+        self._pending_missing_since: Optional[float] = None
         self._goal_locked = False
 
         # The application uses this event as the payload for its POST.
@@ -109,22 +113,32 @@ class KickerAnalyzer:
         timestamp: Optional[float] = None,
     ):
         goal_left = goal_right = False
+        timestamp = float(timestamp) if timestamp is not None else time.perf_counter()
 
         if ball is None:
-            # A missing ball confirms a previously observed entry into a goal.
+            # A goal is only confirmed after a complete second without any
+            # detected ball. This avoids counting a short detector gap as a
+            # goal immediately after the ball enters the goal ROI.
             if self._pending_side is not None and not self._goal_locked:
-                side = self._pending_side
-                self._emit_goal(
-                    side,
-                    self._pending_start_time
-                    if self._pending_start_time is not None
-                    else timestamp,
-                )
-                goal_left = side == "left"
-                goal_right = side == "right"
-                self._goal_locked = True
-                self._pending_side = None
-                self._pending_start_time = None
+                if self._pending_missing_since is None:
+                    self._pending_missing_since = timestamp
+                elif (
+                    timestamp - self._pending_missing_since
+                    >= GOAL_CONFIRMATION_MISSING_SECONDS
+                ):
+                    side = self._pending_side
+                    self._emit_goal(
+                        side,
+                        self._pending_start_time
+                        if self._pending_start_time is not None
+                        else timestamp,
+                    )
+                    goal_left = side == "left"
+                    goal_right = side == "right"
+                    self._goal_locked = True
+                    self._pending_side = None
+                    self._pending_start_time = None
+                    self._pending_missing_since = None
             return goal_left, goal_right
 
         x, y, r = ball
@@ -142,33 +156,34 @@ class KickerAnalyzer:
             if in_left:
                 self._pending_side = "left"
                 self._pending_start_time = timestamp
+                self._pending_missing_since = None
             elif in_right:
                 self._pending_side = "right"
                 self._pending_start_time = timestamp
+                self._pending_missing_since = None
             return False, False
 
-        # The ball was in the goal and is now outside it: confirm the goal.
-        if self._pending_side == "left" and not in_left:
-            self._emit_goal(
-                "left",
-                self._pending_start_time
-                if self._pending_start_time is not None
-                else timestamp,
-            )
-            goal_left = True
-        elif self._pending_side == "right" and not in_right:
-            self._emit_goal(
-                "right",
-                self._pending_start_time
-                if self._pending_start_time is not None
-                else timestamp,
-            )
-            goal_right = True
+        pending_in_goal = (
+            in_left if self._pending_side == "left" else in_right
+        )
+        if pending_in_goal:
+            # The ball is still visible, so the one-second absence window has
+            # not started (or was interrupted).
+            self._pending_missing_since = None
+            return False, False
 
-        if goal_left or goal_right:
-            self._goal_locked = True
-            self._pending_side = None
-            self._pending_start_time = None
+        # A visible ball outside the candidate ROI means that the required
+        # one-second complete absence has not happened. Cancel this candidate;
+        # if it is already in the other ROI, start that side as a new one.
+        self._pending_side = None
+        self._pending_start_time = None
+        self._pending_missing_since = None
+        if in_left:
+            self._pending_side = "left"
+            self._pending_start_time = timestamp
+        elif in_right:
+            self._pending_side = "right"
+            self._pending_start_time = timestamp
 
         return goal_left, goal_right
 
@@ -284,18 +299,22 @@ class KickerAnalyzer:
         )
 
     def confirm_recovered_goal(self, side: str, landing_timestamp: float):
-        """Confirm a goal found in a retroactively analysed frame."""
+        """Register a recovered goal candidate for normal confirmation.
+
+        Recovered frames are older than the current live frame. They must not
+        emit a goal immediately: the live state machine still has to observe
+        one full second with no detected ball.
+        """
         if self._goal_locked:
             return False, False
         if self._pending_side is not None and self._pending_side != side:
             return False, False
 
-        self._emit_goal(side, landing_timestamp)
-        self._pending_side = None
-        self._pending_start_time = None
-        self._goal_locked = True
-        self._finalize_goal_speed()
-        return side == "left", side == "right"
+        if self._pending_side is None:
+            self._pending_side = side
+            self._pending_start_time = float(landing_timestamp)
+            self._pending_missing_since = None
+        return False, False
 
     def _finalize_goal_speed(self) -> None:
         if self._last_goal_timestamp is None:
