@@ -598,6 +598,7 @@ class KickerApp:
         if not frames or not timestamps:
             return
 
+        temp_filename = None
         try:
             first_timestamp = float(timestamps[0])
             relative_times = np.asarray(
@@ -609,31 +610,45 @@ class KickerApp:
                 "goal_pre_"
                 f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S-%f')}.npz"
             )
+            temp_filename = filename.with_name(f".{filename.name}.tmp")
 
             # Die Kopie wird erst hier erzeugt, damit der Kamera-Thread beim
             # Ausloesen des Speicherns moeglichst wenig blockiert.
             frame_array = np.stack([np.asarray(frame).copy() for frame in frames])
-            np.savez(
-                filename,
-                frames=frame_array,
-                # RawReplaySource kann diese Zeitachse direkt wiedergeben.
-                times=relative_times,
-                # Zusaetzliche absolute Zeitstempel erleichtern die spaetere
-                # Auswertung, ohne das bestehende Replay-Format zu brechen.
-                timestamps=np.asarray(timestamps, dtype=np.float64),
-                goal_time=np.asarray(goal_time, dtype=np.float64),
-                goal_position=np.asarray(event.get("goal_position", "")),
-                speed_kmh=np.asarray(
-                    float(event.get("speed_kmh", 0.0)),
-                    dtype=np.float64,
-                ),
-            )
+            # Zuerst in eine temporaere Datei schreiben und erst nach einem
+            # vollstaendigen Write umbenennen. So kann kein unvollstaendiges
+            # NPZ als gueltige Toraufnahme liegen bleiben.
+            with temp_filename.open("wb") as npz_file:
+                np.savez(
+                    npz_file,
+                    frames=frame_array,
+                    # RawReplaySource kann diese Zeitachse direkt wiedergeben.
+                    times=relative_times,
+                    # Zusaetzliche absolute Zeitstempel erleichtern die spaetere
+                    # Auswertung, ohne das bestehende Replay-Format zu brechen.
+                    timestamps=np.asarray(timestamps, dtype=np.float64),
+                    goal_time=np.asarray(goal_time, dtype=np.float64),
+                    goal_position=np.asarray(event.get("goal_position", "")),
+                    speed_kmh=np.asarray(
+                        float(event.get("speed_kmh", 0.0)),
+                        dtype=np.float64,
+                    ),
+                )
+            temp_filename.replace(filename)
             print(
                 f"[GOAL-NPZ] SAVE DONE: {filename} "
                 f"({len(frames)} Frames, Torzeit={goal_time:.6f}s)"
             )
         except Exception as exc:
             print(f"[GOAL-NPZ] Speichern fehlgeschlagen: {exc}")
+        finally:
+            if temp_filename is not None:
+                try:
+                    temp_filename.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as cleanup_error:
+                    print(f"[GOAL-NPZ] Temporärdatei nicht entfernbar: {cleanup_error}")
 
     def _invalidate_rolling_video(self):
         with self.rolling_video_lock:
@@ -1286,8 +1301,13 @@ class KickerApp:
             except Exception as e:
                 print(f"❌ Camera-Loop Fehler: {e}")
                 traceback.print_exc()
-                self.stop_event.set()
-                break
+                # Ein einzelner Fehler beim Lesen/Weiterreichen eines Frames
+                # darf die komplette Torerkennung nicht beenden. Die
+                # BaslerSource versucht den Stream selbst wiederherzustellen;
+                # hier wird nur kurz pausiert, damit bei einem transienten
+                # Fehler keine enge Fehler-Schleife entsteht.
+                time.sleep(0.05)
+                continue
 
     def correction_loop(self):
 
@@ -1319,8 +1339,8 @@ class KickerApp:
             except Exception as e:
                 print(f"❌ Correction-Loop Fehler: {e}")
                 traceback.print_exc()
-                self.stop_event.set()
-                break
+                time.sleep(0.05)
+                continue
 
     # -------------------------------------------------
     # Processing Loop
@@ -1482,8 +1502,12 @@ class KickerApp:
 
             except Exception as e:
                 print(f"❌ Processing-Loop Fehler: {e}")
-                self.stop_event.set()
-                break
+                traceback.print_exc()
+                # Die NPZ-Speicherung läuft absichtlich unabhängig vom
+                # Analyzer. Ein Fehler bei einem einzelnen Frame darf weder
+                # die laufende Analyse noch die nächste Torerkennung stoppen.
+                time.sleep(0.01)
+                continue
 
     # -------------------------------------------------
     # Recording Loop
@@ -1534,8 +1558,8 @@ class KickerApp:
 
                 except Exception as e:
                     print(f"❌ Recording-Loop Fehler: {e}")
-                    self.stop_event.set()
-                    break
+                    time.sleep(0.05)
+                    continue
 
         finally:
             # Falls während laufender Aufnahme beendet wird,
