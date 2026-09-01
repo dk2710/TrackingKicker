@@ -95,6 +95,7 @@ PAGE = """
 const names = ["force_fps", "width", "height", "offset_x", "offset_y",
   "exposure_time", "gain", "pixel_format", "exposure_auto", "gain_auto",
   "grab_strategy", "max_num_buffer", "packet_size", "inter_packet_delay"];
+let settingsLoaded = false;
 
 function fill(settings) {
   for (const name of names) {
@@ -115,7 +116,11 @@ function values() {
 async function refresh() {
   const response = await fetch("/api/status");
   const data = await response.json();
-  fill(data.settings);
+  // Polling must not overwrite values while the user is editing the form.
+  if (!settingsLoaded) {
+    fill(data.settings);
+    settingsLoaded = true;
+  }
   document.getElementById("status").textContent = JSON.stringify(data, null, 2);
 }
 
