@@ -7,9 +7,9 @@ also run against :mod:`.RawReplaySource`.
 
 from __future__ import annotations
 
+import gc
 import threading
 import time
-import gc
 from typing import Any, Optional
 
 from pypylon import pylon
