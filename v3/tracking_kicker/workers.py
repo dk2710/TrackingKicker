@@ -80,7 +80,7 @@ class WorkerMixin:
         converted = to_bgr(raw_image, dist.camera.pixel_format)
         frame.frame = converted if converted is not raw_image else raw_image.copy()
         frame.frame = dist.apply(frame.frame)
-        detector.detect(frame)
+        detector.detect(frame, image_is_bgr=True)
         return frame
 
     def _restore_skipped_frames(self, frames) -> None:
@@ -396,21 +396,37 @@ class WorkerMixin:
                 stage_start = time.perf_counter()
                 raw_image = source_frame.frame
                 converted = to_bgr(raw_image, self.dist.camera.pixel_format)
-                # Bayer conversion already allocates a new BGR image. Only
-                # copy formats where conversion returns the capture-owned
-                # array unchanged.
-                frame.frame = converted if converted is not raw_image else raw_image.copy()
                 stage_time["cvt"] += time.perf_counter() - stage_start
 
                 stage_start = time.perf_counter()
-                frame.frame = self.dist.apply(frame.frame)
+                detection_image = None
+                detection_scale = getattr(self.detector, "detection_scale", 1.0)
+                if HEADLESS and 0.0 < detection_scale < 1.0:
+                    # No consumer needs a full corrected image in headless
+                    # mode. Keep the full shape on the frame for ROI,
+                    # homography, and speed units, while the detector gets a
+                    # corrected image at its existing detection scale.
+                    frame.frame = converted
+                    detection_image = self.analysis_dist.apply_scaled(
+                        converted, detection_scale
+                    )
+                else:
+                    # Bayer conversion already allocates a new BGR image. The
+                    # remap below also allocates its output, so a second copy
+                    # of capture-owned BGR input is unnecessary.
+                    frame.frame = self.dist.apply(converted)
                 stage_time["dist"] += time.perf_counter() - stage_start
 
                 now = time.perf_counter()
                 n += 1
 
                 stage_start = time.perf_counter()
-                self.detector.detect(frame)
+                self.detector.detect(
+                    frame,
+                    detection_image=detection_image,
+                    detection_scale=detection_scale,
+                    image_is_bgr=True,
+                )
                 stage_time["detect"] += time.perf_counter() - stage_start
 
                 current_frame_id = getattr(frame, "frame_id", None)
@@ -442,16 +458,21 @@ class WorkerMixin:
                         current_frame_id, "0.5 s ohne Ball"
                     )
 
-                stage_start = time.perf_counter()
-                self.analyzer.draw_overlay(frame)
-                stage_time["overlay"] += time.perf_counter() - stage_start
+                # In headless operation no consumer can display this image.
+                # Avoid drawing several overlays and handing a full BGR frame
+                # to a queue that is never read.  Analysis still receives the
+                # exact same corrected image and ball coordinates above.
+                if not HEADLESS:
+                    stage_start = time.perf_counter()
+                    self.analyzer.draw_overlay(frame)
+                    stage_time["overlay"] += time.perf_counter() - stage_start
 
-                if self.display_queue.full():
-                    try:
-                        self.display_queue.get_nowait()
-                    except Empty:
-                        pass
-                self.display_queue.put(frame.frame)
+                    if self.display_queue.full():
+                        try:
+                            self.display_queue.get_nowait()
+                        except Empty:
+                            pass
+                    self.display_queue.put(frame.frame)
 
                 if now - last_log >= 1.0:
                     dt = now - last_log

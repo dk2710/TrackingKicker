@@ -85,6 +85,10 @@ class KickerApp(
         self.video = source
         self.cfg: Optional[Dict[str, Any]] = None
         self.dist = DistortionCorrector(config.camera)
+        # In HEADLESS mode the detector can use a reduced corrected image.
+        # Keep this corrector separate because goal-video generation may use
+        # self.dist concurrently for full-resolution output.
+        self.analysis_dist = DistortionCorrector(config.camera)
         print(f"📁 Verzerrung config: {config.camera}")
         cv2.setUseOptimized(True)
 

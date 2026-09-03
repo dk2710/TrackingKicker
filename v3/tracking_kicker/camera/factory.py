@@ -31,6 +31,21 @@ def create_camera_with_retry(
     for attempt in range(1, attempts + 1):
         try:
             return BaslerSource(camera_config)
+        except ModuleNotFoundError as exc:
+            # BaslerSource checks pypylon lazily because replay mode must stay
+            # usable without the vendor package. Do not spend all retry
+            # attempts on a package that is definitely not installed.
+            if exc.name == "pypylon" or "pypylon" in str(exc).lower():
+                raise RuntimeError(
+                    "pypylon ist nicht installiert; Basler-Kamera kann nicht verwendet werden"
+                ) from exc
+            last_error = exc
+            print(
+                f"[CAM-START] Kamera nicht verfuegbar "
+                f"(Versuch {attempt}/{attempts}): {exc}"
+            )
+            if attempt < attempts:
+                time.sleep(max(0.0, float(retry_delay_seconds)))
         except Exception as exc:
             last_error = exc
             print(

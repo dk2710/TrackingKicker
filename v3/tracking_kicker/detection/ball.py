@@ -66,6 +66,9 @@ class BallDetector:
         self.circularity_min = float(circularity_min)
         self.solidity_min = float(solidity_min)
         self.pixel_format = pixel_format
+        self._morph_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (5, 5)
+        )
 
         # Die Konturerkennung liefert pro Frame Kandidaten, verfolgt aber
         # nicht automatisch denselben Kandidaten weiter. Diese Zustandsdaten
@@ -98,13 +101,14 @@ class BallDetector:
     # Mask
     # ---------------------------------------------------------
     def _mask_ball(self, frame: np.ndarray) -> np.ndarray:
-        frame_bgr = to_bgr(frame, self.pixel_format)
-
-        hsv = cv2.cvtColor(cv2.GaussianBlur(frame_bgr, (5, 5), 0), cv2.COLOR_BGR2HSV)
+        hsv = cv2.cvtColor(
+            cv2.GaussianBlur(frame, (5, 5), 0), cv2.COLOR_BGR2HSV
+        )
         mask = cv2.inRange(hsv, self.hsv_low, self.hsv_high)
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        mask = cv2.morphologyEx(
+            mask, cv2.MORPH_CLOSE, self._morph_kernel, iterations=2
+        )
 
         if self.debug:
             cv2.imshow("Ball mask", mask)
@@ -147,9 +151,24 @@ class BallDetector:
     # ---------------------------------------------------------
     # Detection
     # ---------------------------------------------------------
-    def detect(self, frame: Frame):
-        image = frame.frame
-        scale = self.detection_scale
+    def detect(
+        self,
+        frame: Frame,
+        *,
+        detection_image: Optional[np.ndarray] = None,
+        detection_scale: Optional[float] = None,
+        image_is_bgr: bool = False,
+    ):
+        # Workers normally provide BGR already.  Converting here as the
+        # single entry point also keeps direct/replay callers safe and avoids
+        # a second no-op pixel-format check inside _mask_ball().
+        input_image = frame.frame if detection_image is None else detection_image
+        image = input_image if image_is_bgr else to_bgr(input_image, self.pixel_format)
+        scale = (
+            self.detection_scale
+            if detection_scale is None
+            else float(detection_scale)
+        )
 
         # Diese Attribute werden auch bei einer reinen Positionsanalyse
         # gesetzt. Nur ball_track_valid wird vom Analyzer fuer die
@@ -161,15 +180,22 @@ class BallDetector:
         # Die Vollbild-Erkennung ist auf dem Orange Pi sehr teuer. Die
         # Detektion erfolgt halbaufgeloest; die Koordinaten werden unten
         # wieder auf die Originalaufloesung hochgerechnet.
-        if 0.0 < scale < 1.0:
-            image = cv2.resize(
-                image,
-                None,
-                fx=scale,
-                fy=scale,
-                interpolation=cv2.INTER_AREA,
-            )
-        else:
+        # ``detection_image`` may already be reduced by the distortion worker.
+        if detection_image is None:
+            if 0.0 < scale < 1.0:
+                image = cv2.resize(
+                    image,
+                    None,
+                    fx=scale,
+                    fy=scale,
+                    interpolation=cv2.INTER_AREA,
+                )
+            else:
+                scale = 1.0
+        elif not 0.0 < scale <= 1.0:
+            # An externally prepared image must still describe its relation
+            # to the original frame. Fall back safely if a caller omitted a
+            # valid scale rather than producing invalid coordinates.
             scale = 1.0
 
         mask = self._mask_ball(image)
