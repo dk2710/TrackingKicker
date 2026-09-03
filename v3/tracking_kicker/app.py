@@ -89,10 +89,12 @@ class KickerApp(
         print(f"📁 Verzerrung config: {config.camera}")
         cv2.setUseOptimized(True)
 
-        # Queues shared by the camera, processing and recording workers.
+        # The capture worker publishes raw frames only. Analysis makes its own
+        # copy before modifying an image, so replay and recording can share
+        # the raw frame without another copy in the time-critical camera loop.
         self.frame_queue = Queue(maxsize=2)
         self.display_queue = Queue(maxsize=1)
-        self.recording_queue = Queue()
+        self.recording_queue = Queue(maxsize=4)
         self.raw_queue = Queue(maxsize=2)
         self.processed_queue = Queue(maxsize=2)
 

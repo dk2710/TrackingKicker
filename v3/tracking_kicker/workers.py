@@ -150,11 +150,16 @@ class WorkerMixin:
     def capture_loop(self):
         """Capture frames independently from the analysis worker.
 
-        The hand-off queue is deliberately lossy and non-blocking.  When
-        analysis is slower than acquisition, the oldest pending analysis frame
-        is discarded so this loop can immediately return to pypylon.
+        This loop is deliberately kept small: it reads from the source,
+        assigns a sequence number and publishes the raw frame. The hand-off
+        queue is lossy and non-blocking. When analysis is slower than
+        acquisition, the oldest pending analysis frame is discarded so this
+        loop can immediately return to pypylon.
+
+        The raw image is never modified here. The analysis worker makes its
+        own copy before conversion, so replay and recording can safely share
+        the raw frame without another full-resolution copy in this loop.
         """
-        dropped = 0
         while not self.stop_event.is_set():
             try:
                 ret, objframe = self.video.read()
@@ -170,7 +175,7 @@ class WorkerMixin:
 
                 with self.replay_lock:
                     self.replay_buffer.append(
-                        (objframe.frame.copy(), objframe.timestamp)
+                        (objframe.frame, objframe.timestamp)
                     )
                     while (
                         self.replay_buffer
@@ -189,13 +194,18 @@ class WorkerMixin:
                         except Empty:
                             continue
                         self._remember_skipped_frame(skipped)
-                        dropped += 1
 
                 if self.record_event.is_set():
                     try:
-                        # The processing worker changes the Frame in place;
-                        # recording must keep the original raw image.
-                        self.recording_queue.put(objframe.frame.copy())
+                        # The recording worker copies the raw image outside
+                        # this time-critical camera loop.
+                        self.recording_queue.put_nowait(objframe)
+                    except Full:
+                        try:
+                            self.recording_queue.get_nowait()
+                            self.recording_queue.put_nowait(objframe)
+                        except (Empty, Full):
+                            pass
                     except Exception as exc:
                         print(f"⚠️ Recording Queue Fehler: {exc}")
 
@@ -245,7 +255,7 @@ class WorkerMixin:
 
         while not self.stop_event.is_set():
             try:
-                frame = self.frame_queue.get(timeout=0.5)
+                source_frame = self.frame_queue.get(timeout=0.5)
 
                 while True:
                     try:
@@ -254,6 +264,12 @@ class WorkerMixin:
                         skipped_processing_frames += 1
                     except Empty:
                         break
+
+                # Never convert the capture-owned raw frame in place. Replay
+                # and recording may still reference the same image. Analysis
+                # receives an independent copy instead.
+                frame = copy.copy(source_frame)
+                frame.frame = source_frame.frame.copy()
 
                 stage_start = time.perf_counter()
                 frame.frame = to_bgr(frame.frame, self.dist.camera.pixel_format)
@@ -404,7 +420,8 @@ class WorkerMixin:
                         continue
 
                     raw_frame = self.recording_queue.get(timeout=0.2)
-                    raw_frames.append(raw_frame.copy())
+                    raw_image = getattr(raw_frame, "frame", raw_frame)
+                    raw_frames.append(raw_image.copy())
                     raw_times.append(time.perf_counter() - t_start)
                 except Empty:
                     continue
