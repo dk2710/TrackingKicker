@@ -17,7 +17,7 @@
     "solidity_min": 0.85
   },
   "camera": {
-    "force_fps": 120,
+    "force_fps": 60,
     "height": 650,
     "offset_y": 266,
     "width": 1100,
