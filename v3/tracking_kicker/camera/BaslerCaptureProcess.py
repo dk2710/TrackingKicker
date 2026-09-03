@@ -244,7 +244,7 @@ def _configure_camera(camera, cfg) -> None:
         print(f"[CAMERA-WARN] Stream-Parameter nicht lesbar: {exc}", flush=True)
 
     if stream_map is not None:
-        for name, value in (
+        stream_settings = [
             (
                 "MaxTransferSize",
                 int(getattr(cfg, "max_transfer_size", 1048568)),
@@ -253,15 +253,25 @@ def _configure_camera(camera, cfg) -> None:
                 "NumMaxQueuedUrbs",
                 int(getattr(cfg, "num_max_queued_urbs", 64)),
             ),
-            (
-                "ReceiveThreadPriorityOverride",
-                bool(getattr(cfg, "receive_thread_priority_override", True)),
-            ),
-            (
-                "ReceiveThreadPriority",
-                int(getattr(cfg, "receive_thread_priority", 15)),
-            ),
-        ):
+        ]
+        # ReceiveThreadPriority is a socket-driver setting and does not
+        # apply to USB. Do not even query it unless explicitly requested for
+        # a transport that supports it.
+        if bool(getattr(cfg, "receive_thread_priority_override", False)):
+            stream_settings.extend(
+                [
+                    (
+                        "ReceiveThreadPriorityOverride",
+                        True,
+                    ),
+                    (
+                        "ReceiveThreadPriority",
+                        int(getattr(cfg, "receive_thread_priority", 15)),
+                    ),
+                ]
+            )
+
+        for name, value in stream_settings:
             try:
                 node = stream_map.GetNode(name)
                 if node is None:
