@@ -1,5 +1,6 @@
 {
   "headless": true,
+  "opencv_threads": 8,
   "replay_seconds": 3,
   "target_display_fps": 60,
   "replay_fps": 120,

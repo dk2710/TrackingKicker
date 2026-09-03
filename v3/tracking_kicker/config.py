@@ -14,6 +14,7 @@ class AppConfig:
     ball_detection: Dict[str, Any] = field(default_factory=dict)
     # === Runtime ===
     headless: bool = False
+    opencv_threads: int = 8
     replay_seconds: int = 3
 
     # === Video ===

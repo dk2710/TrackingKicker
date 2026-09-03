@@ -285,10 +285,16 @@ def main() -> None:
     if not _acquire_app_lock():
         sys.exit(1)
 
-    # Keep OpenCV from competing with pypylon/libusb for CPU time on the
-    # Orange Pi.  The camera worker remains responsive while the processing
-    # worker handles the latest frame.
-    cv2.setNumThreads(1)
+    # Let OpenCV parallelize the expensive distortion remap. The camera and
+    # analysis workers are already decoupled, so this does not block capture.
+    # Keep the value configurable because the useful setting depends on the
+    # host CPU and should be measured together with the camera stream.
+    try:
+        opencv_threads = max(1, int(getattr(config, "opencv_threads", 8) or 8))
+    except (TypeError, ValueError):
+        opencv_threads = 8
+    cv2.setNumThreads(opencv_threads)
+    print(f"OpenCV Threads = {cv2.getNumThreads()}")
 
     while True:
         source = None
