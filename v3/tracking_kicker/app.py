@@ -212,9 +212,11 @@ class KickerApp(
             self.t_cam = threading.Thread(
                 target=self.capture_loop, name="camera-capture", daemon=True
             )
-            self.t_proc = threading.Thread(
-                target=self.analysis_loop, name="frame-analysis", daemon=True
-            )
+            capture_only = os.environ.get("TK_CAPTURE_ONLY", "0") == "1"
+            if not capture_only:
+                self.t_proc = threading.Thread(
+                    target=self.analysis_loop, name="frame-analysis", daemon=True
+                )
             self.t_retro = threading.Thread(
                 target=self.retro_loop, name="retro-analysis", daemon=True
             )
@@ -223,7 +225,10 @@ class KickerApp(
             )
 
             self.t_cam.start()
-            self.t_proc.start()
+            if self.t_proc is not None:
+                self.t_proc.start()
+            elif capture_only:
+                print("🧪 TK_CAPTURE_ONLY=1 → Analyse-Thread deaktiviert")
             self.t_retro.start()
             self.t_rec.start()
             self.t_api.start()
