@@ -6,6 +6,34 @@ from typing import Optional, Tuple
 from v3.tracking_kicker.Objects.Frames import Frame
 
 class BallDetector:
+    @classmethod
+    def from_config(cls, app_config, field_config=None) -> "BallDetector":
+        """Build the detector from application settings.
+
+        Keeping this wiring beside the detector prevents ``app.py`` from
+        knowing which detection parameters belong together.
+        """
+        detection = app_config.ball_detection
+        camera_fps = getattr(app_config.camera, "force_fps", 180) or 180
+        table_width_cm = 120.0
+        if field_config is not None:
+            table_width_cm = float(field_config.size_cm.w)
+
+        return cls(
+            hsv_low=tuple(detection.get("hsv_low", (100, 110, 90))),
+            hsv_high=tuple(detection.get("hsv_high", (112, 255, 255))),
+            area_min=float(detection.get("area_min", 60.0)),
+            area_max=float(detection.get("area_max", 12000.0)),
+            debug=False,
+            detection_scale=float(detection.get("detection_scale", 0.5)),
+            expected_fps=float(camera_fps),
+            table_width_cm=table_width_cm,
+            radius_min_px=float(detection.get("radius_min_px", 5.0)),
+            radius_max_px=float(detection.get("radius_max_px", 25.0)),
+            circularity_min=float(detection.get("circularity_min", 0.5)),
+            solidity_min=float(detection.get("solidity_min", 0.85)),
+        )
+
     def __init__(
         self,
         hsv_low: Tuple[int, int, int] = (100, 110, 90),
