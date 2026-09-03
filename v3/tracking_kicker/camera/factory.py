@@ -52,6 +52,12 @@ def create_camera_with_retry(
                 f"[CAM-START] Kamera nicht verfuegbar "
                 f"(Versuch {attempt}/{attempts}): {exc}"
             )
+            # A USB2 fallback is deterministic and cannot deliver the
+            # requested high-rate stream. Retrying pylon against that same
+            # link only adds noise and can disturb a marginal USB state.
+            message = str(exc).lower()
+            if "usb2" in message and "usb3" in message:
+                raise RuntimeError(str(exc)) from exc
             if attempt < attempts:
                 time.sleep(max(0.0, float(retry_delay_seconds)))
 
