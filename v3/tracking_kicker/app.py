@@ -95,6 +95,10 @@ class KickerApp(
         self.frame_queue = Queue(maxsize=2)
         self.display_queue = Queue(maxsize=1)
         self.recording_queue = Queue(maxsize=4)
+        # Retro detection is CPU-heavy but does not need to block live
+        # analysis. Only one bounded batch is pending at a time.
+        self.retro_queue = Queue(maxsize=1)
+        self.retro_result_queue = Queue(maxsize=1)
         self.raw_queue = Queue(maxsize=2)
         self.processed_queue = Queue(maxsize=2)
 
@@ -121,6 +125,7 @@ class KickerApp(
         self.t_api = None
         self.t_cam = None
         self.t_proc = None
+        self.t_retro = None
         self.t_rec = None
         self.t_roll = None
 
@@ -170,6 +175,8 @@ class KickerApp(
         )
 
         self.detector = BallDetector.from_config(config, vision.field)
+        self.retro_detector = BallDetector.from_config(config, vision.field)
+        self.retro_dist = DistortionCorrector(config.camera)
         self.analyzer = KickerAnalyzer(
             goals_cfg=vision.goals,
             field_cfg=vision.field,
@@ -202,12 +209,16 @@ class KickerApp(
             self.t_proc = threading.Thread(
                 target=self.analysis_loop, name="frame-analysis", daemon=True
             )
+            self.t_retro = threading.Thread(
+                target=self.retro_loop, name="retro-analysis", daemon=True
+            )
             self.t_rec = threading.Thread(
                 target=self.recording_loop, name="raw-recording", daemon=True
             )
 
             self.t_cam.start()
             self.t_proc.start()
+            self.t_retro.start()
             self.t_rec.start()
             self.t_api.start()
 
@@ -272,7 +283,14 @@ class KickerApp(
                 break
 
     def _join_threads(self):
-        for thread in [self.t_cam, self.t_proc, self.t_rec, self.t_roll, self.t_api]:
+        for thread in [
+            self.t_cam,
+            self.t_proc,
+            self.t_retro,
+            self.t_rec,
+            self.t_roll,
+            self.t_api,
+        ]:
             if thread is None:
                 continue
             try:

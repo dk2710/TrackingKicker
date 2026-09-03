@@ -78,14 +78,34 @@ class WorkerMixin:
                 for skipped in self.skipped_frame_buffer
             )
 
-    def _prepare_and_detect(self, source_frame):
+    def _prepare_and_detect(self, source_frame, *, detector=None, dist=None):
         """Copy, correct and detect one raw frame from the replay buffer."""
+        detector = self.detector if detector is None else detector
+        dist = self.dist if dist is None else dist
         frame = copy.copy(source_frame)
         frame.frame = source_frame.frame.copy()
-        frame.frame = to_bgr(frame.frame, self.dist.camera.pixel_format)
-        frame.frame = self.dist.apply(frame.frame)
-        self.detector.detect(frame)
+        frame.frame = to_bgr(frame.frame, dist.camera.pixel_format)
+        frame.frame = dist.apply(frame.frame)
+        detector.detect(frame)
         return frame
+
+    def _restore_skipped_frames(self, frames) -> None:
+        """Return a batch if the bounded retro queue filled meanwhile."""
+        if not frames:
+            return
+        with self.skipped_frame_lock:
+            combined = list(self.skipped_frame_buffer)
+            combined.extend(frames)
+            combined.sort(
+                key=lambda item: (
+                    getattr(item, "frame_id", 0),
+                    getattr(item, "timestamp", 0.0),
+                )
+            )
+            self.skipped_frame_buffer = deque(
+                combined[-RETRO_BUFFER_MAX_FRAMES:],
+                maxlen=RETRO_BUFFER_MAX_FRAMES,
+            )
 
     def _reanalyze_skipped_frames(self, current_frame_id):
         """Run bounded detection on skipped frames before the live frame."""
@@ -146,6 +166,74 @@ class WorkerMixin:
         if current_ball is None or not current_is_still_in_goal:
             return self.analyzer.confirm_recovered_goal(side, landing_timestamp)
         return False, False
+
+    def _schedule_retro_analysis(self, current_frame_id) -> bool:
+        """Move skipped raw frames to the independent retro worker."""
+        if self.retro_queue.full():
+            return False
+
+        skipped_frames = self._take_skipped_frames(current_frame_id)
+        if not skipped_frames:
+            return False
+
+        try:
+            self.retro_queue.put_nowait(skipped_frames)
+            return True
+        except Full:
+            # Normally impossible because only this analysis thread writes to
+            # the queue, but never lose the batch because of a race.
+            self._restore_skipped_frames(skipped_frames)
+            return False
+
+    def _drain_retro_results(self, current_frame) -> None:
+        """Apply retro detections in the stateful live-analysis thread."""
+        while True:
+            try:
+                recovered_frames = self.retro_result_queue.get_nowait()
+            except Empty:
+                return
+
+            recovered_goal = self._process_recovered_frames(
+                recovered_frames, current_frame
+            )
+            self._handle_goal(recovered_goal)
+
+    def retro_loop(self):
+        """Detect skipped frames without blocking live analysis."""
+        while not self.stop_event.is_set():
+            try:
+                skipped_frames = self.retro_queue.get(timeout=0.5)
+            except Empty:
+                continue
+
+            recovered = []
+            for skipped in skipped_frames:
+                if self.stop_event.is_set():
+                    break
+                try:
+                    recovered.append(
+                        self._prepare_and_detect(
+                            skipped,
+                            detector=self.retro_detector,
+                            dist=self.retro_dist,
+                        )
+                    )
+                except Exception as exc:
+                    print(f"[RETRO] Frame konnte nicht analysiert werden: {exc}")
+
+            self._retro_analysis_count += len(recovered)
+            if not recovered:
+                continue
+
+            # The live worker consumes results quickly. If it is temporarily
+            # busy, keep the newest completed batch and avoid blocking this
+            # worker or growing memory without limit.
+            try:
+                if self.retro_result_queue.full():
+                    self.retro_result_queue.get_nowait()
+                self.retro_result_queue.put_nowait(recovered)
+            except (Empty, Full):
+                pass
 
     def capture_loop(self):
         """Capture frames independently from the analysis worker.
@@ -269,10 +357,14 @@ class WorkerMixin:
                 # and recording may still reference the same image. Analysis
                 # receives an independent copy instead.
                 frame = copy.copy(source_frame)
-                frame.frame = source_frame.frame.copy()
 
                 stage_start = time.perf_counter()
-                frame.frame = to_bgr(frame.frame, self.dist.camera.pixel_format)
+                raw_image = source_frame.frame
+                converted = to_bgr(raw_image, self.dist.camera.pixel_format)
+                # Bayer conversion already allocates a new BGR image. Only
+                # copy formats where conversion returns the capture-owned
+                # array unchanged.
+                frame.frame = converted if converted is not raw_image else raw_image.copy()
                 stage_time["cvt"] += time.perf_counter() - stage_start
 
                 stage_start = time.perf_counter()
@@ -334,16 +426,16 @@ class WorkerMixin:
                 ) and self._has_skipped_frame_before(current_frame_id)
 
                 if should_recover:
-                    self._last_retro_frame_id = current_frame_id
-                    recovered_frames = self._reanalyze_skipped_frames(current_frame_id)
-                    stage_start = time.perf_counter()
-                    recovered_goal = self._process_recovered_frames(
-                        recovered_frames, frame
-                    )
-                    stage_time["analyze"] += time.perf_counter() - stage_start
-                    self._handle_goal(recovered_goal)
-                    if frame.ball is None:
-                        self._no_ball_live_frames = 1
+                    if self._schedule_retro_analysis(current_frame_id):
+                        self._last_retro_frame_id = current_frame_id
+                        if frame.ball is None:
+                            self._no_ball_live_frames = 1
+
+                # Retro detections arrive asynchronously, but all analyzer
+                # state is still updated by this live worker only. Keep this
+                # after the live gap calculation so late frames cannot alter
+                # the gap used for the current frame.
+                self._drain_retro_results(frame)
 
                 if frame.ball is not None and current_frame_id is not None:
                     self._last_visible_frame_id = current_frame_id
