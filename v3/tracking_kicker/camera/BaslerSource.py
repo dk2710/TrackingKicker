@@ -29,6 +29,7 @@ class BaslerSource:
     """
 
     RETRIEVE_TIMEOUT_MS = 100
+    STARTUP_SETTLE_SECONDS = 0.5
     RECOVERY_FAILURE_THRESHOLD = 5
     RECOVERY_MIN_FAILURE_DURATION_SECONDS = 2.0
     RECOVERY_INTERVAL_SECONDS = 5.0
@@ -120,12 +121,34 @@ class BaslerSource:
             camera.Open()
             self._configure_camera(camera)
             camera.StartGrabbing(self._grab_strategy())
+            self._settle_stream(camera)
             print(f"[CAMERA] Basler geoeffnet: {self._device_label(device_info)}")
             self._log_configuration(camera)
             return camera
         except Exception:
             self._stop_and_close(camera)
             raise
+
+    def _settle_stream(self, camera) -> None:
+        """Discard transient USB results before handing the source to workers."""
+        deadline = time.perf_counter() + self.STARTUP_SETTLE_SECONDS
+        while time.perf_counter() < deadline:
+            result = None
+            try:
+                result = camera.RetrieveResult(
+                    self.RETRIEVE_TIMEOUT_MS,
+                    pylon.TimeoutHandling_Return,
+                )
+            except Exception:
+                # The regular grab loop owns error reporting and recovery.
+                # Startup is deliberately best-effort.
+                return
+            finally:
+                if result is not None:
+                    try:
+                        result.Release()
+                    except Exception:
+                        pass
 
     def _configure_camera(self, camera) -> None:
         """Apply all settings that must be made while the camera is open."""
