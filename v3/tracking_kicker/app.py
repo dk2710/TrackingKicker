@@ -191,10 +191,18 @@ class KickerApp(
             self._load_or_calibrate()
             assert self.cfg is not None
 
-            self.t_api = threading.Thread(target=self.api_loop, daemon=True)
-            self.t_cam = threading.Thread(target=self.camera_loop, daemon=True)
-            self.t_proc = threading.Thread(target=self.processing_loop, daemon=True)
-            self.t_rec = threading.Thread(target=self.recording_loop, daemon=True)
+            self.t_api = threading.Thread(
+                target=self.api_loop, name="http-api", daemon=True
+            )
+            self.t_cam = threading.Thread(
+                target=self.capture_loop, name="camera-capture", daemon=True
+            )
+            self.t_proc = threading.Thread(
+                target=self.analysis_loop, name="frame-analysis", daemon=True
+            )
+            self.t_rec = threading.Thread(
+                target=self.recording_loop, name="raw-recording", daemon=True
+            )
 
             self.t_cam.start()
             self.t_proc.start()

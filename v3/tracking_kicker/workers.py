@@ -6,7 +6,7 @@ import threading
 import traceback
 from collections import deque
 from datetime import datetime
-from queue import Empty
+from queue import Empty, Full
 
 import numpy as np
 
@@ -147,7 +147,13 @@ class WorkerMixin:
             return self.analyzer.confirm_recovered_goal(side, landing_timestamp)
         return False, False
 
-    def camera_loop(self):
+    def capture_loop(self):
+        """Capture frames independently from the analysis worker.
+
+        The hand-off queue is deliberately lossy and non-blocking.  When
+        analysis is slower than acquisition, the oldest pending analysis frame
+        is discarded so this loop can immediately return to pypylon.
+        """
         dropped = 0
         while not self.stop_event.is_set():
             try:
@@ -173,15 +179,17 @@ class WorkerMixin:
                     ):
                         self.replay_buffer.popleft()
 
-                if self.frame_queue.full():
+                while not self.stop_event.is_set():
                     try:
-                        skipped = self.frame_queue.get_nowait()
+                        self.frame_queue.put_nowait(objframe)
+                        break
+                    except Full:
+                        try:
+                            skipped = self.frame_queue.get_nowait()
+                        except Empty:
+                            continue
                         self._remember_skipped_frame(skipped)
                         dropped += 1
-                    except Empty:
-                        pass
-
-                self.frame_queue.put(objframe)
 
                 if self.record_event.is_set():
                     try:
@@ -195,6 +203,13 @@ class WorkerMixin:
                 print(f"❌ Camera-Loop Fehler: {exc}")
                 traceback.print_exc()
                 time.sleep(0.05)
+
+    # Compatibility for callers that used the old worker name.
+    camera_loop = capture_loop
+
+    def analysis_loop(self):
+        """Run analysis independently from frame acquisition."""
+        self.processing_loop()
 
     def correction_loop(self):
         while not self.stop_event.is_set():
