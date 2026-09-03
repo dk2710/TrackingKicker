@@ -39,6 +39,10 @@ class BaslerSource:
         self.cfg = cfg
         self.camera: Optional[Any] = None
         self._camera_lock = threading.RLock()
+        # pypylon's USB StopGrabbing() can block inside the transport layer.
+        # Keep release() itself bounded so the application process can exit
+        # and the kernel can tear down the USB handle.
+        self._release_lock = threading.Lock()
         self._closed = False
 
         self._read_count = 0
@@ -413,13 +417,56 @@ class BaslerSource:
         return self.get_temperature()
 
     def release(self) -> None:
-        with self._camera_lock:
+        """Release the camera without allowing a stuck USB cleanup to hang app exit.
+
+        On this USB camera/transport combination, ``StopGrabbing`` has been
+        observed to block in the kernel after the first run.  Waiting for it
+        in the application's main thread leaves the process alive and keeps
+        the camera busy for the next start.  Marking the source closed first
+        prevents new grabs; cleanup then runs in a daemon thread and is given
+        only a short grace period.  If pylon remains stuck, process exit
+        releases the USB file descriptor.
+        """
+        with self._release_lock:
             if self._closed:
                 return
             self._closed = True
+            # The worker threads are stopped by KickerApp before release().
+            # Do not wait on _camera_lock here: an in-flight RetrieveResult()
+            # may be the operation that is holding it.
             camera = self.camera
             self.camera = None
-            self._stop_and_close(camera)
+
+        cleanup = threading.Thread(
+            target=self._release_camera_async,
+            args=(camera,),
+            name="basler-cleanup",
+            daemon=True,
+        )
+        cleanup.start()
+        cleanup.join(timeout=1.0)
+        if cleanup.is_alive():
+            print(
+                "[SHUTDOWN] Basler-Cleanup blockiert; "
+                "Prozess wird trotzdem beendet"
+            )
+        else:
             print("[SHUTDOWN] Basler sauber gestoppt und geschlossen")
+
+    def _release_camera_async(self, camera) -> None:
+        """Serialize cleanup with a possible in-flight grab/recovery."""
+        if camera is None:
+            return
+
+        # Avoid running StopGrabbing concurrently with RetrieveResult or the
+        # recovery path.  The timeout is intentionally bounded as this is a
+        # daemon cleanup thread.
+        if not self._camera_lock.acquire(timeout=1.0):
+            print("[SHUTDOWN] Kamera-Lock nicht freigegeben; Cleanup abgebrochen")
+            return
+        try:
+            self._stop_and_close(camera)
+        finally:
+            self._camera_lock.release()
 
     close = release

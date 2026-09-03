@@ -216,11 +216,9 @@ class KickerApp(
         finally:
             self.stop_event.set()
             self.record_event.clear()
-            try:
-                self.video.release()
-            except BaseException as exc:
-                print(f"[SHUTDOWN] Videoquelle konnte nicht sofort freigegeben werden: {exc}")
-
+            # Let the camera worker leave RetrieveResult() before releasing
+            # the source.  Basler USB cleanup is bounded inside BaslerSource;
+            # it must never block application shutdown indefinitely.
             self._join_threads()
             try:
                 self.video.release()
