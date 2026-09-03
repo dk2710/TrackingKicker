@@ -43,6 +43,8 @@ class BaslerSource:
         # Keep release() itself bounded so the application process can exit
         # and the kernel can tear down the USB handle.
         self._release_lock = threading.Lock()
+        self._cleanup_lock = threading.Lock()
+        self._pending_cleanup: Optional[threading.Thread] = None
         self._closed = False
 
         self._read_count = 0
@@ -344,23 +346,71 @@ class BaslerSource:
             print("[CAM-RECOVER] Kamera-Grab-Stream wird neu aufgebaut")
             old_camera = self.camera
             self.camera = None
-            self._stop_and_close(old_camera)
-            # Close() stops acquisition, while DestroyDevice() detaches the
-            # transport-layer device.  The explicit detach is important on
-            # USB: otherwise the old InstantCamera can keep the device node
-            # busy even though pylon reports it as closed.
-            del old_camera
-            gc.collect()
 
-            if self._closed:
+        # StopGrabbing() can block in the USB transport layer.  Recovery is
+        # called from the camera worker, so doing it inline would strand that
+        # worker and make a later shutdown impossible.  Do not reconnect
+        # while cleanup is still blocked: a second InstantCamera would only
+        # compete for the same USB handle.
+        if not self._cleanup_camera_bounded(old_camera):
+            print(
+                "[CAM-RECOVER] Altes Kamera-Handle blockiert; "
+                "Reconnect wird uebersprungen"
+            )
+            return
+
+        # Close() stops acquisition, while DestroyDevice() detaches the
+        # transport-layer device.  The explicit detach is important on USB:
+        # otherwise the old InstantCamera can keep the device node busy even
+        # though pylon reports it as closed.
+        del old_camera
+        gc.collect()
+
+        if self._closed:
+            return
+
+        try:
+            new_camera = self._open_camera()
+            with self._camera_lock:
+                if self._closed:
+                    discard_camera = True
+                else:
+                    self.camera = new_camera
+                    discard_camera = False
+            if discard_camera:
+                self._cleanup_camera_bounded(new_camera)
                 return
+            self._consecutive_grab_failures = 0
+            print("[CAM-RECOVER] Kamera neu verbunden")
+        except Exception as exc:
+            print(f"[CAM-RECOVER] Kamera-Reconnect fehlgeschlagen: {exc}")
 
-            try:
-                self.camera = self._open_camera()
-                self._consecutive_grab_failures = 0
-                print("[CAM-RECOVER] Kamera neu verbunden")
-            except Exception as exc:
-                print(f"[CAM-RECOVER] Kamera-Reconnect fehlgeschlagen: {exc}")
+    def _cleanup_camera_bounded(self, camera, timeout: float = 1.0) -> bool:
+        """Run pypylon cleanup without blocking an application worker."""
+        with self._cleanup_lock:
+            if self._pending_cleanup is not None:
+                if self._pending_cleanup.is_alive():
+                    return False
+                self._pending_cleanup = None
+
+            if camera is None:
+                return True
+
+            cleanup = threading.Thread(
+                target=self._stop_and_close,
+                args=(camera,),
+                name="basler-cleanup",
+                daemon=True,
+            )
+            self._pending_cleanup = cleanup
+            cleanup.start()
+        cleanup.join(timeout=max(0.0, float(timeout)))
+        finished = not cleanup.is_alive()
+        if finished:
+            with self._cleanup_lock:
+                if self._pending_cleanup is cleanup:
+                    self._pending_cleanup = None
+        return finished
 
     @staticmethod
     def _stop_and_close(camera) -> None:
