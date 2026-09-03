@@ -275,6 +275,11 @@ def main() -> None:
     if not _acquire_app_lock():
         sys.exit(1)
 
+    # Keep OpenCV from competing with pypylon/libusb for CPU time on the
+    # Orange Pi.  The camera worker remains responsive while the processing
+    # worker handles the latest frame.
+    cv2.setNumThreads(1)
+
     while True:
         source = None
         restart_requested = False
