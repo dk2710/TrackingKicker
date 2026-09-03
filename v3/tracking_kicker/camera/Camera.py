@@ -42,8 +42,14 @@ class Camera:
     # product stays comfortably below Linux' default usbfs memory budget.
     max_transfer_size: int = 262144
     num_max_queued_urbs: int = 16
-    receive_thread_priority_override: bool = True
+    # This priority setting belongs to pylon's socket driver and is not
+    # available for USB cameras.
+    receive_thread_priority_override: bool = False
     receive_thread_priority: int = 15
+    # Smooth the USB traffic without lowering 180 FPS. The configured ROI
+    # needs about 129 MB/s of BayerRG8 payload at 180 FPS; 150 MB/s leaves
+    # headroom for USB3 Vision overhead while avoiding a large burst.
+    device_link_throughput_limit: int = 150_000_000
 
     # Optionally reserve host CPUs for the pylon receive process. The process
     # is pinned only after the camera has opened, so affinity cannot interfere

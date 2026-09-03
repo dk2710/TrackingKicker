@@ -61,6 +61,12 @@ class BaslerSource:
         self._last_sequence = 0
         self._last_error = None
         self._last_error_time = 0.0
+        # A fatal USB transport error can leave the camera firmware or host
+        # controller unable to answer a new pylon open request. Reopening the
+        # same dead stream in a loop only makes that state worse. The source
+        # therefore reports the fault and waits for the next application
+        # start instead of repeatedly claiming the device.
+        self._transport_faulted = False
         self._read_count = 0
         self._read_failures = 0
         self._read_log_time = time.perf_counter()
@@ -271,14 +277,26 @@ class BaslerSource:
         return forced
 
     def _restart_process(self, reason: str) -> None:
-        if self._closed:
+        if self._closed or self._transport_faulted:
             return
+
+        if self._fatal_state.value:
+            self._transport_faulted = True
+            print(
+                "[CAM-RECOVER] USB-Transportfehler erkannt; "
+                "kein weiterer pylon-Reconnect in diesem Prozess"
+            )
+            # Give StopGrabbing/Close enough time to finish. A hard kill is
+            # the last resort only when the USB driver itself is blocked.
+            self._stop_process(timeout=5.0)
+            return
+
         now = time.monotonic()
         if now < self._next_restart_time:
             return
 
         print(f"[CAM-RECOVER] Basler-Prozess wird neu gestartet: {reason}")
-        self._stop_process(restart=True)
+        self._stop_process(timeout=5.0, restart=True)
         self._last_sequence = int(self._latest_sequence.value)
         self._last_frame_time = now
         self._next_restart_time = now + self.RESTART_BACKOFF_SECONDS
@@ -375,6 +393,10 @@ class BaslerSource:
         startup_state = int(self._startup_state.value)
         now = time.monotonic()
 
+        if self._transport_faulted:
+            self._read_failures += 1
+            return False, None
+
         if startup_state < 0 or process is None or not process.is_alive():
             self._restart_process("Capture-Prozess beendet")
             self._read_failures += 1
@@ -440,7 +462,7 @@ class BaslerSource:
             self._closed = True
             self._stop_event.set()
 
-        self._stop_process(timeout=1.5)
+        self._stop_process(timeout=5.0)
         self._close_event_queue()
         self._restore_host_affinity()
         print("[SHUTDOWN] Basler-Capture-Prozess beendet")

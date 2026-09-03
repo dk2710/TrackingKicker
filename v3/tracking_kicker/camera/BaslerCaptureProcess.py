@@ -167,6 +167,27 @@ def _configure_camera(camera, cfg) -> None:
     _set_feature(camera, "OffsetX", int(cfg.offset_x), required=True)
     _set_feature(camera, "OffsetY", int(cfg.offset_y), required=True)
 
+    # Spread the same 180 FPS payload over the frame period. This reduces
+    # burst pressure on host controllers that are prone to USB3 Vision
+    # EPIPE/EPROTO errors while the analysis is running. The feature is
+    # optional because it is not exposed by every transport/camera.
+    throughput_limit = int(
+        getattr(cfg, "device_link_throughput_limit", 0) or 0
+    )
+    if throughput_limit > 0:
+        _set_feature(
+            camera,
+            "DeviceLinkThroughputLimitMode",
+            "On",
+            required=False,
+        )
+        _set_feature(
+            camera,
+            "DeviceLinkThroughputLimit",
+            throughput_limit,
+            required=False,
+        )
+
     max_buffers = max(1, int(getattr(cfg, "max_num_buffer", 256)))
     try:
         camera.MaxNumBuffer = max_buffers
