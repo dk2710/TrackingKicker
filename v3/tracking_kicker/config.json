@@ -24,7 +24,7 @@
     "offset_x": 240,
     "exposure_time": 2000.0,
     "gain": 10.0,
-    "grab_strategy_latest_only": false,
+    "grab_strategy_latest_only": true,
     "serial_number": "40719659",
     "max_num_buffer": 256,
     "pixel_format": "BayerRG8",
