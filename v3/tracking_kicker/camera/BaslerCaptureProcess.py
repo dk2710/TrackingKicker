@@ -42,6 +42,15 @@ def _set_feature(camera, name: str, value, *, required: bool) -> bool:
             node.Value = value
         return True
     except Exception as exc:
+        # Some USB camera states expose an already-correct value as read-only
+        # during a reconnect. In that case there is nothing to change. This
+        # is especially common for AcquisitionMode after a transport fault.
+        try:
+            current = _get_feature(camera, name)
+            if current is not None and str(current) == str(value):
+                return True
+        except Exception:
+            pass
         message = f"{name}={value!r} konnte nicht gesetzt werden: {exc}"
         if required:
             raise RuntimeError(message) from exc
@@ -139,6 +148,15 @@ def _open_camera(cfg, pylon):
     factory = pylon.TlFactory.GetInstance()
     device_info = _select_device_info(factory, cfg)
     camera = pylon.InstantCamera(factory.CreateDevice(device_info))
+    # Do not let pylon's default AcquireContinuousConfiguration write
+    # AcquisitionMode during OnOpened. After a USB transport fault the node
+    # can already be Continuous but temporarily read-only; our configuration
+    # below can then safely accept that existing value.
+    camera.RegisterConfiguration(
+        None,
+        pylon.RegistrationMode_ReplaceAll,
+        pylon.Cleanup_None,
+    )
     camera.Open()
     _configure_camera(camera, cfg)
     strategy = (
