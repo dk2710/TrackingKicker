@@ -29,7 +29,7 @@ class BaslerSource:
     """
 
     RETRIEVE_TIMEOUT_MS = 100
-    STARTUP_SETTLE_SECONDS = 0.5
+    STARTUP_SETTLE_SECONDS = 2.0
     RECOVERY_FAILURE_THRESHOLD = 5
     RECOVERY_MIN_FAILURE_DURATION_SECONDS = 2.0
     RECOVERY_INTERVAL_SECONDS = 5.0
@@ -141,8 +141,9 @@ class BaslerSource:
                 )
             except Exception:
                 # The regular grab loop owns error reporting and recovery.
-                # Startup is deliberately best-effort.
-                return
+                # Startup is deliberately best-effort; keep settling so a
+                # transient USB result does not reach the worker.
+                time.sleep(0.01)
             finally:
                 if result is not None:
                     try:
