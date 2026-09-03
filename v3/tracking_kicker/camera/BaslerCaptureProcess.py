@@ -9,7 +9,6 @@ messages never travel through that high-rate path.
 
 from __future__ import annotations
 
-import os
 import queue
 import time
 from typing import Any
@@ -393,10 +392,12 @@ def run_basler_capture_process(
                         "fatal",
                         "Dauerhafter Basler-Read-Fehler; Capture-Prozess wird beendet",
                     )
-                    # Do not call StopGrabbing here. If pylon is blocked in
-                    # the transport layer, the parent must be able to kill
-                    # this process and let the OS release the USB handle.
-                    os._exit(2)
+                    # Leave the grab loop normally. This lets the finally
+                    # block release the current GrabResult and lets the
+                    # process-level cleanup try StopGrabbing/Close. The
+                    # parent has a bounded join and will terminate/kill us if
+                    # pylon blocks during that cleanup.
+                    break
                 time.sleep(0.005)
             finally:
                 if grab_result is not None:
