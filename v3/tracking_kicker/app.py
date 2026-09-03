@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 from collections import deque
+from math import ceil
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any, Dict, Optional
@@ -135,8 +136,25 @@ class KickerApp(
         self.stop_event = threading.Event()
         self.record_event = threading.Event()
 
-        # Raw replay buffer and bounded retro-analysis buffer.
-        self.replay_buffer = deque(maxlen=int(240 * config.replay_seconds))
+        # Keep the complete raw window needed for the one-second goal NPZ,
+        # but do not retain every 180-FPS image for the visual replay. The
+        # replay encoder only emits GOAL_VIDEO_FPS frames anyway. Retaining
+        # hundreds of full-resolution arrays created avoidable DDR traffic
+        # next to the USB receive process.
+        camera_fps = float(
+            getattr(getattr(config, "camera", None), "force_fps", 180) or 180
+        )
+        pre_frames = max(
+            2,
+            int(ceil(camera_fps * GOAL_PRE_NPZ_DURATION_SECONDS)) + 2,
+        )
+        replay_frames = max(
+            GOAL_VIDEO_FRAME_LIMIT + 4,
+            int(ceil(GOAL_VIDEO_FPS * GOAL_VIDEO_DURATION_SECONDS)) + 4,
+        )
+        self.goal_pre_buffer = deque(maxlen=pre_frames)
+        self.replay_buffer = deque(maxlen=replay_frames)
+        self._last_replay_sample_timestamp = 0.0
         self.replay_lock = threading.Lock()
         self.history_frames = deque()
         self.skipped_frame_lock = threading.Lock()
@@ -319,7 +337,15 @@ def main() -> None:
     # Keep the value configurable because the useful setting depends on the
     # host CPU and should be measured together with the camera stream.
     try:
-        opencv_threads = max(1, int(getattr(config, "opencv_threads", 8) or 8))
+        opencv_threads = max(
+            1,
+            int(
+                os.environ.get(
+                    "TK_OPENCV_THREADS",
+                    str(getattr(config, "opencv_threads", 8) or 8),
+                )
+            ),
+        )
     except (TypeError, ValueError):
         opencv_threads = 8
     cv2.setNumThreads(opencv_threads)

@@ -30,14 +30,18 @@ class Camera:
 
     # Optional stable device selection and host buffer configuration
     serial_number: str | None = None
-    max_num_buffer: int = 256
+    # LatestImageOnly already drops stale frames, so a very large host pool
+    # only adds memory pressure during high-rate acquisition.
+    max_num_buffer: int = 32
     pixel_format: str = "BayerRG8"
 
     # pylon USB stream transport.  These are the values recommended by
     # Basler for high-throughput USB3 acquisition and are kept configurable
     # because the usable limits depend on the host controller.
-    max_transfer_size: int = 1048568
-    num_max_queued_urbs: int = 64
+    # Moderate DMA transfers are more stable on the RK3588 USB host. Their
+    # product stays comfortably below Linux' default usbfs memory budget.
+    max_transfer_size: int = 262144
+    num_max_queued_urbs: int = 16
     receive_thread_priority_override: bool = True
     receive_thread_priority: int = 15
 

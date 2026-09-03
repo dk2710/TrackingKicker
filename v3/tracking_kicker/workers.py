@@ -297,15 +297,23 @@ class WorkerMixin:
                 objframe.frame_id = self._frame_sequence
 
                 with self.replay_lock:
-                    self.replay_buffer.append(
+                    # The pre-goal NPZ needs the complete raw stream for one
+                    # second. The visual replay only needs its target output
+                    # rate, so sampling it avoids retaining hundreds of
+                    # full-size arrays at 180 FPS.
+                    self.goal_pre_buffer.append(
                         (objframe.frame, objframe.timestamp)
                     )
-                    while (
-                        self.replay_buffer
-                        and objframe.timestamp - self.replay_buffer[0][1]
-                        > GOAL_VIDEO_DURATION_SECONDS
+                    replay_interval = 1.0 / max(1.0, float(GOAL_VIDEO_FPS))
+                    if (
+                        self._last_replay_sample_timestamp <= 0.0
+                        or objframe.timestamp - self._last_replay_sample_timestamp
+                        >= replay_interval
                     ):
-                        self.replay_buffer.popleft()
+                        self.replay_buffer.append(
+                            (objframe.frame, objframe.timestamp)
+                        )
+                        self._last_replay_sample_timestamp = objframe.timestamp
 
                 while not self.stop_event.is_set():
                     try:
