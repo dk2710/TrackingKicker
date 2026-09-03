@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import queue
+import signal
 import time
 from typing import Any
 
@@ -386,6 +387,18 @@ def run_basler_capture_process(
     events,
 ) -> None:
     """Open pylon and publish frames until stopped or fatally disconnected."""
+    # The terminal sends SIGINT to the complete foreground process group.
+    # Only the application parent should handle that signal. If it reaches
+    # this child while pylon is receiving or publishing a frame, Python raises
+    # KeyboardInterrupt in the middle of the USB cleanup path and the parent
+    # has to hard-kill the process. That can leave a USB3 Vision camera in a
+    # bad state for the next start. The shared stop event is the safe shutdown
+    # channel for this child.
+    if hasattr(signal, "SIGINT"):
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
     camera: Any = None
     try:
         from pypylon import pylon
