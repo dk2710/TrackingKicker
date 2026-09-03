@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib.util
 import multiprocessing as mp
+import os
 import queue
 import threading
 import time
@@ -28,7 +29,9 @@ class BaslerSource:
     RING_SLOTS = 4
     SLOT_BYTES_PER_PIXEL = 8
     STARTUP_TIMEOUT_SECONDS = 10.0
-    RESTART_BACKOFF_SECONDS = 1.0
+    # Give pylon/the USB transport a moment to release a failed stream before
+    # the replacement process tries to open the same device again.
+    RESTART_BACKOFF_SECONDS = 2.0
     FRAME_STALL_SECONDS = 1.0
 
     def __init__(self, cfg: Camera):
@@ -41,7 +44,13 @@ class BaslerSource:
 
         self.cfg = cfg
         self.fps = float(getattr(cfg, "force_fps", 0) or 0)
-        self._ctx = mp.get_context("spawn")
+        # On Linux the parent has not imported pypylon and the source is
+        # created before the worker threads start, so fork avoids re-importing
+        # the complete OpenCV/Flask application for every capture process.
+        # Windows has no fork and keeps the safe spawn behavior.
+        start_methods = mp.get_all_start_methods()
+        method = "fork" if os.name == "posix" and "fork" in start_methods else "spawn"
+        self._ctx = mp.get_context(method)
         self._process_lock = threading.RLock()
         self._release_lock = threading.Lock()
         self._closed = False
