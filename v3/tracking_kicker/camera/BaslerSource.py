@@ -55,6 +55,7 @@ class BaslerSource:
         self._release_lock = threading.Lock()
         self._closed = False
         self._process = None
+        self._original_affinity = None
         self._next_restart_time = 0.0
         self._last_frame_time = time.monotonic()
         self._last_sequence = 0
@@ -99,11 +100,52 @@ class BaslerSource:
             self._closed = True
             self._stop_process()
             self._close_event_queue()
+            self._restore_host_affinity()
             raise
 
     # ------------------------------------------------------------------
     # Child lifecycle
     # ------------------------------------------------------------------
+
+    def _prepare_capture_cpu(self):
+        """Temporarily add the reserved CPU while spawning the child."""
+        if not getattr(self.cfg, "reserve_capture_cpu", True):
+            return None
+        capture_cpu = getattr(self.cfg, "capture_cpu", None)
+        if capture_cpu is None or not hasattr(os, "sched_getaffinity"):
+            return None
+        try:
+            capture_cpu = int(capture_cpu)
+            current = set(os.sched_getaffinity(0))
+            expanded = current | {capture_cpu}
+            if expanded != current:
+                os.sched_setaffinity(0, expanded)
+            if self._original_affinity is None:
+                self._original_affinity = set(current)
+            return current, capture_cpu
+        except (OSError, TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _restore_parent_after_spawn(affinity_state) -> None:
+        if affinity_state is None:
+            return
+        current, capture_cpu = affinity_state
+        remaining = current - {capture_cpu}
+        if not remaining:
+            return
+        try:
+            os.sched_setaffinity(0, remaining)
+        except OSError:
+            pass
+
+    def _restore_host_affinity(self) -> None:
+        if self._original_affinity is None or not hasattr(os, "sched_setaffinity"):
+            return
+        try:
+            os.sched_setaffinity(0, self._original_affinity)
+        except OSError:
+            pass
 
     def _start_process(self, *, wait: bool) -> None:
         with self._process_lock:
@@ -140,7 +182,17 @@ class BaslerSource:
                 name="basler-capture-process",
                 daemon=True,
             )
-            process.start()
+            affinity_state = self._prepare_capture_cpu()
+            try:
+                process.start()
+            except Exception:
+                if affinity_state is not None:
+                    try:
+                        os.sched_setaffinity(0, affinity_state[0])
+                    except OSError:
+                        pass
+                raise
+            self._restore_parent_after_spawn(affinity_state)
             self._process = process
 
         if not wait:
@@ -385,6 +437,7 @@ class BaslerSource:
 
         self._stop_process(timeout=1.5)
         self._close_event_queue()
+        self._restore_host_affinity()
         print("[SHUTDOWN] Basler-Capture-Prozess beendet")
 
     close = release

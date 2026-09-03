@@ -41,6 +41,12 @@ class Camera:
     receive_thread_priority_override: bool = True
     receive_thread_priority: int = 15
 
+    # Reserve one host CPU for the pylon receive process.  The process is
+    # pinned only after the camera has opened, so CPU affinity cannot interfere
+    # with pylon's device initialization.
+    capture_cpu: int | None = 7
+    reserve_capture_cpu: bool = True
+
     # Lens correction
     k1: float = 0.00
     k2: float = 0.05
