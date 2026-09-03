@@ -115,14 +115,19 @@ class BaslerSource:
         if capture_cpu is None or not hasattr(os, "sched_getaffinity"):
             return None
         try:
-            capture_cpu = int(capture_cpu)
+            values = (
+                capture_cpu
+                if isinstance(capture_cpu, (list, tuple, set))
+                else (capture_cpu,)
+            )
+            capture_cpus = {int(cpu) for cpu in values}
             current = set(os.sched_getaffinity(0))
-            expanded = current | {capture_cpu}
+            expanded = current | capture_cpus
             if expanded != current:
                 os.sched_setaffinity(0, expanded)
             if self._original_affinity is None:
                 self._original_affinity = set(current)
-            return current, capture_cpu
+            return current, capture_cpus
         except (OSError, TypeError, ValueError):
             return None
 
@@ -130,8 +135,8 @@ class BaslerSource:
     def _restore_parent_after_spawn(affinity_state) -> None:
         if affinity_state is None:
             return
-        current, capture_cpu = affinity_state
-        remaining = current - {capture_cpu}
+        current, capture_cpus = affinity_state
+        remaining = current - capture_cpus
         if not remaining:
             return
         try:

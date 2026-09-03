@@ -41,10 +41,10 @@ class Camera:
     receive_thread_priority_override: bool = True
     receive_thread_priority: int = 15
 
-    # Reserve one host CPU for the pylon receive process.  The process is
-    # pinned only after the camera has opened, so CPU affinity cannot interfere
+    # Optionally reserve host CPUs for the pylon receive process. The process
+    # is pinned only after the camera has opened, so affinity cannot interfere
     # with pylon's device initialization.
-    capture_cpu: int | None = 7
+    capture_cpu: int | list[int] | None = 7
     # Keep pylon's USB receive threads free to use all available CPUs by
     # default. Pinning the complete process to one core can starve the USB3
     # transport at high frame rates; enable it only for a measured setup.

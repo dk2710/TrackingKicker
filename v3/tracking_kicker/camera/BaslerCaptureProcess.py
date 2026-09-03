@@ -23,19 +23,36 @@ RETRIEVE_TIMEOUT_MS = 100
 STARTUP_SETTLE_SECONDS = 2.0
 
 
+def _capture_cpu_set(cfg) -> set[int]:
+    value = getattr(cfg, "capture_cpu", None)
+    if value is None:
+        return set()
+    values = value if isinstance(value, (list, tuple, set)) else (value,)
+    try:
+        return {int(cpu) for cpu in values}
+    except (TypeError, ValueError):
+        return set()
+
+
 def _pin_capture_cpu(cfg) -> None:
     """Pin the already-started pylon process to the reserved CPU."""
-    capture_cpu = getattr(cfg, "capture_cpu", None)
+    capture_cpus = _capture_cpu_set(cfg)
     if (
-        capture_cpu is None
+        not capture_cpus
         or not getattr(cfg, "reserve_capture_cpu", True)
         or not hasattr(os, "sched_setaffinity")
     ):
         return
     try:
-        cpu = int(capture_cpu)
-        os.sched_setaffinity(0, {cpu})
-        print(f"[CAMERA] Capture-CPU reserviert: {cpu}", flush=True)
+        available = set(os.sched_getaffinity(0))
+        capture_cpus &= available
+        if not capture_cpus:
+            return
+        os.sched_setaffinity(0, capture_cpus)
+        print(
+            f"[CAMERA] Capture-CPUs reserviert: {sorted(capture_cpus)}",
+            flush=True,
+        )
     except (OSError, TypeError, ValueError) as exc:
         print(f"[CAMERA-WARN] Capture-CPU nicht setzbar: {exc}", flush=True)
 
