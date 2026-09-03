@@ -9,7 +9,6 @@ messages never travel through that high-rate path.
 
 from __future__ import annotations
 
-import os
 import queue
 import time
 from typing import Any
@@ -21,23 +20,6 @@ FAILURE_THRESHOLD = 5
 FAILURE_MIN_DURATION_SECONDS = 0.5
 RETRIEVE_TIMEOUT_MS = 100
 STARTUP_SETTLE_SECONDS = 2.0
-
-
-def _pin_capture_cpu(cfg) -> None:
-    """Pin pylon's process to the CPU reserved by the parent."""
-    capture_cpu = getattr(cfg, "capture_cpu", None)
-    if (
-        capture_cpu is None
-        or not getattr(cfg, "reserve_capture_cpu", True)
-        or not hasattr(os, "sched_setaffinity")
-    ):
-        return
-    try:
-        cpu = int(capture_cpu)
-        os.sched_setaffinity(0, {cpu})
-        print(f"[CAMERA] Capture-CPU reserviert: {cpu}", flush=True)
-    except (OSError, TypeError, ValueError) as exc:
-        print(f"[CAMERA-WARN] Capture-CPU nicht setzbar: {exc}", flush=True)
 
 
 def _emit(events, kind: str, message: str) -> None:
@@ -371,7 +353,6 @@ def run_basler_capture_process(
     """Open pylon and publish frames until stopped or fatally disconnected."""
     camera: Any = None
     try:
-        _pin_capture_cpu(cfg)
         from pypylon import pylon
 
         camera, device_info = _open_camera(cfg, pylon)

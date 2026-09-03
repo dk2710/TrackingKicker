@@ -41,11 +41,6 @@ class Camera:
     receive_thread_priority_override: bool = True
     receive_thread_priority: int = 15
 
-    # Keep one host CPU available for the pylon receive process.  This is
-    # useful for high-rate USB3 streams when OpenCV is using the other cores.
-    capture_cpu: int | None = 0
-    reserve_capture_cpu: bool = True
-
     # Lens correction
     k1: float = 0.00
     k2: float = 0.05

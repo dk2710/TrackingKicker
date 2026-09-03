@@ -44,19 +44,17 @@ class BaslerSource:
 
         self.cfg = cfg
         self.fps = float(getattr(cfg, "force_fps", 0) or 0)
-        # On Linux the parent has not imported pypylon and the source is
-        # created before the worker threads start, so fork avoids re-importing
-        # the complete OpenCV/Flask application for every capture process.
-        # Windows has no fork and keeps the safe spawn behavior.
+        # pypylon and OpenCV both own native state and worker threads.  A fork
+        # can inherit that state in an unsafe half-initialized condition once
+        # the analysis workers start.  Spawn gives the capture process a clean
+        # interpreter on every platform.
         start_methods = mp.get_all_start_methods()
-        method = "fork" if os.name == "posix" and "fork" in start_methods else "spawn"
+        method = "spawn" if "spawn" in start_methods else start_methods[0]
         self._ctx = mp.get_context(method)
         self._process_lock = threading.RLock()
         self._release_lock = threading.Lock()
         self._closed = False
         self._process = None
-        self._original_affinity = None
-        self._capture_cpu_reserved = False
         self._next_restart_time = 0.0
         self._last_frame_time = time.monotonic()
         self._last_sequence = 0
@@ -101,60 +99,11 @@ class BaslerSource:
             self._closed = True
             self._stop_process()
             self._close_event_queue()
-            self._restore_host_affinity()
             raise
 
     # ------------------------------------------------------------------
     # Child lifecycle
     # ------------------------------------------------------------------
-
-    def _prepare_capture_cpu(self):
-        """Temporarily include the capture CPU while spawning the child.
-
-        The child pins itself to this CPU.  The parent is moved off that CPU
-        immediately after ``Process.start`` so OpenCV cannot compete with
-        pylon's receive path.  Linux may restrict the available CPU set (for
-        example in a service cgroup), therefore affinity is best effort.
-        """
-        if not getattr(self.cfg, "reserve_capture_cpu", True):
-            return None
-        capture_cpu = getattr(self.cfg, "capture_cpu", None)
-        if capture_cpu is None or not hasattr(os, "sched_getaffinity"):
-            return None
-        try:
-            capture_cpu = int(capture_cpu)
-            current = set(os.sched_getaffinity(0))
-            if capture_cpu not in current:
-                expanded = current | {capture_cpu}
-                os.sched_setaffinity(0, expanded)
-                current = expanded
-            if self._original_affinity is None:
-                self._original_affinity = set(current)
-            return current, capture_cpu
-        except (OSError, TypeError, ValueError):
-            return None
-
-    def _restore_parent_after_spawn(self, affinity_state) -> None:
-        if affinity_state is None:
-            return
-        current, capture_cpu = affinity_state
-        remaining = current - {capture_cpu}
-        if not remaining:
-            return
-        try:
-            os.sched_setaffinity(0, remaining)
-            self._capture_cpu_reserved = True
-        except OSError:
-            pass
-
-    def _restore_host_affinity(self) -> None:
-        if self._original_affinity is None or not hasattr(os, "sched_setaffinity"):
-            return
-        try:
-            os.sched_setaffinity(0, self._original_affinity)
-        except OSError:
-            pass
-        self._capture_cpu_reserved = False
 
     def _start_process(self, *, wait: bool) -> None:
         with self._process_lock:
@@ -191,17 +140,7 @@ class BaslerSource:
                 name="basler-capture-process",
                 daemon=True,
             )
-            affinity_state = self._prepare_capture_cpu()
-            try:
-                process.start()
-            except Exception:
-                if affinity_state is not None:
-                    try:
-                        os.sched_setaffinity(0, affinity_state[0])
-                    except OSError:
-                        pass
-                raise
-            self._restore_parent_after_spawn(affinity_state)
+            process.start()
             self._process = process
 
         if not wait:
@@ -446,7 +385,6 @@ class BaslerSource:
 
         self._stop_process(timeout=1.5)
         self._close_event_queue()
-        self._restore_host_affinity()
         print("[SHUTDOWN] Basler-Capture-Prozess beendet")
 
     close = release
