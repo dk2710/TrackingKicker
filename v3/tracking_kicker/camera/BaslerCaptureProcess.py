@@ -122,6 +122,39 @@ def _device_label(device_info) -> str:
     return " / ".join(values) or "unbekanntes Basler-Geraet"
 
 
+def _device_property(device_info, name: str):
+    """Read an optional pylon device-info property across pylon versions."""
+    try:
+        result = device_info.GetPropertyValue(name)
+        if isinstance(result, (tuple, list)) and len(result) >= 2:
+            available, value = result[0], result[1]
+            return value if available else None
+        return result
+    except Exception:
+        return None
+
+
+def _validate_usb_link_speed(device_info, cfg) -> None:
+    """Reject a USB2 fallback before it can corrupt a 180 FPS stream."""
+    requested_fps = float(getattr(cfg, "force_fps", 0) or 0)
+    if requested_fps < 120 or str(_device_property(device_info, "TLType")) != "U3V":
+        return
+
+    version = _device_property(device_info, "UsbPortVersionBcd")
+    if version is None:
+        return
+    try:
+        version_number = int(str(version), 0)
+    except (TypeError, ValueError):
+        return
+    if version_number < 0x300:
+        raise RuntimeError(
+            "Basler-Kamera ist nur mit USB2 ausgehandelt "
+            f"(UsbPortVersionBcd={version}); 180 FPS erfordern eine "
+            "USB3-SuperSpeed-Verbindung. Stream wird nicht gestartet."
+        )
+
+
 def _select_device_info(factory, cfg):
     devices = list(factory.EnumerateDevices())
     if not devices:
@@ -131,10 +164,13 @@ def _select_device_info(factory, cfg):
 
     wanted_serial = str(getattr(cfg, "serial_number", "") or "").strip()
     if not wanted_serial:
-        return devices[0]
+        selected = devices[0]
+        _validate_usb_link_speed(selected, cfg)
+        return selected
 
     for device_info in devices:
         if _device_serial(device_info) == wanted_serial:
+            _validate_usb_link_speed(device_info, cfg)
             return device_info
 
     available = ", ".join(_device_serial(info) for info in devices)
