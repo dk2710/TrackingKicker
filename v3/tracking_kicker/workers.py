@@ -17,8 +17,10 @@ from .runtime import (
     GOAL_VIDEO_DURATION_SECONDS,
     GOAL_VIDEO_FPS,
     RETRO_BUFFER_MAX_FRAMES,
+    RETRO_BALL_LOSS_SECONDS,
     RETRO_MAX_REANALYZE_FRAMES,
-    RETRO_TRIGGER_NO_BALL_FRAMES,
+    RETRO_REARM_MIN_BALL_DETECTIONS,
+    RETRO_REARM_WINDOW_SECONDS,
     HEADLESS,
 )
 from .ui.opencv_gui import (
@@ -69,22 +71,14 @@ class WorkerMixin:
         )
         return selected
 
-    def _has_skipped_frame_before(self, frame_id) -> bool:
-        with self.skipped_frame_lock:
-            if frame_id is None:
-                return bool(self.skipped_frame_buffer)
-            return any(
-                getattr(skipped, "frame_id", frame_id) <= frame_id
-                for skipped in self.skipped_frame_buffer
-            )
-
     def _prepare_and_detect(self, source_frame, *, detector=None, dist=None):
         """Copy, correct and detect one raw frame from the replay buffer."""
         detector = self.detector if detector is None else detector
         dist = self.dist if dist is None else dist
         frame = copy.copy(source_frame)
-        frame.frame = source_frame.frame.copy()
-        frame.frame = to_bgr(frame.frame, dist.camera.pixel_format)
+        raw_image = source_frame.frame
+        converted = to_bgr(raw_image, dist.camera.pixel_format)
+        frame.frame = converted if converted is not raw_image else raw_image.copy()
         frame.frame = dist.apply(frame.frame)
         detector.detect(frame)
         return frame
@@ -106,22 +100,6 @@ class WorkerMixin:
                 combined[-RETRO_BUFFER_MAX_FRAMES:],
                 maxlen=RETRO_BUFFER_MAX_FRAMES,
             )
-
-    def _reanalyze_skipped_frames(self, current_frame_id):
-        """Run bounded detection on skipped frames before the live frame."""
-        skipped_frames = self._take_skipped_frames(current_frame_id)
-        if not skipped_frames:
-            return []
-
-        recovered = []
-        for skipped in skipped_frames:
-            try:
-                recovered.append(self._prepare_and_detect(skipped))
-            except Exception as exc:
-                print(f"[RETRO] Frame konnte nicht analysiert werden: {exc}")
-
-        self._retro_analysis_count += len(recovered)
-        return recovered
 
     def _process_recovered_frames(self, recovered_frames, current_frame):
         """Use recovered positions for speed and register a goal candidate."""
@@ -184,6 +162,63 @@ class WorkerMixin:
             # the queue, but never lose the batch because of a race.
             self._restore_skipped_frames(skipped_frames)
             return False
+
+    def _update_ball_episode(self, frame) -> None:
+        """Track whether a new ball episode has armed retro analysis."""
+        timestamp = float(getattr(frame, "timestamp", time.perf_counter()))
+
+        if (
+            self._retro_triggered_for_episode
+            and self._last_ball_seen_timestamp is not None
+            and timestamp - self._last_ball_seen_timestamp
+            >= RETRO_BALL_LOSS_SECONDS
+        ):
+            self._waiting_for_new_ball = True
+
+        if frame.ball is None:
+            return
+
+        if self._retro_triggered_for_episode and not self._waiting_for_new_ball:
+            # The same ball episode is still active. Do not re-arm retro just
+            # because the ball remains visible after a goal-triggered batch.
+            self._last_ball_seen_timestamp = timestamp
+            return
+
+        self._last_ball_seen_timestamp = timestamp
+        self._recent_ball_detections.append(timestamp)
+        cutoff = timestamp - RETRO_REARM_WINDOW_SECONDS
+        while (
+            self._recent_ball_detections
+            and self._recent_ball_detections[0] < cutoff
+        ):
+            self._recent_ball_detections.popleft()
+
+        if len(self._recent_ball_detections) >= RETRO_REARM_MIN_BALL_DETECTIONS:
+            self._retro_armed = True
+            self._retro_triggered_for_episode = False
+            self._waiting_for_new_ball = False
+
+    def _retro_loss_elapsed(self, frame) -> bool:
+        """Return whether an armed ball episode has been absent for 0.5 s."""
+        if not self._retro_armed or self._last_ball_seen_timestamp is None:
+            return False
+
+        timestamp = float(getattr(frame, "timestamp", time.perf_counter()))
+        return timestamp - self._last_ball_seen_timestamp >= RETRO_BALL_LOSS_SECONDS
+
+    def _start_retro_if_possible(self, current_frame_id, reason: str) -> bool:
+        """Start one retro batch and disarm until a new ball episode."""
+        if self._retro_triggered_for_episode:
+            return False
+        if not self._schedule_retro_analysis(current_frame_id):
+            return False
+
+        self._retro_armed = False
+        self._retro_triggered_for_episode = True
+        self._waiting_for_new_ball = False
+        self._recent_ball_detections.clear()
+        print(f"[RETRO] Einmalige Nachanalyse gestartet ({reason})")
+        return True
 
     def _drain_retro_results(self, current_frame) -> None:
         """Apply retro detections in the stateful live-analysis thread."""
@@ -378,58 +413,9 @@ class WorkerMixin:
                 self.detector.detect(frame)
                 stage_time["detect"] += time.perf_counter() - stage_start
 
-                no_ball_before = self._no_ball_live_frames
                 current_frame_id = getattr(frame, "frame_id", None)
-                raw_frame_gap = None
-                if (
-                    current_frame_id is not None
-                    and self._last_visible_frame_id is not None
-                ):
-                    raw_frame_gap = current_frame_id - self._last_visible_frame_id
-
-                if frame.ball is None:
-                    self._no_ball_live_frames += 1
-                else:
-                    self._no_ball_live_frames = 0
-
-                recover_due_to_missing_ball = (
-                    frame.ball is None
-                    and (
-                        self._no_ball_live_frames >= RETRO_TRIGGER_NO_BALL_FRAMES
-                        or (
-                            raw_frame_gap is not None
-                            and raw_frame_gap >= RETRO_TRIGGER_NO_BALL_FRAMES
-                            and (
-                                self._last_retro_frame_id is None
-                                or current_frame_id - self._last_retro_frame_id
-                                >= RETRO_TRIGGER_NO_BALL_FRAMES
-                            )
-                        )
-                    )
-                )
-                recover_due_to_ball_return = (
-                    frame.ball is not None
-                    and (
-                        no_ball_before >= 3
-                        or (
-                            raw_frame_gap is not None
-                            and raw_frame_gap >= 3
-                            and (
-                                self._last_retro_frame_id is None
-                                or current_frame_id - self._last_retro_frame_id >= 3
-                            )
-                        )
-                    )
-                )
-                should_recover = (
-                    recover_due_to_missing_ball or recover_due_to_ball_return
-                ) and self._has_skipped_frame_before(current_frame_id)
-
-                if should_recover:
-                    if self._schedule_retro_analysis(current_frame_id):
-                        self._last_retro_frame_id = current_frame_id
-                        if frame.ball is None:
-                            self._no_ball_live_frames = 1
+                self._update_ball_episode(frame)
+                loss_elapsed = self._retro_loss_elapsed(frame)
 
                 # Retro detections arrive asynchronously, but all analyzer
                 # state is still updated by this live worker only. Keep this
@@ -444,6 +430,17 @@ class WorkerMixin:
                 goal = self.analyzer.process_frame(frame)
                 stage_time["analyze"] += time.perf_counter() - stage_start
                 self._handle_goal(goal)
+
+                # A live goal result is an immediate retro trigger. Otherwise
+                # an armed ball episode starts exactly once after 0.5 s
+                # without a ball. The retro worker itself still processes its
+                # complete batch if a goal appears in the middle of it.
+                if goal and any(goal):
+                    self._start_retro_if_possible(current_frame_id, "Tor erkannt")
+                elif loss_elapsed:
+                    self._start_retro_if_possible(
+                        current_frame_id, "0.5 s ohne Ball"
+                    )
 
                 stage_start = time.perf_counter()
                 self.analyzer.draw_overlay(frame)

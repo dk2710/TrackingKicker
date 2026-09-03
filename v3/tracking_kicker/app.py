@@ -47,7 +47,6 @@ from .runtime import (
     HEADLESS,
     RETRO_BUFFER_MAX_FRAMES,
     RETRO_MAX_REANALYZE_FRAMES,
-    RETRO_TRIGGER_NO_BALL_FRAMES,
     VIDEO_PATH,
     acquire_app_lock,
     config,
@@ -140,9 +139,12 @@ class KickerApp(
         self.skipped_frame_buffer = deque(maxlen=RETRO_BUFFER_MAX_FRAMES)
         self._frame_sequence = 0
         self._last_visible_frame_id = None
-        self._last_retro_frame_id = None
-        self._no_ball_live_frames = 0
         self._retro_analysis_count = 0
+        self._last_ball_seen_timestamp = None
+        self._recent_ball_detections = deque()
+        self._retro_armed = False
+        self._retro_triggered_for_episode = False
+        self._waiting_for_new_ball = False
 
         # Last goal result and digiKicker notification settings.
         self.last_analysis_lock = threading.Lock()
