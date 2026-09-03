@@ -168,6 +168,8 @@ class BaslerSource:
             self._ready_event.clear()
             self._startup_state.value = 0
             self._fatal_state.value = 0
+            self._last_error = None
+            self._last_error_time = 0.0
             process = self._ctx.Process(
                 target=run_basler_capture_process,
                 args=(
@@ -219,6 +221,14 @@ class BaslerSource:
 
         self._drain_events()
         if self._startup_state.value != 1:
+            # multiprocessing.Queue uses a feeder thread in the child; give
+            # its final startup error a brief chance to arrive before
+            # reporting the generic "not ready" message to the factory.
+            for _ in range(10):
+                if self._last_error:
+                    break
+                time.sleep(0.02)
+                self._drain_events()
             error = self._last_error or "Basler-Prozess wurde nicht bereit"
             self._stop_process()
             raise RuntimeError(error)
