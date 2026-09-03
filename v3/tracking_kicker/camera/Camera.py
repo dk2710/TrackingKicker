@@ -33,6 +33,14 @@ class Camera:
     max_num_buffer: int = 256
     pixel_format: str = "BayerRG8"
 
+    # pylon USB stream transport.  These are the values recommended by
+    # Basler for high-throughput USB3 acquisition and are kept configurable
+    # because the usable limits depend on the host controller.
+    max_transfer_size: int = 1048568
+    num_max_queued_urbs: int = 64
+    receive_thread_priority_override: bool = True
+    receive_thread_priority: int = 15
+
     # Lens correction
     k1: float = 0.00
     k2: float = 0.05

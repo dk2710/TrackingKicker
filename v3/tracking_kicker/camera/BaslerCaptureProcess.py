@@ -138,6 +138,53 @@ def _configure_camera(camera, cfg) -> None:
     except Exception as exc:
         print(f"[CAMERA-WARN] MaxNumBuffer nicht setzbar: {exc}", flush=True)
 
+    # USB3 cameras expose the host-side transport settings through the stream
+    # grabber node map.  Setting these before StartGrabbing is important: the
+    # receive thread must have sufficiently large transfers and queued URBs
+    # before the camera starts producing at the requested frame rate.  Older
+    # pylon versions or non-USB transports may not expose every node, so each
+    # setting is intentionally optional.
+    try:
+        stream_map = camera.GetStreamGrabberNodeMap()
+    except Exception as exc:
+        stream_map = None
+        print(f"[CAMERA-WARN] Stream-Parameter nicht lesbar: {exc}", flush=True)
+
+    if stream_map is not None:
+        for name, value in (
+            (
+                "MaxTransferSize",
+                int(getattr(cfg, "max_transfer_size", 1048568)),
+            ),
+            (
+                "NumMaxQueuedUrbs",
+                int(getattr(cfg, "num_max_queued_urbs", 64)),
+            ),
+            (
+                "ReceiveThreadPriorityOverride",
+                bool(getattr(cfg, "receive_thread_priority_override", True)),
+            ),
+            (
+                "ReceiveThreadPriority",
+                int(getattr(cfg, "receive_thread_priority", 15)),
+            ),
+        ):
+            try:
+                node = stream_map.GetNode(name)
+                if node is None:
+                    continue
+                setter = getattr(node, "SetValue", None)
+                if callable(setter):
+                    setter(value)
+                else:
+                    node.Value = value
+                print(f"pylon {name} = {value}", flush=True)
+            except Exception as exc:
+                print(
+                    f"[CAMERA-WARN] {name} nicht setzbar: {exc}",
+                    flush=True,
+                )
+
     requested_fps = float(getattr(cfg, "force_fps", 0) or 0)
     if requested_fps > 0:
         _set_feature(camera, "AcquisitionFrameRateEnable", True, required=False)
