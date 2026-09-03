@@ -8,9 +8,9 @@ from collections import deque
 from datetime import datetime
 from queue import Empty
 
-import cv2
 import numpy as np
 
+from .camera.conversion import to_bgr
 from .Objects.Frames import Frame
 from .runtime import (
     ANALYSIS_VIDEO_PATH,
@@ -82,10 +82,7 @@ class WorkerMixin:
         """Copy, correct and detect one raw frame from the replay buffer."""
         frame = copy.copy(source_frame)
         frame.frame = source_frame.frame.copy()
-        if frame.frame.ndim == 2:
-            frame.frame = cv2.cvtColor(frame.frame, cv2.COLOR_BayerRG2BGR)
-        elif frame.frame.ndim == 3 and frame.frame.shape[2] == 1:
-            frame.frame = cv2.cvtColor(frame.frame, cv2.COLOR_GRAY2BGR)
+        frame.frame = to_bgr(frame.frame, self.dist.camera.pixel_format)
         frame.frame = self.dist.apply(frame.frame)
         self.detector.detect(frame)
         return frame
@@ -200,7 +197,7 @@ class WorkerMixin:
         while not self.stop_event.is_set():
             try:
                 frame = self.raw_queue.get(timeout=0.5)
-                frame.frame = cv2.cvtColor(frame.frame, cv2.COLOR_BayerRG2BGR)
+                frame.frame = to_bgr(frame.frame, self.dist.camera.pixel_format)
                 frame.frame = self.dist.apply(frame.frame)
 
                 if self.processed_queue.full():
@@ -241,7 +238,7 @@ class WorkerMixin:
                         break
 
                 stage_start = time.perf_counter()
-                frame.frame = cv2.cvtColor(frame.frame, cv2.COLOR_BayerRG2BGR)
+                frame.frame = to_bgr(frame.frame, self.dist.camera.pixel_format)
                 stage_time["cvt"] += time.perf_counter() - stage_start
 
                 stage_start = time.perf_counter()

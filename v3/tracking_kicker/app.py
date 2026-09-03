@@ -3,6 +3,7 @@
 The domain implementations live in their packages:
 
 * :mod:`detection.ball` owns ball detection
+* :mod:`camera` owns Basler/replay sources and pixel conversion
 * :mod:`analysis` owns goal and speed analysis
 * :mod:`calibration` owns calibration
 * :mod:`comms.http_api` owns HTTP endpoints
@@ -31,7 +32,8 @@ from .analysis import KickerAnalyzer
 from .calibration.workflow import CalibrationWorkflowMixin
 from .comms.http_api import ApiMixin
 from .detection import BallDetector
-from .distoration import DistortionCorrector
+from .camera.distortion import DistortionCorrector
+from .camera.factory import create_camera_with_retry
 from .goal_media import GoalMediaMixin
 from .runtime import (
     ANALYSIS_VIDEO_PATH,
@@ -49,7 +51,6 @@ from .runtime import (
     VIDEO_PATH,
     acquire_app_lock,
     config,
-    create_camera_with_retry,
     create_replay_fallback,
     find_replay_video,
     vision,

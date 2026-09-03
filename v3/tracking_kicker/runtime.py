@@ -1,7 +1,6 @@
-"""Application-wide runtime configuration and source factories."""
+"""Application-wide runtime configuration and replay discovery."""
 
 import os
-import time
 from pathlib import Path
 
 try:
@@ -9,7 +8,7 @@ try:
 except ImportError:  # Windows/deployments without POSIX file locking
     _fcntl = None
 
-from .RawReplaySource import RawReplaySource
+from .camera import RawReplaySource
 from .config import AppConfig
 from .model.VisionConfig import VisionConfig
 
@@ -81,28 +80,6 @@ def acquire_app_lock() -> bool:
     except (BlockingIOError, OSError):
         print("[APP] Bereits eine TrackingKicker-Instanz aktiv; zweiter Start beendet.")
         return False
-
-
-def create_camera_with_retry(camera_config):
-    # Import lazily so replay-only installations do not need pypylon merely
-    # to import the application package.
-    from .BaslerSource import BaslerSource
-
-    last_error = None
-    for attempt in range(1, 16):
-        try:
-            return BaslerSource(camera_config)
-        except Exception as exc:
-            last_error = exc
-            print(
-                f"[CAM-START] Kamera nicht verfuegbar "
-                f"(Versuch {attempt}/15): {exc}"
-            )
-            if attempt < 15:
-                time.sleep(2.0)
-    raise RuntimeError(
-        f"Basler-Kamera konnte nach 15 Versuchen nicht geoeffnet werden: {last_error}"
-    )
 
 
 def find_replay_video() -> Path:

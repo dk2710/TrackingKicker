@@ -1,7 +1,7 @@
 import cv2
 import json
 from pathlib import Path
-from v3.tracking_kicker.model.Camera import Camera
+from ..camera import Camera
 
 
 class DistortionTunerUI:

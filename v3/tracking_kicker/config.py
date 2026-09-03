@@ -4,7 +4,7 @@ import os
 import json
 from typing import Any, Dict
 from dataclasses import asdict, fields
-from v3.tracking_kicker.model.Camera import Camera
+from .camera import Camera
 
 
 @dataclass

@@ -2,6 +2,7 @@
 
 import cv2
 
+from ..camera.conversion import to_bgr
 from .pipeline import CalibrationPipeline
 from ..storage import JsonStore
 from ..ui.distortion_tuner import DistortionTunerUI
@@ -47,7 +48,7 @@ class CalibrationWorkflowMixin:
             if not ret or frame is None:
                 raise RuntimeError("❌ Kein Frame nach Distortion-Tuning")
 
-            frame.frame = cv2.cvtColor(frame.frame, cv2.COLOR_BayerRG2BGR)
+            frame.frame = to_bgr(frame.frame, self.dist.camera.pixel_format)
             frame.frame = self.dist.apply(frame.frame)
 
             self.cfg = CalibrationPipeline().run(frame.frame)

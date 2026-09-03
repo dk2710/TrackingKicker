@@ -3,7 +3,9 @@ import numpy as np
 import math
 import time
 from typing import Optional, Tuple
-from v3.tracking_kicker.Objects.Frames import Frame
+
+from ..camera.conversion import to_bgr
+from ..Objects.Frames import Frame
 
 class BallDetector:
     @classmethod
@@ -15,6 +17,7 @@ class BallDetector:
         """
         detection = app_config.ball_detection
         camera_fps = getattr(app_config.camera, "force_fps", 180) or 180
+        pixel_format = getattr(app_config.camera, "pixel_format", "BayerRG8")
         table_width_cm = 120.0
         if field_config is not None:
             table_width_cm = float(field_config.size_cm.w)
@@ -32,6 +35,7 @@ class BallDetector:
             radius_max_px=float(detection.get("radius_max_px", 25.0)),
             circularity_min=float(detection.get("circularity_min", 0.5)),
             solidity_min=float(detection.get("solidity_min", 0.85)),
+            pixel_format=pixel_format,
         )
 
     def __init__(
@@ -49,6 +53,7 @@ class BallDetector:
         radius_max_px: float = 25.0,
         circularity_min: float = 0.5,
         solidity_min: float = 0.85,
+        pixel_format: str = "BayerRG8",
     ):
         self.hsv_low = hsv_low
         self.hsv_high = hsv_high
@@ -60,6 +65,7 @@ class BallDetector:
         self.radius_max_px = float(radius_max_px)
         self.circularity_min = float(circularity_min)
         self.solidity_min = float(solidity_min)
+        self.pixel_format = pixel_format
 
         # Die Konturerkennung liefert pro Frame Kandidaten, verfolgt aber
         # nicht automatisch denselben Kandidaten weiter. Diese Zustandsdaten
@@ -92,10 +98,7 @@ class BallDetector:
     # Mask
     # ---------------------------------------------------------
     def _mask_ball(self, frame: np.ndarray) -> np.ndarray:
-        if frame.ndim == 2:
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
-        else:
-            frame_bgr = frame
+        frame_bgr = to_bgr(frame, self.pixel_format)
 
         hsv = cv2.cvtColor(cv2.GaussianBlur(frame_bgr, (5, 5), 0), cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, self.hsv_low, self.hsv_high)

@@ -21,6 +21,7 @@ try:
 except ImportError:  # pragma: no cover - fallback is used on minimal installs
     requests = None
 
+from .camera.conversion import to_bgr
 from .Objects.Frames import Frame
 from .runtime import (
     ANALYSIS_VIDEO_PATH,
@@ -231,10 +232,7 @@ class GoalMediaMixin:
             return
 
         image = image.copy()
-        if image.ndim == 2:
-            image = cv2.cvtColor(image, cv2.COLOR_BayerRG2BGR)
-        elif image.ndim == 3 and image.shape[2] == 1:
-            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        image = to_bgr(image, self.dist.camera.pixel_format)
 
         width = min(image.shape[1], GOAL_VIDEO_MAX_WIDTH)
         height = int(round(image.shape[0] * width / image.shape[1]))
@@ -279,10 +277,7 @@ class GoalMediaMixin:
         for source_frame in source_frames:
             frame = copy.copy(source_frame)
             image = source_frame.frame.copy()
-            if image.ndim == 2:
-                image = cv2.cvtColor(image, cv2.COLOR_BayerRG2BGR)
-            elif image.ndim == 3 and image.shape[2] == 1:
-                image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+            image = to_bgr(image, self.dist.camera.pixel_format)
             frame.frame = self.dist.apply(image)
             prepared.append(frame)
         return prepared
@@ -491,11 +486,7 @@ class GoalMediaMixin:
         )
         try:
             for frame in frames:
-                image = frame.frame
-                if image.ndim == 2:
-                    image = cv2.cvtColor(image, cv2.COLOR_BayerRG2BGR)
-                elif image.ndim == 3 and image.shape[2] == 1:
-                    image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+                image = to_bgr(frame.frame, self.dist.camera.pixel_format)
                 if image.shape[1] != output_width or image.shape[0] != output_height:
                     image = cv2.resize(
                         image,
