@@ -45,7 +45,10 @@ class Camera:
     # pinned only after the camera has opened, so CPU affinity cannot interfere
     # with pylon's device initialization.
     capture_cpu: int | None = 7
-    reserve_capture_cpu: bool = True
+    # Keep pylon's USB receive threads free to use all available CPUs by
+    # default. Pinning the complete process to one core can starve the USB3
+    # transport at high frame rates; enable it only for a measured setup.
+    reserve_capture_cpu: bool = False
 
     # Lens correction
     k1: float = 0.00
