@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 import time
+import gc
 from typing import Any, Optional
 
 from pypylon import pylon
@@ -340,6 +341,12 @@ class BaslerSource:
             old_camera = self.camera
             self.camera = None
             self._stop_and_close(old_camera)
+            # Close() stops acquisition, while DestroyDevice() detaches the
+            # transport-layer device.  The explicit detach is important on
+            # USB: otherwise the old InstantCamera can keep the device node
+            # busy even though pylon reports it as closed.
+            del old_camera
+            gc.collect()
 
             if self._closed:
                 return
@@ -365,6 +372,14 @@ class BaslerSource:
                 camera.Close()
         except Exception as exc:
             print(f"[CAMERA] Close fehlgeschlagen: {exc}")
+        try:
+            attached = getattr(camera, "IsPylonDeviceAttached", None)
+            if not callable(attached) or attached():
+                destroy = getattr(camera, "DestroyDevice", None)
+                if callable(destroy):
+                    destroy()
+        except Exception as exc:
+            print(f"[CAMERA] DestroyDevice fehlgeschlagen: {exc}")
 
     # ------------------------------------------------------------------
     # Source compatibility and shutdown
