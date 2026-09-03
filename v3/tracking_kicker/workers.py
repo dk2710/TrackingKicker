@@ -154,6 +154,9 @@ class WorkerMixin:
                 ret, objframe = self.video.read()
                 if not ret or objframe is None:
                     self._invalidate_rolling_video()
+                    # A disconnected/temporarily unavailable camera must not
+                    # turn the worker into a busy loop while recovery runs.
+                    time.sleep(0.005)
                     continue
 
                 self._frame_sequence += 1

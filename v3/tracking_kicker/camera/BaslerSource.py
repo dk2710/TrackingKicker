@@ -30,6 +30,7 @@ class BaslerSource:
 
     RETRIEVE_TIMEOUT_MS = 100
     RECOVERY_FAILURE_THRESHOLD = 5
+    RECOVERY_MIN_FAILURE_DURATION_SECONDS = 2.0
     RECOVERY_INTERVAL_SECONDS = 5.0
 
     def __init__(self, cfg: Camera):
@@ -53,6 +54,7 @@ class BaslerSource:
         self._last_grab_error: Optional[str] = None
         self._last_grab_error_time = 0.0
         self._consecutive_grab_failures = 0
+        self._first_grab_failure_time = 0.0
         self._last_recovery_time = 0.0
         self.fps = float(getattr(cfg, "force_fps", 0) or 0)
 
@@ -314,10 +316,17 @@ class BaslerSource:
         if ok and frame is not None:
             self._read_count += 1
             self._consecutive_grab_failures = 0
+            self._first_grab_failure_time = 0.0
         else:
             self._read_failures += 1
             self._consecutive_grab_failures += 1
-            if self._consecutive_grab_failures >= self.RECOVERY_FAILURE_THRESHOLD:
+            if self._consecutive_grab_failures == 1:
+                self._first_grab_failure_time = now
+            failure_duration = now - self._first_grab_failure_time
+            if (
+                self._consecutive_grab_failures >= self.RECOVERY_FAILURE_THRESHOLD
+                and failure_duration >= self.RECOVERY_MIN_FAILURE_DURATION_SECONDS
+            ):
                 self._recover_grab_stream()
 
         if now - self._read_log_time >= 1.0:
