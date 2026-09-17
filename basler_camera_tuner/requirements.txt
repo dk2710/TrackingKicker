@@ -1,4 +1,4 @@
 Flask>=2.2
 numpy>=1.23
 opencv-python>=4.6
-pypylon>=26.7
+pypylon>=3.0

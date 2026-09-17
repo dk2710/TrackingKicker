@@ -141,7 +141,7 @@ class GoalMediaMixin:
         with self.replay_lock:
             selected = [
                 (image, float(timestamp))
-                for image, timestamp in self.goal_pre_buffer
+                for image, timestamp in self.replay_buffer
                 if start_timestamp <= float(timestamp) <= goal_timestamp
             ]
 

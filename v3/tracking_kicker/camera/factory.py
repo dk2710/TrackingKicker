@@ -17,47 +17,42 @@ def create_camera_with_retry(
         raise ValueError("Eine Kamerakonfiguration ist erforderlich")
 
     # Lazy import keeps replay-only mode independent of the pypylon package.
-    try:
-        from .BaslerSource import BaslerSource
-    except ModuleNotFoundError as exc:
-        if exc.name == "pypylon":
-            raise RuntimeError(
-                "pypylon ist nicht installiert; Basler-Kamera kann nicht verwendet werden"
-            ) from exc
-        raise
+    source = str(getattr(camera_config, "source", "camera_process")).lower()
+    if source in {"camera_process", "camera-process", "shared_memory"}:
+        source_type = "CameraProcessSource"
+        try:
+            from .CameraProcessSource import CameraProcessSource
+        except ModuleNotFoundError as exc:
+            if exc.name == "numpy":
+                raise RuntimeError(
+                    "numpy ist fuer den CameraProcess-Framezugriff nicht installiert"
+                ) from exc
+            raise
+        source_class = CameraProcessSource
+    else:
+        source_type = "BaslerSource"
+        try:
+            from .BaslerSource import BaslerSource
+        except ModuleNotFoundError as exc:
+            if exc.name == "pypylon":
+                raise RuntimeError(
+                    "pypylon ist nicht installiert; Basler-Kamera kann nicht verwendet werden"
+                ) from exc
+            raise
+        source_class = BaslerSource
 
     attempts = max(1, int(attempts))
     last_error = None
     for attempt in range(1, attempts + 1):
         try:
-            return BaslerSource(camera_config)
-        except ModuleNotFoundError as exc:
-            # BaslerSource checks pypylon lazily because replay mode must stay
-            # usable without the vendor package. Do not spend all retry
-            # attempts on a package that is definitely not installed.
-            if exc.name == "pypylon" or "pypylon" in str(exc).lower():
-                raise RuntimeError(
-                    "pypylon ist nicht installiert; Basler-Kamera kann nicht verwendet werden"
-                ) from exc
-            last_error = exc
-            print(
-                f"[CAM-START] Kamera nicht verfuegbar "
-                f"(Versuch {attempt}/{attempts}): {exc}"
-            )
-            if attempt < attempts:
-                time.sleep(max(0.0, float(retry_delay_seconds)))
+            return source_class(camera_config)
         except Exception as exc:
             last_error = exc
             print(
                 f"[CAM-START] Kamera nicht verfuegbar "
+                f"{source_type} nicht verfuegbar "
                 f"(Versuch {attempt}/{attempts}): {exc}"
             )
-            # A USB2 fallback is deterministic and cannot deliver the
-            # requested high-rate stream. Retrying pylon against that same
-            # link only adds noise and can disturb a marginal USB state.
-            message = str(exc).lower()
-            if "usb2" in message and "usb3" in message:
-                raise RuntimeError(str(exc)) from exc
             if attempt < attempts:
                 time.sleep(max(0.0, float(retry_delay_seconds)))
 

@@ -6,9 +6,12 @@ importable even when pypylon is not installed.
 
 from .Camera import Camera
 from .conversion import to_bgr
-from .RawReplaySource import RawReplaySource
-
-__all__ = ["BaslerSource", "Camera", "RawReplaySource", "to_bgr"]
+__all__ = [
+    "BaslerSource",
+    "Camera",
+    "CameraProcessSource",
+    "to_bgr",
+]
 
 
 def __getattr__(name):
@@ -16,4 +19,8 @@ def __getattr__(name):
         from .BaslerSource import BaslerSource
 
         return BaslerSource
+    if name == "CameraProcessSource":
+        from .CameraProcessSource import CameraProcessSource
+
+        return CameraProcessSource
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

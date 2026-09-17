@@ -1,434 +1,396 @@
-"""Process-isolated Basler/pypylon image source.
+"""Basler/pypylon image source.
 
-The parent process owns only a shared-memory ring and the source interface.
-All pypylon calls run in :mod:`BaslerCaptureProcess`. This is important for
-USB transport failures because pypylon can block while stopping a damaged
-grab stream.
+Only this module knows about pypylon.  The rest of the application receives
+plain :class:`~tracking_kicker.Objects.Frames.Frame` objects and can therefore
+also run against the separate raw replay process through the shared frame
+client.
 """
 
 from __future__ import annotations
 
-import importlib.util
-import multiprocessing as mp
-import os
-import queue
+import gc
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional
 
-import numpy as np
+from pypylon import pylon
 
 from ..Objects.Frames import Frame
-from .BaslerCaptureProcess import run_basler_capture_process
 from .Camera import Camera
+from .pixel_format import resolve_pixel_format
 
 
 class BaslerSource:
-    """Acquire Basler frames through a killable child process."""
+    """Acquire frames from one Basler camera through pypylon.
 
-    RING_SLOTS = 4
-    SLOT_BYTES_PER_PIXEL = 8
-    STARTUP_TIMEOUT_SECONDS = 10.0
-    # Give pylon/the USB transport a moment to release a failed stream before
-    # the replacement process tries to open the same device again.
-    RESTART_BACKOFF_SECONDS = 2.0
-    FRAME_STALL_SECONDS = 1.0
+    The source follows the pypylon user-allocated grab pattern used in the
+    documentation: ``StartGrabbing`` is called once, each result is consumed
+    with ``RetrieveResult`` and released in a ``finally`` block.  A serial
+    number can be configured so a reconnect cannot accidentally select another
+    USB camera.
+    """
+
+    RETRIEVE_TIMEOUT_MS = 100
+    STARTUP_SETTLE_SECONDS = 2.0
+    RECOVERY_FAILURE_THRESHOLD = 5
+    RECOVERY_MIN_FAILURE_DURATION_SECONDS = 2.0
+    RECOVERY_INTERVAL_SECONDS = 5.0
 
     def __init__(self, cfg: Camera):
         if cfg is None:
             raise ValueError("Eine Kamerakonfiguration ist erforderlich")
-        if importlib.util.find_spec("pypylon") is None:
-            raise ModuleNotFoundError(
-                "pypylon ist nicht installiert; Basler-Kamera kann nicht verwendet werden"
-            )
 
         self.cfg = cfg
-        self.fps = float(getattr(cfg, "force_fps", 0) or 0)
-        # pypylon and OpenCV both own native state and worker threads.  A fork
-        # can inherit that state in an unsafe half-initialized condition once
-        # the analysis workers start.  Spawn gives the capture process a clean
-        # interpreter on every platform.
-        start_methods = mp.get_all_start_methods()
-        method = "spawn" if "spawn" in start_methods else start_methods[0]
-        self._ctx = mp.get_context(method)
-        self._process_lock = threading.RLock()
+        self.camera: Optional[Any] = None
+        self._camera_lock = threading.RLock()
+        # pypylon's USB StopGrabbing() can block inside the transport layer.
+        # Keep release() itself bounded so the application process can exit
+        # and the kernel can tear down the USB handle.
         self._release_lock = threading.Lock()
+        self._cleanup_lock = threading.Lock()
+        self._pending_cleanup: Optional[threading.Thread] = None
         self._closed = False
-        self._process = None
-        self._original_affinity = None
-        self._next_restart_time = 0.0
-        self._last_frame_time = time.monotonic()
-        self._last_sequence = 0
-        self._last_error = None
-        self._last_error_time = 0.0
-        # A fatal USB transport error can leave the camera firmware or host
-        # controller unable to answer a new pylon open request. Reopening the
-        # same dead stream in a loop only makes that state worse. The source
-        # therefore reports the fault and waits for the next application
-        # start instead of repeatedly claiming the device.
-        self._transport_faulted = False
+
         self._read_count = 0
         self._read_failures = 0
         self._read_log_time = time.perf_counter()
-
-        width = max(1, int(cfg.width))
-        height = max(1, int(cfg.height))
-        self._slot_bytes = width * height * self.SLOT_BYTES_PER_PIXEL
-        self._shared_buffer = self._ctx.RawArray(
-            "B", self._slot_bytes * self.RING_SLOTS
-        )
-        self._slot_locks = [self._ctx.Lock() for _ in range(self.RING_SLOTS)]
-        # Metadata is read/written while the corresponding slot lock is held.
-        self._slot_sequences = self._ctx.Array(
-            "q", [0] * self.RING_SLOTS, lock=False
-        )
-        self._slot_timestamps = self._ctx.Array(
-            "d", [0.0] * self.RING_SLOTS, lock=False
-        )
-        self._slot_ndims = self._ctx.Array("i", [0] * self.RING_SLOTS, lock=False)
-        self._slot_shapes0 = self._ctx.Array("i", [0] * self.RING_SLOTS, lock=False)
-        self._slot_shapes1 = self._ctx.Array("i", [0] * self.RING_SLOTS, lock=False)
-        self._slot_shapes2 = self._ctx.Array("i", [0] * self.RING_SLOTS, lock=False)
-        self._slot_dtype_codes = self._ctx.Array(
-            "i", [0] * self.RING_SLOTS, lock=False
-        )
-        self._latest_sequence = self._ctx.Value("q", 0)
-        self._stop_event = self._ctx.Event()
-        self._ready_event = self._ctx.Event()
-        self._startup_state = self._ctx.Value("i", 0)
-        self._fatal_state = self._ctx.Value("i", 0)
-        self._fps_value = self._ctx.Value("d", self.fps)
-        self._events = self._ctx.Queue(maxsize=32)
+        self._last_grab_error: Optional[str] = None
+        self._last_grab_error_time = 0.0
+        self._consecutive_grab_failures = 0
+        self._first_grab_failure_time = 0.0
+        self._last_recovery_time = 0.0
+        self.fps = float(getattr(cfg, "force_fps", 0) or 0)
 
         try:
-            self._start_process(wait=True)
+            self.camera = self._open_camera()
         except Exception:
-            self._closed = True
-            self._stop_process()
-            self._close_event_queue()
-            self._restore_host_affinity()
+            # Open() may have succeeded before a feature or ROI failed.  The
+            # partially initialized camera must still be closed here.
+            self.camera = None
             raise
 
     # ------------------------------------------------------------------
-    # Child lifecycle
+    # Device discovery and configuration
     # ------------------------------------------------------------------
 
-    def _prepare_capture_cpu(self):
-        """Temporarily add the reserved CPU while spawning the child."""
-        if not getattr(self.cfg, "reserve_capture_cpu", True):
-            return None
-        capture_cpu = getattr(self.cfg, "capture_cpu", None)
-        if capture_cpu is None or not hasattr(os, "sched_getaffinity"):
-            return None
-        try:
-            values = (
-                capture_cpu
-                if isinstance(capture_cpu, (list, tuple, set))
-                else (capture_cpu,)
+    def _select_device_info(self):
+        factory = pylon.TlFactory.GetInstance()
+        devices = list(factory.EnumerateDevices())
+        if not devices:
+            raise RuntimeError(
+                "Keine Basler-Kamera gefunden (pypylon EnumerateDevices=0). "
+                "USB-Verbindung, pylon-Treiber und Zugriffsrechte pruefen."
             )
-            capture_cpus = {int(cpu) for cpu in values}
-            current = set(os.sched_getaffinity(0))
-            expanded = current | capture_cpus
-            if expanded != current:
-                os.sched_setaffinity(0, expanded)
-            if self._original_affinity is None:
-                self._original_affinity = set(current)
-            return current, capture_cpus
-        except (OSError, TypeError, ValueError):
-            return None
+
+        wanted_serial = str(getattr(self.cfg, "serial_number", "") or "").strip()
+        if not wanted_serial:
+            return factory, devices[0]
+
+        for device_info in devices:
+            if self._device_serial(device_info) == wanted_serial:
+                return factory, device_info
+
+        available = ", ".join(self._device_serial(info) for info in devices)
+        raise RuntimeError(
+            f"Basler-Kamera mit Seriennummer {wanted_serial!r} nicht gefunden. "
+            f"Verfuegbare Seriennummern: {available or 'unbekannt'}"
+        )
 
     @staticmethod
-    def _restore_parent_after_spawn(affinity_state) -> None:
-        if affinity_state is None:
-            return
-        current, capture_cpus = affinity_state
-        remaining = current - capture_cpus
-        if not remaining:
-            return
+    def _device_serial(device_info) -> str:
         try:
-            os.sched_setaffinity(0, remaining)
-        except OSError:
-            pass
+            return str(device_info.GetSerialNumber())
+        except Exception:
+            return ""
 
-    def _restore_host_affinity(self) -> None:
-        if self._original_affinity is None or not hasattr(os, "sched_setaffinity"):
-            return
-        try:
-            os.sched_setaffinity(0, self._original_affinity)
-        except OSError:
-            pass
-
-    def _start_process(self, *, wait: bool) -> None:
-        with self._process_lock:
-            if self._closed:
-                return
-            if self._process is not None and self._process.is_alive():
-                return
-
-            self._ready_event.clear()
-            self._startup_state.value = 0
-            self._fatal_state.value = 0
-            self._last_error = None
-            self._last_error_time = 0.0
-            process = self._ctx.Process(
-                target=run_basler_capture_process,
-                args=(
-                    self.cfg,
-                    self._shared_buffer,
-                    self._slot_bytes,
-                    self._slot_locks,
-                    self._slot_sequences,
-                    self._slot_timestamps,
-                    self._slot_ndims,
-                    self._slot_shapes0,
-                    self._slot_shapes1,
-                    self._slot_shapes2,
-                    self._slot_dtype_codes,
-                    self._latest_sequence,
-                    self._stop_event,
-                    self._ready_event,
-                    self._startup_state,
-                    self._fatal_state,
-                    self._fps_value,
-                    self._events,
-                ),
-                name="basler-capture-process",
-                daemon=True,
-            )
-            affinity_state = self._prepare_capture_cpu()
+    @staticmethod
+    def _device_label(device_info) -> str:
+        values = []
+        for method_name in ("GetModelName", "GetSerialNumber", "GetDeviceClass"):
             try:
-                process.start()
+                value = getattr(device_info, method_name)()
             except Exception:
-                if affinity_state is not None:
+                continue
+            if value:
+                values.append(str(value))
+        return " / ".join(values) or "unbekanntes Basler-Geraet"
+
+    def _open_camera(self):
+        factory, device_info = self._select_device_info()
+        camera = pylon.InstantCamera(factory.CreateDevice(device_info))
+
+        try:
+            camera.RegisterConfiguration(
+                None,
+                pylon.RegistrationMode_ReplaceAll,
+                pylon.Cleanup_None,
+            )
+            camera.Open()
+            self._configure_camera(camera)
+            camera.StartGrabbing(self._grab_strategy())
+            self._settle_stream(camera)
+            print(f"[CAMERA] Basler geoeffnet: {self._device_label(device_info)}")
+            self._log_configuration(camera)
+            return camera
+        except Exception:
+            self._stop_and_close(camera)
+            raise
+
+    def _settle_stream(self, camera) -> None:
+        """Discard transient USB results before handing the source to workers."""
+        deadline = time.perf_counter() + self.STARTUP_SETTLE_SECONDS
+        while time.perf_counter() < deadline:
+            result = None
+            try:
+                result = camera.RetrieveResult(
+                    self.RETRIEVE_TIMEOUT_MS,
+                    pylon.TimeoutHandling_Return,
+                )
+            except Exception:
+                # The regular grab loop owns error reporting and recovery.
+                # Startup is deliberately best-effort; keep settling so a
+                # transient USB result does not reach the worker.
+                time.sleep(0.01)
+            finally:
+                if result is not None:
                     try:
-                        os.sched_setaffinity(0, affinity_state[0])
-                    except OSError:
+                        result.Release()
+                    except Exception:
                         pass
-                raise
-            self._restore_parent_after_spawn(affinity_state)
-            self._process = process
 
-        if not wait:
-            return
+    def _configure_camera(self, camera) -> None:
+        """Apply all settings that must be made while the camera is open."""
 
-        deadline = time.monotonic() + self.STARTUP_TIMEOUT_SECONDS
-        while not self._ready_event.wait(timeout=0.1):
-            process = self._process
-            if process is None or not process.is_alive():
-                break
-            if time.monotonic() >= deadline:
-                break
+        # The camera is operated by the user-triggered grab loop.  Explicitly
+        # disabling trigger mode avoids inheriting a stale camera state from
+        # pylon Viewer or an earlier process.
+        self._set_feature(camera, "TriggerSelector", "FrameStart", required=False)
+        self._set_feature(camera, "TriggerMode", "Off", required=True)
+        self._set_feature(camera, "AcquisitionMode", "Continuous", required=True)
 
-        self._drain_events()
-        if self._startup_state.value != 1:
-            # multiprocessing.Queue uses a feeder thread in the child; give
-            # its final startup error a brief chance to arrive before
-            # reporting the generic "not ready" message to the factory.
-            for _ in range(10):
-                if self._last_error:
-                    break
-                time.sleep(0.02)
-                self._drain_events()
-            error = self._last_error or "Basler-Prozess wurde nicht bereit"
-            self._stop_process()
-            raise RuntimeError(error)
+        self._set_feature(camera, "ExposureAuto", "Off", required=True)
+        self._set_feature(camera, "GainAuto", "Off", required=True)
+        requested_pixel_format = getattr(self.cfg, "pixel_format", "BayerRG8")
+        pixel_format, available_formats = resolve_pixel_format(
+            camera, requested_pixel_format
+        )
+        if available_formats:
+            print(
+                "[CAMERA] Verfuegbare PixelFormate: "
+                + ", ".join(available_formats)
+            )
+        self._set_feature(camera, "PixelFormat", pixel_format, required=True)
+        try:
+            self.cfg.pixel_format = pixel_format
+        except Exception:
+            pass
+        self._set_feature(camera, "ExposureTime", float(self.cfg.exposure_time), required=True)
+        self._set_feature(camera, "Gain", float(self.cfg.gain), required=True)
 
-        self._last_frame_time = time.monotonic()
+        # Set offsets to zero before changing the ROI.  This avoids an invalid
+        # intermediate ROI when the old offset is too large for the new size.
+        self._set_feature(camera, "OffsetX", 0, required=True)
+        self._set_feature(camera, "OffsetY", 0, required=True)
+        self._set_feature(camera, "Width", int(self.cfg.width), required=True)
+        self._set_feature(camera, "Height", int(self.cfg.height), required=True)
+        self._set_feature(camera, "OffsetX", int(self.cfg.offset_x), required=True)
+        self._set_feature(camera, "OffsetY", int(self.cfg.offset_y), required=True)
 
-    def _stop_process(
-        self,
-        timeout: float = 1.5,
-        *,
-        restart: bool = False,
-    ) -> bool:
-        """Stop the capture process without allowing pylon to block forever.
+        max_buffers = max(1, int(getattr(self.cfg, "max_num_buffer", 256)))
+        try:
+            camera.MaxNumBuffer = max_buffers
+            print(f"pylon MaxNumBuffer = {max_buffers}")
+        except Exception as exc:
+            print(f"[CAMERA-WARN] MaxNumBuffer nicht setzbar: {exc}")
 
-        A normal shutdown gets a chance to execute the child's
-        ``StopGrabbing``/``Close`` cleanup.  If the transport layer is stuck,
-        the bounded join expires and the parent terminates the child.  During
-        recovery the shared stop event is cleared only after the old process
-        is gone, so the replacement process can use the same event safely.
+        self._set_stream_parameter(
+            camera, "MaxTransferSize", getattr(self.cfg, "max_transfer_size", 0)
+        )
+        self._set_stream_parameter(
+            camera, "NumMaxQueuedUrbs", getattr(self.cfg, "num_max_queued_urbs", 0)
+        )
 
-        Returns whether the process had to be force-terminated.
-        """
-        with self._process_lock:
-            process = self._process
-            self._process = None
-        if process is None:
-            if restart:
-                self._stop_event.clear()
+        requested_fps = float(getattr(self.cfg, "force_fps", 0) or 0)
+        if requested_fps > 0:
+            # This feature is not present on every camera/transport layer.  A
+            # missing optional frame-rate control must not prevent grabbing.
+            self._set_feature(camera, "AcquisitionFrameRateEnable", True, required=False)
+            self._set_feature(camera, "AcquisitionFrameRate", requested_fps, required=False)
+
+    @staticmethod
+    def _set_feature(camera, name: str, value, *, required: bool) -> bool:
+        try:
+            node = getattr(camera, name)
+            setter = getattr(node, "SetValue", None)
+            if callable(setter):
+                setter(value)
+            else:
+                node.Value = value
+            return True
+        except Exception as exc:
+            message = f"{name}={value!r} konnte nicht gesetzt werden: {exc}"
+            if required:
+                raise RuntimeError(message) from exc
+            print(f"[CAMERA-WARN] {message}")
             return False
 
-        forced = False
+    @staticmethod
+    def _set_stream_parameter(camera, name: str, value: int) -> bool:
+        """Set an optional pylon USB stream-grabber parameter."""
+        if int(value or 0) <= 0:
+            return False
         try:
-            if process.is_alive():
-                self._stop_event.set()
-            process.join(timeout=max(0.0, float(timeout)))
-            if process.is_alive():
-                forced = True
-                kill = getattr(process, "kill", None)
-                if callable(kill):
-                    kill()
-                else:
-                    process.terminate()
-                process.join(timeout=0.5)
-        finally:
-            try:
-                process.close()
-            except (OSError, ValueError):
-                pass
-            if restart:
-                self._stop_event.clear()
-        if forced:
-            print(
-                "[CAM-RECOVER] Alter Capture-Prozess reagierte nicht; "
-                "er wurde beendet"
-            )
-        return forced
+            node = camera.GetStreamGrabberNodeMap().GetNode(name)
+            if node is None:
+                raise RuntimeError("Knoten nicht vorhanden")
+            node.SetValue(int(value))
+            print(f"pylon {name} = {int(value)}")
+            return True
+        except Exception as exc:
+            print(f"[CAMERA-WARN] {name} nicht setzbar: {exc}")
+            return False
 
-    def _restart_process(self, reason: str) -> None:
-        if self._closed or self._transport_faulted:
-            return
-
-        if self._fatal_state.value:
-            self._transport_faulted = True
-            print(
-                "[CAM-RECOVER] USB-Transportfehler erkannt; "
-                "kein weiterer pylon-Reconnect in diesem Prozess"
-            )
-            # Give StopGrabbing/Close enough time to finish. A hard kill is
-            # the last resort only when the USB driver itself is blocked.
-            self._stop_process(timeout=5.0)
-            return
-
-        now = time.monotonic()
-        if now < self._next_restart_time:
-            return
-
-        print(f"[CAM-RECOVER] Basler-Prozess wird neu gestartet: {reason}")
-        self._stop_process(timeout=5.0, restart=True)
-        self._last_sequence = int(self._latest_sequence.value)
-        self._last_frame_time = now
-        self._next_restart_time = now + self.RESTART_BACKOFF_SECONDS
-        self._start_process(wait=False)
-
-    # ------------------------------------------------------------------
-    # Shared-memory frame handoff
-    # ------------------------------------------------------------------
-
-    def _read_latest_frame(self):
-        latest = int(self._latest_sequence.value)
-        if latest <= self._last_sequence:
+    @staticmethod
+    def _get_feature(camera, name: str):
+        try:
+            node = getattr(camera, name)
+            getter = getattr(node, "GetValue", None)
+            return getter() if callable(getter) else node.Value
+        except Exception:
             return None
 
-        first = max(self._last_sequence + 1, latest - self.RING_SLOTS + 1)
-        for sequence in range(latest, first - 1, -1):
-            slot = sequence % self.RING_SLOTS
-            with self._slot_locks[slot]:
-                if int(self._slot_sequences[slot]) != sequence:
-                    continue
+    def _log_configuration(self, camera) -> None:
+        model = self._get_feature(camera, "DeviceModelName")
+        if model:
+            print(f"pylon Modell: {model}")
+        for name in (
+            "PixelFormat",
+            "PixelColorFilter",
+            "Width",
+            "Height",
+            "OffsetX",
+            "OffsetY",
+            "ExposureAuto",
+            "ExposureTime",
+            "GainAuto",
+            "Gain",
+            "AcquisitionMode",
+            "TriggerMode",
+            "AcquisitionFrameRateEnable",
+            "AcquisitionFrameRate",
+            "BslResultingAcquisitionFrameRate",
+            "ResultingFrameRate",
+        ):
+            value = self._get_feature(camera, name)
+            if value is not None:
+                print(f"pylon {name} = {value}")
 
-                ndim = int(self._slot_ndims[slot])
-                shape0 = int(self._slot_shapes0[slot])
-                shape1 = int(self._slot_shapes1[slot])
-                shape2 = int(self._slot_shapes2[slot])
-                dtype_code = int(self._slot_dtype_codes[slot])
-                if ndim == 2 and shape0 > 0 and shape1 > 0:
-                    shape = (shape0, shape1)
-                elif ndim == 3 and shape0 > 0 and shape1 > 0 and shape2 > 0:
-                    shape = (shape0, shape1, shape2)
-                else:
-                    self._last_sequence = sequence
-                    return None
-
-                if dtype_code == 1:
-                    dtype = np.uint8
-                elif dtype_code == 2:
-                    dtype = np.uint16
-                else:
-                    self._last_sequence = sequence
-                    return None
-
-                required = int(np.prod(shape)) * np.dtype(dtype).itemsize
-                if required > self._slot_bytes:
-                    self._last_sequence = sequence
-                    return None
-
-                image = np.ndarray(
-                    shape,
-                    dtype=dtype,
-                    buffer=self._shared_buffer,
-                    offset=slot * self._slot_bytes,
-                ).copy()
-                timestamp = float(self._slot_timestamps[slot])
-
-            self._last_sequence = sequence
-            frame = Frame()
-            frame.frame = image
-            frame.timestamp = timestamp
-            return frame
-
-        # The child captured more frames than the ring can retain. Return the
-        # newest one on the next call instead of replaying stale images.
-        self._last_sequence = latest - 1
-        return None
+    def _grab_strategy(self):
+        if getattr(self.cfg, "grab_strategy_latest_only", False):
+            return pylon.GrabStrategy_LatestImageOnly
+        return pylon.GrabStrategy_OneByOne
 
     # ------------------------------------------------------------------
-    # Source interface
+    # Frame acquisition and recovery
     # ------------------------------------------------------------------
 
-    def _log_error(self, message: str) -> None:
-        now = time.perf_counter()
-        if message != self._last_error or now - self._last_error_time >= 1.0:
-            print(f"[CAM-ERR] {message}")
-            self._last_error = message
-            self._last_error_time = now
+    def _grab_raw_once(self):
+        with self._camera_lock:
+            if self._closed or self.camera is None:
+                return False, None
 
-    def _drain_events(self) -> None:
-        while True:
+            camera = self.camera
+            grab_result = None
             try:
-                kind, message = self._events.get_nowait()
-            except (queue.Empty, EOFError, OSError):
-                return
-            self._log_error(message)
-            if kind == "fatal":
-                self._fatal_state.value = 1
+                if not camera.IsGrabbing():
+                    self._log_grab_error("Kamera grabbt nicht (IsGrabbing=False)")
+                    return False, None
+
+                grab_result = camera.RetrieveResult(
+                    self.RETRIEVE_TIMEOUT_MS,
+                    pylon.TimeoutHandling_Return,
+                )
+                if grab_result is None:
+                    self._log_grab_error("RetrieveResult liefert None")
+                    return False, None
+
+                if not grab_result.IsValid():
+                    self._log_grab_error(
+                        "Grab-Ergebnis ungueltig: "
+                        f"code={self._grab_error_code(grab_result)} "
+                        f"text={self._grab_error_text(grab_result)}"
+                    )
+                    return False, None
+
+                if not grab_result.GrabSucceeded():
+                    self._log_grab_error(
+                        "Grab fehlgeschlagen: "
+                        f"code={self._grab_error_code(grab_result)} "
+                        f"text={self._grab_error_text(grab_result)}"
+                    )
+                    return False, None
+
+                image = grab_result.GetArray()
+                if image is None:
+                    self._log_grab_error("Grab-Ergebnis enthaelt kein Bild")
+                    return False, None
+
+                frame = Frame()
+                # pypylon's array is backed by the grab result.  Copy before
+                # Release(), otherwise a later grab can overwrite the image.
+                frame.frame = image.copy()
+                frame.timestamp = time.perf_counter()
+                return True, frame
+            except Exception as exc:
+                self._log_grab_error(f"Basler-Grab fehlgeschlagen: {exc}")
+                return False, None
+            finally:
+                if grab_result is not None:
+                    try:
+                        grab_result.Release()
+                    except Exception as exc:
+                        self._log_grab_error(f"Grab-Ergebnis konnte nicht freigegeben werden: {exc}")
+
+    @staticmethod
+    def _grab_error_code(grab_result) -> str:
+        try:
+            return str(grab_result.GetErrorCode())
+        except Exception:
+            return "unbekannt"
+
+    @staticmethod
+    def _grab_error_text(grab_result) -> str:
+        try:
+            return str(grab_result.GetErrorDescription())
+        except Exception:
+            return "unbekannt"
+
+    def _log_grab_error(self, message: str) -> None:
+        now = time.perf_counter()
+        if message != self._last_grab_error or now - self._last_grab_error_time >= 1.0:
+            print(f"[CAM-ERR] {message}")
+            self._last_grab_error = message
+            self._last_grab_error_time = now
 
     def read(self):
-        if self._closed:
-            return False, None
+        ok, frame = self._grab_raw_once()
+        now = time.perf_counter()
 
-        self._drain_events()
-        process = self._process
-        startup_state = int(self._startup_state.value)
-        now = time.monotonic()
-
-        if self._transport_faulted:
-            self._read_failures += 1
-            return False, None
-
-        if startup_state < 0 or process is None or not process.is_alive():
-            self._restart_process("Capture-Prozess beendet")
-            self._read_failures += 1
-            return False, None
-        if startup_state != 1:
-            self._read_failures += 1
-            return False, None
-
-        frame = self._read_latest_frame()
-        if frame is not None:
+        if ok and frame is not None:
             self._read_count += 1
-            self._read_failures = 0
-            self._last_frame_time = now
+            self._consecutive_grab_failures = 0
+            self._first_grab_failure_time = 0.0
         else:
             self._read_failures += 1
-            if now - self._last_frame_time >= self.FRAME_STALL_SECONDS:
-                reason = (
-                    "dauerhafter Grab-/Read-Fehler"
-                    if self._fatal_state.value
-                    else "keine neuen Frames"
-                )
-                self._restart_process(reason)
+            self._consecutive_grab_failures += 1
+            if self._consecutive_grab_failures == 1:
+                self._first_grab_failure_time = now
+            failure_duration = now - self._first_grab_failure_time
+            if (
+                self._consecutive_grab_failures >= self.RECOVERY_FAILURE_THRESHOLD
+                and failure_duration >= self.RECOVERY_MIN_FAILURE_DURATION_SECONDS
+            ):
+                self._recover_grab_stream()
 
         if now - self._read_log_time >= 1.0:
             elapsed = now - self._read_log_time
@@ -441,40 +403,192 @@ class BaslerSource:
             self._read_failures = 0
             self._read_log_time = now
 
-        return (True, frame) if frame is not None else (False, None)
+        return ok, frame
+
+    def _recover_grab_stream(self) -> None:
+        with self._camera_lock:
+            if self._closed:
+                return
+
+            now = time.perf_counter()
+            if now - self._last_recovery_time < self.RECOVERY_INTERVAL_SECONDS:
+                return
+            self._last_recovery_time = now
+
+            print("[CAM-RECOVER] Kamera-Grab-Stream wird neu aufgebaut")
+            old_camera = self.camera
+            self.camera = None
+
+        # StopGrabbing() can block in the USB transport layer.  Recovery is
+        # called from the camera worker, so doing it inline would strand that
+        # worker and make a later shutdown impossible.  Do not reconnect
+        # while cleanup is still blocked: a second InstantCamera would only
+        # compete for the same USB handle.
+        if not self._cleanup_camera_bounded(old_camera):
+            print(
+                "[CAM-RECOVER] Altes Kamera-Handle blockiert; "
+                "Reconnect wird uebersprungen"
+            )
+            return
+
+        # Close() stops acquisition, while DestroyDevice() detaches the
+        # transport-layer device.  The explicit detach is important on USB:
+        # otherwise the old InstantCamera can keep the device node busy even
+        # though pylon reports it as closed.
+        del old_camera
+        gc.collect()
+
+        if self._closed:
+            return
+
+        try:
+            new_camera = self._open_camera()
+            with self._camera_lock:
+                if self._closed:
+                    discard_camera = True
+                else:
+                    self.camera = new_camera
+                    discard_camera = False
+            if discard_camera:
+                self._cleanup_camera_bounded(new_camera)
+                return
+            self._consecutive_grab_failures = 0
+            print("[CAM-RECOVER] Kamera neu verbunden")
+        except Exception as exc:
+            print(f"[CAM-RECOVER] Kamera-Reconnect fehlgeschlagen: {exc}")
+
+    def _cleanup_camera_bounded(self, camera, timeout: float = 1.0) -> bool:
+        """Run pypylon cleanup without blocking an application worker."""
+        with self._cleanup_lock:
+            if self._pending_cleanup is not None:
+                if self._pending_cleanup.is_alive():
+                    return False
+                self._pending_cleanup = None
+
+            if camera is None:
+                return True
+
+            cleanup = threading.Thread(
+                target=self._stop_and_close,
+                args=(camera,),
+                name="basler-cleanup",
+                daemon=True,
+            )
+            self._pending_cleanup = cleanup
+            cleanup.start()
+        cleanup.join(timeout=max(0.0, float(timeout)))
+        finished = not cleanup.is_alive()
+        if finished:
+            with self._cleanup_lock:
+                if self._pending_cleanup is cleanup:
+                    self._pending_cleanup = None
+        return finished
+
+    @staticmethod
+    def _stop_and_close(camera) -> None:
+        if camera is None:
+            return
+        try:
+            if camera.IsGrabbing():
+                camera.StopGrabbing()
+        except Exception as exc:
+            print(f"[CAMERA] StopGrabbing fehlgeschlagen: {exc}")
+        try:
+            if camera.IsOpen():
+                camera.Close()
+        except Exception as exc:
+            print(f"[CAMERA] Close fehlgeschlagen: {exc}")
+        try:
+            attached = getattr(camera, "IsPylonDeviceAttached", None)
+            if not callable(attached) or attached():
+                destroy = getattr(camera, "DestroyDevice", None)
+                if callable(destroy):
+                    destroy()
+        except Exception as exc:
+            print(f"[CAMERA] DestroyDevice fehlgeschlagen: {exc}")
+
+    # ------------------------------------------------------------------
+    # Source compatibility and shutdown
+    # ------------------------------------------------------------------
+
+    def showFPS(self) -> str:
+        for name in ("BslResultingAcquisitionFrameRate", "ResultingFrameRate"):
+            value = self._get_feature(self.camera, name) if self.camera is not None else None
+            try:
+                if value is not None and float(value) > 0:
+                    self.fps = float(value)
+                    break
+            except (TypeError, ValueError):
+                continue
+        return f"{self.fps:.2f}"
 
     def reset(self) -> None:
         """Keep the source interface; a live camera has no replay position."""
 
-    def showFPS(self) -> str:
-        value = float(self._fps_value.value)
-        if value > 0:
-            self.fps = value
-        return f"{self.fps:.2f}"
-
     def get_temperature(self) -> Optional[str]:
+        if self.camera is None:
+            return None
+        for name in ("DeviceTemperature", "BslTemperature"):
+            value = self._get_feature(self.camera, name)
+            if value is not None:
+                return str(value)
         return None
 
+    # Preserve the old method spelling for callers outside the application.
     def getTemperatur(self, camera=None) -> Optional[str]:
         return self.get_temperature()
 
-    def _close_event_queue(self) -> None:
-        try:
-            self._events.close()
-            self._events.join_thread()
-        except (AttributeError, OSError, ValueError):
-            pass
-
     def release(self) -> None:
+        """Release the camera without allowing a stuck USB cleanup to hang app exit.
+
+        On this USB camera/transport combination, ``StopGrabbing`` has been
+        observed to block in the kernel after the first run.  Waiting for it
+        in the application's main thread leaves the process alive and keeps
+        the camera busy for the next start.  Marking the source closed first
+        prevents new grabs; cleanup then runs in a daemon thread and is given
+        only a short grace period.  If pylon remains stuck, process exit
+        releases the USB file descriptor.
+        """
         with self._release_lock:
             if self._closed:
                 return
             self._closed = True
-            self._stop_event.set()
+            # The worker threads are stopped by KickerApp before release().
+            # Do not wait on _camera_lock here: an in-flight RetrieveResult()
+            # may be the operation that is holding it.
+            camera = self.camera
+            self.camera = None
 
-        self._stop_process(timeout=5.0)
-        self._close_event_queue()
-        self._restore_host_affinity()
-        print("[SHUTDOWN] Basler-Capture-Prozess beendet")
+        cleanup = threading.Thread(
+            target=self._release_camera_async,
+            args=(camera,),
+            name="basler-cleanup",
+            daemon=True,
+        )
+        cleanup.start()
+        cleanup.join(timeout=1.0)
+        if cleanup.is_alive():
+            print(
+                "[SHUTDOWN] Basler-Cleanup blockiert; "
+                "Prozess wird trotzdem beendet"
+            )
+        else:
+            print("[SHUTDOWN] Basler sauber gestoppt und geschlossen")
+
+    def _release_camera_async(self, camera) -> None:
+        """Serialize cleanup with a possible in-flight grab/recovery."""
+        if camera is None:
+            return
+
+        # Avoid running StopGrabbing concurrently with RetrieveResult or the
+        # recovery path.  The timeout is intentionally bounded as this is a
+        # daemon cleanup thread.
+        if not self._camera_lock.acquire(timeout=1.0):
+            print("[SHUTDOWN] Kamera-Lock nicht freigegeben; Cleanup abgebrochen")
+            return
+        try:
+            self._stop_and_close(camera)
+        finally:
+            self._camera_lock.release()
 
     close = release

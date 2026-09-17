@@ -14,14 +14,14 @@ class AppConfig:
     ball_detection: Dict[str, Any] = field(default_factory=dict)
     # === Runtime ===
     headless: bool = False
-    opencv_threads: int = 8
+    ball_detection_enabled: bool = False
     replay_seconds: int = 3
+    replay_ipc_name: str = "tracking_kicker_replay_frames"
+    replay_ipc_slots: int = 160
 
     # === Video ===
     target_display_fps: int = 60
-    replay_fps: int = 120
     use_camera: bool = True
-    debug_video: str | None = None
 
     # === Paths ===
     base_dir: Path = field(default_factory=lambda: Path(__file__).resolve().parents[0])

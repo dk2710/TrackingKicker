@@ -6,7 +6,7 @@ import threading
 import traceback
 from collections import deque
 from datetime import datetime
-from queue import Empty, Full
+from queue import Empty
 
 import numpy as np
 
@@ -17,10 +17,8 @@ from .runtime import (
     GOAL_VIDEO_DURATION_SECONDS,
     GOAL_VIDEO_FPS,
     RETRO_BUFFER_MAX_FRAMES,
-    RETRO_BALL_LOSS_SECONDS,
     RETRO_MAX_REANALYZE_FRAMES,
-    RETRO_REARM_MIN_BALL_DETECTIONS,
-    RETRO_REARM_WINDOW_SECONDS,
+    RETRO_TRIGGER_NO_BALL_FRAMES,
     HEADLESS,
 )
 from .ui.opencv_gui import (
@@ -71,35 +69,46 @@ class WorkerMixin:
         )
         return selected
 
-    def _prepare_and_detect(self, source_frame, *, detector=None, dist=None):
+    def _has_skipped_frame_before(self, frame_id) -> bool:
+        with self.skipped_frame_lock:
+            if frame_id is None:
+                return bool(self.skipped_frame_buffer)
+            return any(
+                getattr(skipped, "frame_id", frame_id) <= frame_id
+                for skipped in self.skipped_frame_buffer
+            )
+
+    def _prepare_and_detect(self, source_frame):
         """Copy, correct and detect one raw frame from the replay buffer."""
-        detector = self.detector if detector is None else detector
-        dist = self.dist if dist is None else dist
         frame = copy.copy(source_frame)
-        raw_image = source_frame.frame
-        converted = to_bgr(raw_image, dist.camera.pixel_format)
-        frame.frame = converted if converted is not raw_image else raw_image.copy()
-        frame.frame = dist.apply(frame.frame)
-        detector.detect(frame, image_is_bgr=True)
+        frame.frame = source_frame.frame.copy()
+        frame.frame = to_bgr(frame.frame, self.dist.camera.pixel_format)
+        with self.calibration_lock:
+            frame.frame = self.dist.apply(frame.frame)
+        if getattr(self, "ball_detection_enabled", True):
+            self.detector.detect(frame)
+        else:
+            frame.ball = None
+            frame.ball_track_valid = False
+            frame.ball_track_reason = "deaktiviert"
+            frame.ball_track_distance_px = None
         return frame
 
-    def _restore_skipped_frames(self, frames) -> None:
-        """Return a batch if the bounded retro queue filled meanwhile."""
-        if not frames:
-            return
-        with self.skipped_frame_lock:
-            combined = list(self.skipped_frame_buffer)
-            combined.extend(frames)
-            combined.sort(
-                key=lambda item: (
-                    getattr(item, "frame_id", 0),
-                    getattr(item, "timestamp", 0.0),
-                )
-            )
-            self.skipped_frame_buffer = deque(
-                combined[-RETRO_BUFFER_MAX_FRAMES:],
-                maxlen=RETRO_BUFFER_MAX_FRAMES,
-            )
+    def _reanalyze_skipped_frames(self, current_frame_id):
+        """Run bounded detection on skipped frames before the live frame."""
+        skipped_frames = self._take_skipped_frames(current_frame_id)
+        if not skipped_frames:
+            return []
+
+        recovered = []
+        for skipped in skipped_frames:
+            try:
+                recovered.append(self._prepare_and_detect(skipped))
+            except Exception as exc:
+                print(f"[RETRO] Frame konnte nicht analysiert werden: {exc}")
+
+        self._retro_analysis_count += len(recovered)
+        return recovered
 
     def _process_recovered_frames(self, recovered_frames, current_frame):
         """Use recovered positions for speed and register a goal candidate."""
@@ -145,144 +154,8 @@ class WorkerMixin:
             return self.analyzer.confirm_recovered_goal(side, landing_timestamp)
         return False, False
 
-    def _schedule_retro_analysis(self, current_frame_id) -> bool:
-        """Move skipped raw frames to the independent retro worker."""
-        if self.retro_queue.full():
-            return False
-
-        skipped_frames = self._take_skipped_frames(current_frame_id)
-        if not skipped_frames:
-            return False
-
-        try:
-            self.retro_queue.put_nowait(skipped_frames)
-            return True
-        except Full:
-            # Normally impossible because only this analysis thread writes to
-            # the queue, but never lose the batch because of a race.
-            self._restore_skipped_frames(skipped_frames)
-            return False
-
-    def _update_ball_episode(self, frame) -> None:
-        """Track whether a new ball episode has armed retro analysis."""
-        timestamp = float(getattr(frame, "timestamp", time.perf_counter()))
-
-        if (
-            self._retro_triggered_for_episode
-            and self._last_ball_seen_timestamp is not None
-            and timestamp - self._last_ball_seen_timestamp
-            >= RETRO_BALL_LOSS_SECONDS
-        ):
-            self._waiting_for_new_ball = True
-
-        if frame.ball is None:
-            return
-
-        if self._retro_triggered_for_episode and not self._waiting_for_new_ball:
-            # The same ball episode is still active. Do not re-arm retro just
-            # because the ball remains visible after a goal-triggered batch.
-            self._last_ball_seen_timestamp = timestamp
-            return
-
-        self._last_ball_seen_timestamp = timestamp
-        self._recent_ball_detections.append(timestamp)
-        cutoff = timestamp - RETRO_REARM_WINDOW_SECONDS
-        while (
-            self._recent_ball_detections
-            and self._recent_ball_detections[0] < cutoff
-        ):
-            self._recent_ball_detections.popleft()
-
-        if len(self._recent_ball_detections) >= RETRO_REARM_MIN_BALL_DETECTIONS:
-            self._retro_armed = True
-            self._retro_triggered_for_episode = False
-            self._waiting_for_new_ball = False
-
-    def _retro_loss_elapsed(self, frame) -> bool:
-        """Return whether an armed ball episode has been absent for 0.5 s."""
-        if not self._retro_armed or self._last_ball_seen_timestamp is None:
-            return False
-
-        timestamp = float(getattr(frame, "timestamp", time.perf_counter()))
-        return timestamp - self._last_ball_seen_timestamp >= RETRO_BALL_LOSS_SECONDS
-
-    def _start_retro_if_possible(self, current_frame_id, reason: str) -> bool:
-        """Start one retro batch and disarm until a new ball episode."""
-        if self._retro_triggered_for_episode:
-            return False
-        if not self._schedule_retro_analysis(current_frame_id):
-            return False
-
-        self._retro_armed = False
-        self._retro_triggered_for_episode = True
-        self._waiting_for_new_ball = False
-        self._recent_ball_detections.clear()
-        print(f"[RETRO] Einmalige Nachanalyse gestartet ({reason})")
-        return True
-
-    def _drain_retro_results(self, current_frame) -> None:
-        """Apply retro detections in the stateful live-analysis thread."""
-        while True:
-            try:
-                recovered_frames = self.retro_result_queue.get_nowait()
-            except Empty:
-                return
-
-            recovered_goal = self._process_recovered_frames(
-                recovered_frames, current_frame
-            )
-            self._handle_goal(recovered_goal)
-
-    def retro_loop(self):
-        """Detect skipped frames without blocking live analysis."""
-        while not self.stop_event.is_set():
-            try:
-                skipped_frames = self.retro_queue.get(timeout=0.5)
-            except Empty:
-                continue
-
-            recovered = []
-            for skipped in skipped_frames:
-                if self.stop_event.is_set():
-                    break
-                try:
-                    recovered.append(
-                        self._prepare_and_detect(
-                            skipped,
-                            detector=self.retro_detector,
-                            dist=self.retro_dist,
-                        )
-                    )
-                except Exception as exc:
-                    print(f"[RETRO] Frame konnte nicht analysiert werden: {exc}")
-
-            self._retro_analysis_count += len(recovered)
-            if not recovered:
-                continue
-
-            # The live worker consumes results quickly. If it is temporarily
-            # busy, keep the newest completed batch and avoid blocking this
-            # worker or growing memory without limit.
-            try:
-                if self.retro_result_queue.full():
-                    self.retro_result_queue.get_nowait()
-                self.retro_result_queue.put_nowait(recovered)
-            except (Empty, Full):
-                pass
-
-    def capture_loop(self):
-        """Capture frames independently from the analysis worker.
-
-        This loop is deliberately kept small: it reads from the source,
-        assigns a sequence number and publishes the raw frame. The hand-off
-        queue is lossy and non-blocking. When analysis is slower than
-        acquisition, the oldest pending analysis frame is discarded so this
-        loop can immediately return to pypylon.
-
-        The raw image is never modified here. The analysis worker makes its
-        own copy before conversion, so replay and recording can safely share
-        the raw frame without another full-resolution copy in this loop.
-        """
+    def camera_loop(self):
+        dropped = 0
         while not self.stop_event.is_set():
             try:
                 ret, objframe = self.video.read()
@@ -297,46 +170,31 @@ class WorkerMixin:
                 objframe.frame_id = self._frame_sequence
 
                 with self.replay_lock:
-                    # The pre-goal NPZ needs the complete raw stream for one
-                    # second. The visual replay only needs its target output
-                    # rate, so sampling it avoids retaining hundreds of
-                    # full-size arrays at 180 FPS.
-                    self.goal_pre_buffer.append(
-                        (objframe.frame, objframe.timestamp)
+                    self.replay_buffer.append(
+                        (objframe.frame.copy(), objframe.timestamp)
                     )
-                    replay_interval = 1.0 / max(1.0, float(GOAL_VIDEO_FPS))
-                    if (
-                        self._last_replay_sample_timestamp <= 0.0
-                        or objframe.timestamp - self._last_replay_sample_timestamp
-                        >= replay_interval
+                    while (
+                        self.replay_buffer
+                        and objframe.timestamp - self.replay_buffer[0][1]
+                        > GOAL_VIDEO_DURATION_SECONDS
                     ):
-                        self.replay_buffer.append(
-                            (objframe.frame, objframe.timestamp)
-                        )
-                        self._last_replay_sample_timestamp = objframe.timestamp
+                        self.replay_buffer.popleft()
 
-                while not self.stop_event.is_set():
+                if self.frame_queue.full():
                     try:
-                        self.frame_queue.put_nowait(objframe)
-                        break
-                    except Full:
-                        try:
-                            skipped = self.frame_queue.get_nowait()
-                        except Empty:
-                            continue
+                        skipped = self.frame_queue.get_nowait()
                         self._remember_skipped_frame(skipped)
+                        dropped += 1
+                    except Empty:
+                        pass
+
+                self.frame_queue.put(objframe)
 
                 if self.record_event.is_set():
                     try:
-                        # The recording worker copies the raw image outside
-                        # this time-critical camera loop.
-                        self.recording_queue.put_nowait(objframe)
-                    except Full:
-                        try:
-                            self.recording_queue.get_nowait()
-                            self.recording_queue.put_nowait(objframe)
-                        except (Empty, Full):
-                            pass
+                        # The processing worker changes the Frame in place;
+                        # recording must keep the original raw image.
+                        self.recording_queue.put(objframe.frame.copy())
                     except Exception as exc:
                         print(f"⚠️ Recording Queue Fehler: {exc}")
 
@@ -344,13 +202,6 @@ class WorkerMixin:
                 print(f"❌ Camera-Loop Fehler: {exc}")
                 traceback.print_exc()
                 time.sleep(0.05)
-
-    # Compatibility for callers that used the old worker name.
-    camera_loop = capture_loop
-
-    def analysis_loop(self):
-        """Run analysis independently from frame acquisition."""
-        self.processing_loop()
 
     def correction_loop(self):
         while not self.stop_event.is_set():
@@ -386,7 +237,7 @@ class WorkerMixin:
 
         while not self.stop_event.is_set():
             try:
-                source_frame = self.frame_queue.get(timeout=0.5)
+                frame = self.frame_queue.get(timeout=0.5)
 
                 while True:
                     try:
@@ -396,56 +247,102 @@ class WorkerMixin:
                     except Empty:
                         break
 
-                # Never convert the capture-owned raw frame in place. Replay
-                # and recording may still reference the same image. Analysis
-                # receives an independent copy instead.
-                frame = copy.copy(source_frame)
-
                 stage_start = time.perf_counter()
-                raw_image = source_frame.frame
-                converted = to_bgr(raw_image, self.dist.camera.pixel_format)
+                frame.frame = to_bgr(frame.frame, self.dist.camera.pixel_format)
                 stage_time["cvt"] += time.perf_counter() - stage_start
 
                 stage_start = time.perf_counter()
-                detection_image = None
-                detection_scale = getattr(self.detector, "detection_scale", 1.0)
-                if HEADLESS and 0.0 < detection_scale < 1.0:
-                    # No consumer needs a full corrected image in headless
-                    # mode. Keep the full shape on the frame for ROI,
-                    # homography, and speed units, while the detector gets a
-                    # corrected image at its existing detection scale.
-                    frame.frame = converted
-                    detection_image = self.analysis_dist.apply_scaled(
-                        converted, detection_scale
-                    )
-                else:
-                    # Bayer conversion already allocates a new BGR image. The
-                    # remap below also allocates its output, so a second copy
-                    # of capture-owned BGR input is unnecessary.
-                    frame.frame = self.dist.apply(converted)
+                with self.calibration_lock:
+                    frame.frame = self.dist.apply(frame.frame)
                 stage_time["dist"] += time.perf_counter() - stage_start
 
                 now = time.perf_counter()
                 n += 1
 
                 stage_start = time.perf_counter()
-                self.detector.detect(
-                    frame,
-                    detection_image=detection_image,
-                    detection_scale=detection_scale,
-                    image_is_bgr=True,
-                )
+                if self.ball_detection_enabled:
+                    self.detector.detect(frame)
+                else:
+                    frame.ball = None
+                    frame.ball_track_valid = False
+                    frame.ball_track_reason = "deaktiviert"
+                    frame.ball_track_distance_px = None
                 stage_time["detect"] += time.perf_counter() - stage_start
 
-                current_frame_id = getattr(frame, "frame_id", None)
-                self._update_ball_episode(frame)
-                loss_elapsed = self._retro_loss_elapsed(frame)
+                with self.detection_state_lock:
+                    self.last_detection = {
+                        "frame_id": getattr(frame, "frame_id", None),
+                        "timestamp": float(getattr(frame, "timestamp", 0.0)),
+                        "ball": list(frame.ball) if frame.ball is not None else None,
+                        "ball_track_valid": bool(
+                            getattr(frame, "ball_track_valid", False)
+                        ),
+                        "ball_track_reason": getattr(
+                            frame, "ball_track_reason", None
+                        ),
+                        "ball_track_distance_px": getattr(
+                            frame, "ball_track_distance_px", None
+                        ),
+                    }
 
-                # Retro detections arrive asynchronously, but all analyzer
-                # state is still updated by this live worker only. Keep this
-                # after the live gap calculation so late frames cannot alter
-                # the gap used for the current frame.
-                self._drain_retro_results(frame)
+                no_ball_before = self._no_ball_live_frames
+                current_frame_id = getattr(frame, "frame_id", None)
+                raw_frame_gap = None
+                if (
+                    current_frame_id is not None
+                    and self._last_visible_frame_id is not None
+                ):
+                    raw_frame_gap = current_frame_id - self._last_visible_frame_id
+
+                if frame.ball is None:
+                    self._no_ball_live_frames += 1
+                else:
+                    self._no_ball_live_frames = 0
+
+                recover_due_to_missing_ball = (
+                    frame.ball is None
+                    and (
+                        self._no_ball_live_frames >= RETRO_TRIGGER_NO_BALL_FRAMES
+                        or (
+                            raw_frame_gap is not None
+                            and raw_frame_gap >= RETRO_TRIGGER_NO_BALL_FRAMES
+                            and (
+                                self._last_retro_frame_id is None
+                                or current_frame_id - self._last_retro_frame_id
+                                >= RETRO_TRIGGER_NO_BALL_FRAMES
+                            )
+                        )
+                    )
+                )
+                recover_due_to_ball_return = (
+                    frame.ball is not None
+                    and (
+                        no_ball_before >= 3
+                        or (
+                            raw_frame_gap is not None
+                            and raw_frame_gap >= 3
+                            and (
+                                self._last_retro_frame_id is None
+                                or current_frame_id - self._last_retro_frame_id >= 3
+                            )
+                        )
+                    )
+                )
+                should_recover = (
+                    recover_due_to_missing_ball or recover_due_to_ball_return
+                ) and self._has_skipped_frame_before(current_frame_id)
+
+                if should_recover:
+                    self._last_retro_frame_id = current_frame_id
+                    recovered_frames = self._reanalyze_skipped_frames(current_frame_id)
+                    stage_start = time.perf_counter()
+                    recovered_goal = self._process_recovered_frames(
+                        recovered_frames, frame
+                    )
+                    stage_time["analyze"] += time.perf_counter() - stage_start
+                    self._handle_goal(recovered_goal)
+                    if frame.ball is None:
+                        self._no_ball_live_frames = 1
 
                 if frame.ball is not None and current_frame_id is not None:
                     self._last_visible_frame_id = current_frame_id
@@ -455,36 +352,21 @@ class WorkerMixin:
                 stage_time["analyze"] += time.perf_counter() - stage_start
                 self._handle_goal(goal)
 
-                # A live goal result is an immediate retro trigger. Otherwise
-                # an armed ball episode starts exactly once after 0.5 s
-                # without a ball. The retro worker itself still processes its
-                # complete batch if a goal appears in the middle of it.
-                if goal and any(goal):
-                    self._start_retro_if_possible(current_frame_id, "Tor erkannt")
-                elif loss_elapsed:
-                    self._start_retro_if_possible(
-                        current_frame_id, "0.5 s ohne Ball"
-                    )
+                stage_start = time.perf_counter()
+                self.analyzer.draw_overlay(frame)
+                stage_time["overlay"] += time.perf_counter() - stage_start
 
-                # In headless operation no consumer can display this image.
-                # Avoid drawing several overlays and handing a full BGR frame
-                # to a queue that is never read.  Analysis still receives the
-                # exact same corrected image and ball coordinates above.
-                if not HEADLESS:
-                    stage_start = time.perf_counter()
-                    self.analyzer.draw_overlay(frame)
-                    stage_time["overlay"] += time.perf_counter() - stage_start
-
-                    if self.display_queue.full():
-                        try:
-                            self.display_queue.get_nowait()
-                        except Empty:
-                            pass
-                    self.display_queue.put(frame.frame)
+                if self.display_queue.full():
+                    try:
+                        self.display_queue.get_nowait()
+                    except Empty:
+                        pass
+                self.display_queue.put(frame.frame)
 
                 if now - last_log >= 1.0:
                     dt = now - last_log
                     host_fps = n / dt
+                    self.processing_fps = host_fps
                     print(
                         f"[CAM] AnalysierenFPS={host_fps:.1f} | "
                         f"cvt={stage_time['cvt'] / n * 1000:.1f}ms "
@@ -538,8 +420,7 @@ class WorkerMixin:
                         continue
 
                     raw_frame = self.recording_queue.get(timeout=0.2)
-                    raw_image = getattr(raw_frame, "frame", raw_frame)
-                    raw_frames.append(raw_image.copy())
+                    raw_frames.append(raw_frame.copy())
                     raw_times.append(time.perf_counter() - t_start)
                 except Empty:
                     continue

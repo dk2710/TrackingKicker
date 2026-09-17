@@ -1,142 +1,339 @@
+"""BallTuner consumer for frames produced by ``v3.camera_process``."""
+
 from __future__ import annotations
 
+import json
 import threading
 import time
 from dataclasses import fields
 from typing import Any, Dict, Optional
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import cv2
 import numpy as np
-from pypylon import pylon
+
+from v3.camera_frame_ipc import DEFAULT_NAME, DEFAULT_SLOTS, SharedFrameRing
+from v3.tracking_kicker.camera.conversion import to_bgr
 
 from .settings import BallDetectionSettings, CameraSettings
 
 
 class BaslerCamera:
-    """Small, independent Basler preview and settings controller.
+    """Website-side tuner that never opens pypylon or the USB camera."""
 
-    The camera is accessed by one capture thread. Settings are applied by
-    stopping and reopening that stream, so the same values are also used after
-    a transport error and reconnect.
-    """
-
-    RECOVERY_FAILURE_THRESHOLD = 5
-    RETRY_SECONDS = 2.0
+    PREVIEW_FPS_LIMIT = 30.0
 
     def __init__(
         self,
         settings: CameraSettings,
         ball_settings: Optional[BallDetectionSettings] = None,
-    ):
+        *,
+        ball_detection_enabled: bool = False,
+        frame_ipc_name: str = DEFAULT_NAME,
+        frame_ipc_slots: int = DEFAULT_SLOTS,
+        control_url: str = "http://127.0.0.1:5011",
+    ) -> None:
         self.settings = settings
         self.ball_settings = ball_settings or BallDetectionSettings()
-        self.camera = None
-        self._camera_lock = threading.RLock()
-        self._latest_lock = threading.Lock()
+        self._ball_detection_enabled = bool(ball_detection_enabled)
+        self._frame_ipc_name = str(frame_ipc_name)
+        self._frame_ipc_slots = DEFAULT_SLOTS
+        self._control_url = str(control_url).rstrip("/")
+        self._ring: Optional[SharedFrameRing] = None
+        self._ring_lock = threading.RLock()
         self._stop_event = threading.Event()
         self._capture_thread: Optional[threading.Thread] = None
-
+        self._preview_thread: Optional[threading.Thread] = None
+        self._raw_frame: Optional[np.ndarray] = None
+        self._raw_sequence = 0
+        self._latest_frame: Optional[np.ndarray] = None
         self._latest_jpeg: Optional[bytes] = None
         self._latest_ball_jpeg: Optional[bytes] = None
         self._latest_mask_jpeg: Optional[bytes] = None
-        self._latest_frame: Optional[np.ndarray] = None
+        self._last_ball = None
+        self._latest_lock = threading.Lock()
+        self._stats_lock = threading.Lock()
         self._frame_number = 0
         self._received_frames = 0
-        self._failed_grabs = 0
-        self._measured_fps = 0.0
+        self._preview_fps = 0.0
+        self._dropped_frames = 0
+        self._ipc_errors = 0
         self._last_error = ""
-        self._model = ""
-        self._last_frame_time = 0.0
-        self._last_ball = None
+        self._last_error_time = 0.0
+        self._remote_status: Dict[str, Any] = {}
+        self._remote_last_error = ""
 
     # ------------------------------------------------------------------
-    # Camera lifecycle
+    # CameraProcess control API
+    # ------------------------------------------------------------------
+    def _request(self, path: str, *, method: str = "GET", payload=None):
+        data = None
+        headers = {}
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = Request(
+            self._control_url + path,
+            data=data,
+            headers=headers,
+            method=method,
+        )
+        with urlopen(request, timeout=0.8) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def _read_remote_status(self) -> Dict[str, Any]:
+        try:
+            remote = self._request("/api/status")
+            with self._stats_lock:
+                self._remote_status = remote
+            remote_error = str(remote.get("last_error", "") or "")
+            if remote_error and remote_error != self._remote_last_error:
+                self._remote_last_error = remote_error
+                self._set_error(f"CameraProcess: {remote_error}")
+            elif not remote_error and self._remote_last_error:
+                self._remote_last_error = ""
+                with self._stats_lock:
+                    if self._last_error.startswith("CameraProcess:"):
+                        self._last_error = ""
+                        self._last_error_time = 0.0
+            return remote
+        except (OSError, ValueError, HTTPError, URLError) as exc:
+            self._set_error(f"CameraProcess-Verbindung fehlgeschlagen: {exc}")
+            with self._stats_lock:
+                return dict(self._remote_status)
+
+    def update_settings(self, values: Dict[str, Any]) -> bool:
+        if "grab_strategy" in values and values["grab_strategy"] != "latest_image_only":
+            raise ValueError("Die Tracking-Konfiguration verwendet LatestImageOnly")
+        result = self._request("/api/settings", method="POST", payload={"camera": values})
+        if isinstance(result.get("settings"), dict):
+            self.settings = CameraSettings(**result["settings"])
+        return bool(result.get("camera_open", False))
+
+    def reconnect(self) -> bool:
+        try:
+            result = self._request("/api/reconnect", method="POST", payload={})
+            return bool(result.get("camera_open", False))
+        except (OSError, ValueError, HTTPError, URLError) as exc:
+            self._set_error(f"Kamera-Reconnect fehlgeschlagen: {exc}")
+            return False
+
+    # ------------------------------------------------------------------
+    # Consumer lifecycle and shared-memory reading
     # ------------------------------------------------------------------
     def start(self) -> None:
+        # The CameraProcess is authoritative for acquisition settings. This
+        # also makes the UI reflect settings changed outside the tuner.
+        self._sync_remote_settings()
         self._stop_event.clear()
         self._capture_thread = threading.Thread(
-            target=self._capture_loop,
-            name="basler-tuner-capture",
-            daemon=True,
+            target=self._consume_loop, name="ball-tuner-shared-memory", daemon=True
+        )
+        self._preview_thread = threading.Thread(
+            target=self._preview_loop, name="ball-tuner-preview", daemon=True
         )
         self._capture_thread.start()
+        self._preview_thread.start()
 
     def stop(self) -> None:
         self._stop_event.set()
-        self._close_camera()
-        if self._capture_thread is not None:
-            self._capture_thread.join(timeout=2.0)
+        for thread in (self._capture_thread, self._preview_thread):
+            if thread is not None:
+                thread.join(timeout=2.0)
+        with self._ring_lock:
+            if self._ring is not None:
+                self._ring.close()
+                self._ring = None
 
-    def reconnect(self) -> bool:
-        """Apply current settings by reopening the camera stream."""
-        with self._camera_lock:
-            if self._stop_event.is_set():
-                return False
-            return self._open_camera_locked()
+    def _attach_ring(self) -> Optional[SharedFrameRing]:
+        try:
+            ring = SharedFrameRing.open(self._frame_ipc_name)
+            expected = (int(self.settings.height), int(self.settings.width))
+            actual = (ring.height, ring.width)
+            if actual != expected:
+                ring.close()
+                raise RuntimeError(f"Framegroesse {actual} passt nicht zu {expected}")
+            print(
+                f"[BALL-TUNER] Shared Memory verbunden: {self._frame_ipc_name} "
+                f"({ring.width}x{ring.height})"
+            )
+            return ring
+        except Exception as exc:
+            self._set_error(f"Shared-Memory-Verbindung fehlgeschlagen: {exc}")
+            return None
 
-    def update_settings(self, values: Dict[str, Any]) -> bool:
-        """Validate settings, store them, and restart the stream."""
-        for name, value in values.items():
-            if not hasattr(self.settings, name):
-                continue
-            current = getattr(self.settings, name)
+    def _sync_remote_settings(self) -> None:
+        remote = self._read_remote_status()
+        values = remote.get("settings")
+        if not isinstance(values, dict):
+            return
+        try:
+            self.settings = CameraSettings(**values)
+        except (TypeError, ValueError) as exc:
+            self._set_error(f"Kameraeinstellungen des CameraProcess ungueltig: {exc}")
+
+    def _consume_loop(self) -> None:
+        last_sequence = 0
+        while not self._stop_event.is_set():
+            with self._ring_lock:
+                ring = self._ring
+            if ring is None:
+                ring = self._attach_ring()
+                if ring is None:
+                    self._stop_event.wait(0.5)
+                    continue
+                last_sequence = ring.latest_sequence()
+                with self._ring_lock:
+                    self._ring = ring
             try:
-                if isinstance(current, bool):
-                    value = bool(value)
-                elif isinstance(current, int):
-                    value = int(value)
-                elif isinstance(current, float):
-                    value = float(value)
-                else:
-                    value = str(value)
-            except (TypeError, ValueError):
-                raise ValueError(f"Ungueltiger Wert fuer {name}: {value!r}")
+                item = ring.read_latest(last_sequence)
+            except Exception as exc:
+                with self._stats_lock:
+                    self._ipc_errors += 1
+                self._set_error(f"Shared-Memory-Lesen fehlgeschlagen: {exc}")
+                with self._ring_lock:
+                    if self._ring is ring:
+                        self._ring = None
+                try:
+                    ring.close()
+                except Exception:
+                    pass
+                self._stop_event.wait(0.1)
+                continue
+            if item is None:
+                self._stop_event.wait(0.002)
+                continue
+            sequence, _timestamp, image = item
+            if sequence > last_sequence + 1:
+                with self._stats_lock:
+                    self._dropped_frames += sequence - last_sequence - 1
+            last_sequence = sequence
+            with self._latest_lock:
+                self._raw_frame = image
+                self._raw_sequence = int(sequence)
 
-            if name in {"width", "height", "max_num_buffer"} and value <= 0:
-                raise ValueError(f"{name} muss groesser als 0 sein")
-            if name == "force_fps" and value < 0:
-                raise ValueError("force_fps darf nicht negativ sein")
-            if name in {"offset_x", "offset_y", "packet_size", "inter_packet_delay"} and value < 0:
-                raise ValueError(f"{name} darf nicht negativ sein")
-            if name == "grab_strategy" and value not in {
-                "latest_image_only",
-                "one_by_one",
-            }:
-                raise ValueError("grab_strategy muss latest_image_only oder one_by_one sein")
+    def _preview_loop(self) -> None:
+        interval = 1.0 / self.PREVIEW_FPS_LIMIT
+        next_preview = time.monotonic()
+        last_sequence = 0
+        report_time = time.monotonic()
+        report_frames = 0
+        while not self._stop_event.is_set():
+            now = time.monotonic()
+            if next_preview > now and self._stop_event.wait(next_preview - now):
+                return
+            with self._latest_lock:
+                sequence = self._raw_sequence
+                image = None if self._raw_frame is None else self._raw_frame.copy()
+            if image is not None and sequence != last_sequence:
+                if self._publish_frame(image):
+                    last_sequence = sequence
+                    report_frames += 1
+            now = time.monotonic()
+            if now - report_time >= 1.0:
+                with self._stats_lock:
+                    self._preview_fps = report_frames / (now - report_time)
+                report_frames = 0
+                report_time = now
+            next_preview = max(next_preview + interval, now)
 
-            setattr(self.settings, name, value)
+    def _publish_frame(self, raw_image: np.ndarray) -> bool:
+        try:
+            image = to_bgr(raw_image, self.settings.pixel_format)
+            if image is None or image.size == 0:
+                return False
+            detection_enabled = self.is_ball_detection_enabled()
+            if detection_enabled:
+                ball_preview, mask_preview, ball = self._create_ball_preview(image)
+            else:
+                ball_preview, mask_preview, ball = image, image, None
+            ok, encoded = cv2.imencode(
+                ".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 85]
+            )
+            if detection_enabled:
+                preview_ok, ball_encoded = cv2.imencode(".jpg", ball_preview)
+                mask_ok, mask_encoded = cv2.imencode(".jpg", mask_preview)
+            else:
+                preview_ok = mask_ok = ok
+                ball_encoded = mask_encoded = encoded
+            if not ok or not preview_ok or not mask_ok:
+                return False
+            with self._latest_lock:
+                self._latest_frame = image
+                self._latest_jpeg = encoded.tobytes()
+                self._latest_ball_jpeg = ball_encoded.tobytes()
+                self._latest_mask_jpeg = mask_encoded.tobytes()
+                self._frame_number += 1
+                self._received_frames += 1
+                self._last_ball = ball
+            return True
+        except Exception as exc:
+            self._set_error(f"Preview-Verarbeitung fehlgeschlagen: {exc}")
+            return False
 
-        return self.reconnect()
+    def _create_ball_preview(self, image):
+        settings = self.ball_settings
+        scale = float(settings.detection_scale)
+        detection_image = image
+        if 0.0 < scale < 1.0:
+            detection_image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        hsv = cv2.cvtColor(cv2.GaussianBlur(detection_image, (5, 5), 0), cv2.COLOR_BGR2HSV)
+        lower = np.array([settings.hsv_low_h, settings.hsv_low_s, settings.hsv_low_v], dtype=np.uint8)
+        upper = np.array([settings.hsv_high_h, settings.hsv_high_s, settings.hsv_high_v], dtype=np.uint8)
+        mask = cv2.inRange(hsv, lower, upper)
+        mask = cv2.morphologyEx(
+            mask,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+            iterations=2,
+        )
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        candidates = []
+        area_scale = scale * scale
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if not settings.area_min * area_scale <= area <= settings.area_max * area_scale:
+                continue
+            (x, y), radius = cv2.minEnclosingCircle(contour)
+            if not settings.radius_min_px * scale < radius < settings.radius_max_px * scale:
+                continue
+            perimeter = cv2.arcLength(contour, True)
+            circularity = 4.0 * np.pi * area / (perimeter * perimeter) if perimeter else 0.0
+            hull_area = cv2.contourArea(cv2.convexHull(contour))
+            solidity = area / hull_area if hull_area else 0.0
+            if circularity >= settings.circularity_min and solidity >= settings.solidity_min:
+                candidates.append((area, x / scale, y / scale, radius / scale))
+        preview = image.copy()
+        ball = None
+        if candidates:
+            _, x, y, radius = max(candidates, key=lambda value: value[0])
+            ball = [round(x), round(y), round(radius)]
+            cv2.circle(preview, (round(x), round(y)), max(2, round(radius)), (0, 255, 255), 3)
+        if mask.shape[:2] != image.shape[:2]:
+            mask = cv2.resize(mask, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST)
+        return preview, cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR), ball
 
+    # ------------------------------------------------------------------
+    # Settings, detection and status exposed to the existing web UI
+    # ------------------------------------------------------------------
     def update_ball_settings(self, values: Dict[str, Any]) -> None:
-        """Update the live color/contour preview without reopening the camera."""
         valid_names = {item.name for item in fields(BallDetectionSettings)}
         updated = dict(vars(self.ball_settings))
         for name, value in values.items():
             if name not in valid_names:
                 continue
             current = updated[name]
-            try:
-                if isinstance(current, int):
-                    value = int(value)
-                else:
-                    value = float(value)
-            except (TypeError, ValueError):
-                raise ValueError(f"Ungueltiger Wert fuer {name}: {value!r}")
-            updated[name] = value
-
+            updated[name] = int(value) if isinstance(current, int) else float(value)
         candidate = BallDetectionSettings(**updated)
-
-        integer_ranges = {
-            "hsv_low_h": (0, 179), "hsv_high_h": (0, 179),
-            "hsv_low_s": (0, 255), "hsv_high_s": (0, 255),
-            "hsv_low_v": (0, 255), "hsv_high_v": (0, 255),
-        }
-        for name, (minimum, maximum) in integer_ranges.items():
+        for name, maximum in {
+            "hsv_low_h": 179, "hsv_high_h": 179,
+            "hsv_low_s": 255, "hsv_high_s": 255,
+            "hsv_low_v": 255, "hsv_high_v": 255,
+        }.items():
             value = getattr(candidate, name)
-            if not minimum <= value <= maximum:
-                raise ValueError(f"{name} muss zwischen {minimum} und {maximum} liegen")
-
+            if not 0 <= value <= maximum:
+                raise ValueError(f"{name} muss zwischen 0 und {maximum} liegen")
         if candidate.hsv_low_h > candidate.hsv_high_h:
             raise ValueError("hsv_low_h darf nicht groesser als hsv_high_h sein")
         if candidate.hsv_low_s > candidate.hsv_high_s:
@@ -153,368 +350,82 @@ class BaslerCamera:
             raise ValueError("circularity_min muss zwischen 0 und 1 liegen")
         if not 0.0 <= candidate.solidity_min <= 1.0:
             raise ValueError("solidity_min muss zwischen 0 und 1 liegen")
-
         self.ball_settings = candidate
 
-    # ------------------------------------------------------------------
-    # Configuration: this is deliberately explicit so every reconnect uses
-    # exactly the values visible in the tuning UI/settings.json.
-    # ------------------------------------------------------------------
-    def _configure_reconnected_camera(self, camera) -> None:
-        """Apply all editable settings to a newly opened Basler camera."""
-        settings = self.settings
+    def set_ball_detection_enabled(self, enabled: bool) -> None:
+        self._ball_detection_enabled = bool(enabled)
 
-        self.try_set(camera, "ExposureAuto", settings.exposure_auto)
-        self.try_set(camera, "PixelFormat", settings.pixel_format)
-        self.try_set(camera, "GainAuto", settings.gain_auto)
-        self.try_set(camera, "ExposureTime", settings.exposure_time)
-        self.try_set(camera, "Gain", settings.gain)
+    def is_ball_detection_enabled(self) -> bool:
+        return self._ball_detection_enabled
 
-        # Width/height are set before offsets because Basler ROI nodes usually
-        # validate the offset against the currently selected ROI size.
-        self.try_set(camera, "Width", settings.width)
-        self.try_set(camera, "Height", settings.height)
-        self.try_set(camera, "OffsetX", settings.offset_x)
-        self.try_set(camera, "OffsetY", settings.offset_y)
-
-        try:
-            camera.MaxNumBuffer = settings.max_num_buffer
-        except Exception as exc:
-            self._set_error(f"MaxNumBuffer nicht setzbar: {exc}")
-
-        self.try_set(
-            camera,
-            "AcquisitionFrameRateEnable",
-            settings.force_fps > 0,
-        )
-        if settings.force_fps > 0:
-            self.try_set(camera, "AcquisitionFrameRate", settings.force_fps)
-
-        # These nodes exist on GigE cameras. They are optional so the tuner
-        # also works with USB or cameras whose transport layer has no manual
-        # packet controls.
-        if settings.packet_size > 0:
-            self.try_set(camera, "GevSCPSPacketSize", settings.packet_size)
-        if settings.inter_packet_delay > 0:
-            self.try_set(camera, "GevSCPD", settings.inter_packet_delay)
-
-    def _grab_strategy(self):
-        if self.settings.grab_strategy == "one_by_one":
-            return pylon.GrabStrategy_OneByOne
-        return pylon.GrabStrategy_LatestImageOnly
-
-    def _open_camera_locked(self) -> bool:
-        self._close_camera_locked()
-        camera = None
-        try:
-            device = pylon.TlFactory.GetInstance().CreateFirstDevice()
-            camera = pylon.InstantCamera(device)
-            camera.Open()
-            self._configure_reconnected_camera(camera)
-            camera.StartGrabbing(self._grab_strategy())
-            self.camera = camera
-            self._model = str(camera.GetDeviceInfo().GetModelName())
-            self._last_error = ""
-            print(f"[TUNER] Basler geoeffnet: {self._model}")
-            return True
-        except Exception as exc:
-            self._set_error(f"Kamera konnte nicht geoeffnet werden: {exc}")
-            try:
-                if camera.IsGrabbing():
-                    camera.StopGrabbing()
-                if camera.IsOpen():
-                    camera.Close()
-            except Exception:
-                pass
-            self.camera = None
-            return False
-
-    def _close_camera(self) -> None:
-        with self._camera_lock:
-            self._close_camera_locked()
-
-    def _close_camera_locked(self) -> None:
-        camera = self.camera
-        self.camera = None
-        if camera is None:
-            return
-        try:
-            if camera.IsGrabbing():
-                camera.StopGrabbing()
-        except Exception:
-            pass
-        try:
-            if camera.IsOpen():
-                camera.Close()
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
-    # Capture and preview data
-    # ------------------------------------------------------------------
-    def _capture_loop(self) -> None:
-        failures = 0
-        report_time = time.monotonic()
-        report_frames = 0
-
-        while not self._stop_event.is_set():
-            with self._camera_lock:
-                if self.camera is None:
-                    opened = self._open_camera_locked()
-                    if not opened:
-                        # Do not spin when no device is connected.
-                        pass
-                camera = self.camera
-
-                grab = None
-                if camera is not None:
-                    try:
-                        grab = camera.RetrieveResult(
-                            100,
-                            pylon.TimeoutHandling_Return,
-                        )
-                        if grab is None:
-                            raise RuntimeError("RetrieveResult liefert None")
-                        if not grab.IsValid() or not grab.GrabSucceeded():
-                            code = self._grab_error_code(grab)
-                            message = self._grab_error_text(grab)
-                            raise RuntimeError(f"Grab {code}: {message}")
-
-                        image = grab.GetArray().copy()
-                        failures = 0
-                    except Exception as exc:
-                        failures += 1
-                        self._failed_grabs += 1
-                        self._set_error(str(exc))
-                        image = None
-                    finally:
-                        if grab is not None:
-                            try:
-                                grab.Release()
-                            except Exception:
-                                pass
-                else:
-                    image = None
-
-            if image is not None:
-                self._publish_frame(image)
-                report_frames += 1
-            elif failures >= self.RECOVERY_FAILURE_THRESHOLD:
-                self._recover_after_failure()
-                failures = 0
-            else:
-                time.sleep(0.02)
-
-            now = time.monotonic()
-            if now - report_time >= 1.0:
-                self._measured_fps = report_frames / (now - report_time)
-                report_frames = 0
-                report_time = now
-
-    def _recover_after_failure(self) -> None:
-        if self._stop_event.is_set():
-            return
-        print("[TUNER] Streamfehler, Kamera wird neu verbunden")
-        with self._camera_lock:
-            self._open_camera_locked()
-        time.sleep(self.RETRY_SECONDS)
-
-    def _publish_frame(self, image: np.ndarray) -> None:
-        pixel_format = self.settings.pixel_format.lower()
-        if image.ndim == 2:
-            if pixel_format.startswith("bayer"):
-                image = cv2.cvtColor(image, cv2.COLOR_BayerRG2BGR)
-            else:
-                image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-        elif image.ndim == 3 and image.shape[2] == 1:
-            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-
-        ball_preview, mask_preview, ball = self._create_ball_preview(image)
-        ok, encoded = cv2.imencode(
-            ".jpg",
-            image,
-            [int(cv2.IMWRITE_JPEG_QUALITY), 85],
-        )
-        preview_ok, ball_encoded = cv2.imencode(".jpg", ball_preview)
-        mask_ok, mask_encoded = cv2.imencode(".jpg", mask_preview)
-        if not ok or not preview_ok or not mask_ok:
-            return
-
-        now = time.monotonic()
-        with self._latest_lock:
-            self._latest_frame = image
-            self._latest_jpeg = encoded.tobytes()
-            self._latest_ball_jpeg = ball_encoded.tobytes()
-            self._latest_mask_jpeg = mask_encoded.tobytes()
-            self._last_ball = ball
-            self._frame_number += 1
-            self._received_frames += 1
-            self._last_frame_time = now
-
-    def latest_jpeg(self) -> Optional[bytes]:
+    def latest_jpeg(self):
         with self._latest_lock:
             return self._latest_jpeg
 
-    def latest_ball_jpeg(self) -> Optional[bytes]:
+    def latest_ball_jpeg(self):
         with self._latest_lock:
             return self._latest_ball_jpeg
 
-    def latest_mask_jpeg(self) -> Optional[bytes]:
+    def latest_mask_jpeg(self):
         with self._latest_lock:
             return self._latest_mask_jpeg
 
-    def latest_frame(self) -> Optional[np.ndarray]:
+    def latest_frame(self):
         with self._latest_lock:
             return None if self._latest_frame is None else self._latest_frame.copy()
 
-    # ------------------------------------------------------------------
-    # Status helpers
-    # ------------------------------------------------------------------
     def status(self) -> Dict[str, Any]:
-        with self._camera_lock:
-            camera = self.camera
-            is_open = bool(camera is not None and camera.IsOpen())
-            is_grabbing = bool(camera is not None and camera.IsGrabbing())
+        remote = self._read_remote_status()
+        self._sync_remote_settings_from_status(remote)
         with self._latest_lock:
             frame_number = self._frame_number
-            last_frame_age = (
-                None
-                if self._last_frame_time == 0.0
-                else max(0.0, time.monotonic() - self._last_frame_time)
-            )
-        return {
-            "camera_open": is_open,
-            "grabbing": is_grabbing,
-            "model": self._model,
-            "received_frames": self._received_frames,
+            received_frames = self._received_frames
+            frame_age = None if self._latest_frame is None else 0.0
+        with self._stats_lock:
+            preview_fps = self._preview_fps
+            dropped = self._dropped_frames
+            ipc_errors = self._ipc_errors
+            local_error = self._last_error
+        result = dict(remote)
+        result.update({
             "frame_number": frame_number,
-            "failed_grabs": self._failed_grabs,
-            "measured_fps": round(self._measured_fps, 2),
-            "last_frame_age_seconds": last_frame_age,
-            "last_error": self._last_error,
-            "settings": dict(vars(self.settings)),
+            "received_frames": received_frames,
+            "preview_fps": round(preview_fps, 2),
+            "measured_fps": round(preview_fps, 2),
+            "dropped_frames": max(dropped, int(remote.get("dropped_frames", 0) or 0)),
+            "ipc_errors": ipc_errors,
+            "last_error": remote.get("last_error") or local_error,
+            # Never replace the CameraProcess settings with stale tuner-local
+            # values in the website response.
+            "settings": dict(remote.get("settings") or vars(self.settings)),
             "ball_detection": dict(vars(self.ball_settings)),
+            "ball_detection_enabled": self.is_ball_detection_enabled(),
             "detected_ball": self._last_ball,
-        }
+            "frame_ipc": remote.get("frame_ipc", {
+                "name": self._frame_ipc_name,
+                "slots": self._frame_ipc_slots,
+                "available": self._ring is not None,
+            }),
+            "source": "CameraProcessSharedMemory",
+            "camera_owner": "v3.camera_process",
+        })
+        return result
 
-    def _create_ball_preview(self, image: np.ndarray):
-        settings = self.ball_settings
-        scale = settings.detection_scale
-        detection_image = image
-        if 0.0 < scale < 1.0:
-            detection_image = cv2.resize(
-                image,
-                None,
-                fx=scale,
-                fy=scale,
-                interpolation=cv2.INTER_AREA,
-            )
-
-        hsv = cv2.cvtColor(
-            cv2.GaussianBlur(detection_image, (5, 5), 0),
-            cv2.COLOR_BGR2HSV,
-        )
-        lower = np.array(
-            [settings.hsv_low_h, settings.hsv_low_s, settings.hsv_low_v],
-            dtype=np.uint8,
-        )
-        upper = np.array(
-            [settings.hsv_high_h, settings.hsv_high_s, settings.hsv_high_v],
-            dtype=np.uint8,
-        )
-        mask = cv2.inRange(hsv, lower, upper)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-        contours, _ = cv2.findContours(
-            mask,
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE,
-        )
-        candidates = []
-        area_scale = scale * scale
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if not settings.area_min * area_scale <= area <= settings.area_max * area_scale:
-                continue
-            (x, y), radius = cv2.minEnclosingCircle(contour)
-            if not settings.radius_min_px * scale < radius < settings.radius_max_px * scale:
-                continue
-            perimeter = cv2.arcLength(contour, True)
-            circularity = 4.0 * np.pi * area / (perimeter * perimeter) if perimeter > 1e-6 else 0.0
-            if circularity < settings.circularity_min:
-                continue
-            hull_area = cv2.contourArea(cv2.convexHull(contour))
-            solidity = area / hull_area if hull_area > 1e-6 else 0.0
-            if solidity < settings.solidity_min:
-                continue
-            candidates.append((area, x / scale, y / scale, radius / scale))
-
-        preview = image.copy()
-        selected_ball = None
-        if candidates:
-            _, x, y, radius = max(candidates, key=lambda candidate: candidate[0])
-            selected_ball = [round(x), round(y), round(radius)]
-            cv2.circle(
-                preview,
-                (int(round(x)), int(round(y))),
-                max(2, int(round(radius))),
-                (0, 255, 255),
-                3,
-            )
-            cv2.putText(
-                preview,
-                f"BALL x={int(x)} y={int(y)} r={int(radius)}",
-                (15, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.75,
-                (0, 255, 255),
-                2,
-            )
-        cv2.putText(
-            preview,
-            f"Kandidaten: {len(candidates)}",
-            (15, 60),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (255, 255, 255),
-            2,
-        )
-
-        if mask.shape[:2] != image.shape[:2]:
-            mask = cv2.resize(
-                mask,
-                (image.shape[1], image.shape[0]),
-                interpolation=cv2.INTER_NEAREST,
-            )
-        mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-        return preview, mask_bgr, selected_ball
+    def _sync_remote_settings_from_status(self, remote: Dict[str, Any]) -> None:
+        values = remote.get("settings")
+        if not isinstance(values, dict):
+            return
+        try:
+            self.settings = CameraSettings(**values)
+        except (TypeError, ValueError) as exc:
+            self._set_error(f"Kameraeinstellungen des CameraProcess ungueltig: {exc}")
 
     def _set_error(self, message: str) -> None:
-        self._last_error = str(message)
-        print(f"[TUNER] {self._last_error}")
-
-    @staticmethod
-    def _grab_error_code(grab) -> str:
-        try:
-            return str(grab.GetErrorCode())
-        except Exception:
-            return "unbekannt"
-
-    @staticmethod
-    def _grab_error_text(grab) -> str:
-        try:
-            return str(grab.GetErrorDescription())
-        except Exception:
-            return "unbekannt"
-
-    @staticmethod
-    def try_set(camera, name: str, value: Any) -> bool:
-        try:
-            node = getattr(camera, name)
-            node.Value = value
-            print(f"[TUNER] {name} = {value}")
-            return True
-        except Exception as exc:
-            print(f"[TUNER] {name} nicht setzbar: {exc}")
-            return False
+        now = time.monotonic()
+        with self._stats_lock:
+            if message == self._last_error and now - self._last_error_time < 1.0:
+                return
+            self._last_error = str(message)
+            self._last_error_time = now
+        if message:
+            print(f"[BALL-TUNER-ERR] {message}")

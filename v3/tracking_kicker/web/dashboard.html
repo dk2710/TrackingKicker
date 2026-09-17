@@ -1,0 +1,570 @@
+﻿<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tracking Kicker</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    body { margin: 0; background: #101318; color: #edf2f7; }
+    main { max-width: 1500px; margin: auto; padding: 18px; }
+    h1, h2, h3 { margin: 0 0 12px; }
+    h3 { font-size: .95rem; color: #b9c6d5; }
+    .layout { display: grid; grid-template-columns: minmax(0, 2fr) minmax(330px, 1fr); gap: 18px; }
+    .card { background: #1b222c; border: 1px solid #303b49; border-radius: 10px; padding: 16px; margin-bottom: 18px; }
+    .video, .snapshot-image { width: 100%; background: #050607; border-radius: 6px; display: block; min-height: 220px; object-fit: contain; }
+    .snapshot-stage { position: relative; line-height: 0; background: #050607; border-radius: 6px; overflow: hidden; }
+    .snapshot-stage .snapshot-image { min-height: 0; cursor: crosshair; }
+    #calibrationCanvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    label { display: flex; flex-direction: column; gap: 4px; font-size: .86rem; color: #b9c6d5; }
+    input, select { width: 100%; box-sizing: border-box; padding: 8px; border: 1px solid #465365; border-radius: 5px; background: #11161d; color: #fff; }
+    button { margin: 7px 5px 0 0; padding: 9px 13px; border: 0; border-radius: 5px; background: #2f9e62; color: white; cursor: pointer; }
+    button:hover { background: #3bb875; }
+    button.secondary { background: #465365; }
+    button:disabled { opacity: .45; cursor: default; }
+    .check { display: block; margin-top: 10px; }
+    .check input { width: auto; margin-right: 6px; }
+    pre { white-space: pre-wrap; word-break: break-word; margin: 0; font-size: .8rem; color: #cbd5e1; }
+    .status, .hint { color: #aab8c8; font-size: .86rem; line-height: 1.4; }
+    .ok { color: #63e6be; }
+    .warn { color: #ffd166; }
+    .hidden { display: none; }
+    .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin: 10px 0; }
+    .toolbar span { margin: 0 8px; }
+    .timeline { width: 100%; margin: 8px 0 2px; accent-color: #2f9e62; }
+    .timeline-label { display: flex; justify-content: space-between; color: #aab8c8; font-size: .82rem; }
+    .logs { width: 100%; min-height: 230px; box-sizing: border-box; resize: vertical;
+            padding: 10px; border: 1px solid #465365; border-radius: 5px;
+            background: #0b0f14; color: #cbd5e1; font: .78rem/1.45 ui-monospace, monospace; }
+    @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Tracking Kicker</h1>
+  <div class="layout">
+    <section>
+      <section class="card">
+        <h2>Verzoegerter Livestream</h2>
+        <img id="liveImage" class="video" alt="Verzoegerter Livestream">
+        <p id="liveState" class="warn">Warte auf Frames ...</p>
+        <p id="liveStreamState" class="status">HTTP-Livestream wird gestartet ...</p>
+        <p id="detectionMode" class="status">Ballerkennung wird geladen ...</p>
+        <pre id="detectionState"></pre>
+      </section>
+
+      <section class="card">
+        <h2>System-Logs</h2>
+        <textarea id="runtimeLogs" class="logs" readonly spellcheck="false">Logs werden geladen ...</textarea>
+        <p id="logState" class="status">Zeitstempel werden vom Tracker mitgeliefert.</p>
+      </section>
+
+      <section class="card">
+        <h2>Snapshot: letzte Sekunde</h2>
+        <p class="hint">Der Snapshot friert die letzten Frames ein. Mit Zurueck/Weiter kann jeder Frame einzeln analysiert werden.</p>
+        <button id="snapshotButton" onclick="captureSnapshot()">Snapshot aufnehmen</button>
+        <div id="snapshotPanel" class="hidden">
+          <div class="toolbar">
+            <button class="secondary" id="previousFrame" onclick="moveSnapshot(-1)">Zurueck</button>
+            <span id="snapshotPosition">Kein Frame</span>
+            <button class="secondary" id="nextFrame" onclick="moveSnapshot(1)">Weiter</button>
+          </div>
+          <input id="snapshotTimeline" class="timeline" type="range" min="0" max="0" value="0" step="1" oninput="seekSnapshot(this.value)">
+          <div class="timeline-label"><span>Anfang der letzten Sekunde</span><span>Aktuell</span></div>
+          <div class="snapshot-stage">
+            <img id="snapshotImage" class="snapshot-image" alt="Snapshot-Frame">
+            <canvas id="calibrationCanvas"></canvas>
+          </div>
+          <p id="snapshotInfo" class="status"></p>
+        </div>
+      </section>
+    </section>
+
+    <aside>
+      <section class="card">
+        <h2>Ball-Erkennung</h2>
+        <form id="parameters">
+          <div class="grid">
+            <label>HSV Low<input id="hsv_low" required></label>
+            <label>HSV High<input id="hsv_high" required></label>
+            <label>Flaeche min<input id="area_min" type="number" step="any"></label>
+            <label>Flaeche max<input id="area_max" type="number" step="any"></label>
+            <label>Detection Scale<input id="detection_scale" type="number" step="0.01" min="0.05" max="1"></label>
+            <label>Radius min px<input id="radius_min_px" type="number" step="any"></label>
+            <label>Radius max px<input id="radius_max_px" type="number" step="any"></label>
+            <label>Circularity min<input id="circularity_min" type="number" step="0.01" min="0" max="1"></label>
+            <label>Solidity min<input id="solidity_min" type="number" step="0.01" min="0" max="1"></label>
+          </div>
+          <label class="check"><span><input id="persist" type="checkbox"> In config.json speichern</span></label>
+          <button type="submit">Parameter anwenden</button>
+        </form>
+        <p id="parameterMessage"></p>
+      </section>
+
+      <section class="card">
+        <h2>Snapshot-Kalibrierung</h2>
+        <p class="hint">Snapshot aufnehmen, einen Modus waehlen und im Bild klicken. Feld: vier Ecken im Uhrzeigersinn. Tor: zwei Ecken des jeweiligen Tors.</p>
+        <div class="grid">
+          <label>Modus<select id="calibrationMode" onchange="modeChanged()">
+            <option value="none">Nur analysieren</option>
+            <option value="field">Spielfeld-Ecken</option>
+            <option value="goal_left">Linkes Tor</option>
+            <option value="goal_right">Rechtes Tor</option>
+          </select></label>
+          <label>Feldbreite cm<input id="field_width" type="number" step="any" value="120"></label>
+          <label>Feldhoehe cm<input id="field_height" type="number" step="any" value="68"></label>
+          <label>Rod-X Positionen<input id="rod_positions" placeholder="0.05, 0.17, ..."></label>
+        </div>
+        <h3>Verzerrung</h3>
+        <div class="grid">
+          <label>k1<input id="k1" type="number" step="any"></label>
+          <label>k2<input id="k2" type="number" step="any"></label>
+          <label>k3<input id="k3" type="number" step="any"></label>
+          <label>p1<input id="p1" type="number" step="any"></label>
+          <label>p2<input id="p2" type="number" step="any"></label>
+          <label>Scale<input id="scale" type="number" step="any" min="0.01"></label>
+        </div>
+        <button class="secondary" onclick="clearCurrentPoints()">Punkte zuruecksetzen</button>
+        <button onclick="saveCalibration()">Kalibrierung speichern und testen</button>
+        <p id="calibrationMessage"></p>
+      </section>
+
+      <section class="card">
+        <h2>Quelle und Kamera</h2>
+        <pre id="sourceState">Lade ...</pre>
+      </section>
+      <section class="card">
+        <h2>Tor-, Feld- und Rod-Kalibrierung</h2>
+        <pre id="calibrationState">Lade ...</pre>
+      </section>
+    </aside>
+  </div>
+</main>
+<script>
+  const fields = ["area_min", "area_max", "detection_scale", "radius_min_px", "radius_max_px", "circularity_min", "solidity_min"];
+  const distortionFields = ["k1", "k2", "k3", "p1", "p2", "scale"];
+  const byId = id => document.getElementById(id);
+  const setValue = (id, value) => byId(id).value = Array.isArray(value) ? value.join(", ") : (value ?? "");
+  let snapshot = null;
+  let snapshotIndex = 0;
+  let snapshotRequestController = null;
+  let snapshotRequestSerial = 0;
+  let snapshotImageUrl = null;
+  let calibration = null;
+  let points = {field: [], goal_left: [], goal_right: []};
+  let liveStreamController = null;
+  let liveStreamImageUrl = null;
+  let liveStreamBuffer = new Uint8Array(0);
+  let liveStreamExpectedLength = null;
+  let liveStreamFrameCount = 0;
+  let liveStreamFpsStarted = 0;
+  let latestLogId = 0;
+  const liveBoundary = new TextEncoder().encode("--frame");
+  const liveHeaderSeparator = new Uint8Array([13, 10, 13, 10]);
+  const liveCrlf = new Uint8Array([13, 10]);
+
+  function appendBytes(first, second) {
+    const result = new Uint8Array(first.length + second.length);
+    result.set(first);
+    result.set(second, first.length);
+    return result;
+  }
+
+  function findBytes(haystack, needle) {
+    outer: for (let index = 0; index <= haystack.length - needle.length; index++) {
+      for (let offset = 0; offset < needle.length; offset++) {
+        if (haystack[index + offset] !== needle[offset]) continue outer;
+      }
+      return index;
+    }
+    return -1;
+  }
+
+  function startsWithBytes(haystack, needle) {
+    if (haystack.length < needle.length) return false;
+    return needle.every((value, index) => haystack[index] === value);
+  }
+
+  function showLiveJpeg(jpeg) {
+    const image = byId("liveImage");
+    const imageUrl = URL.createObjectURL(new Blob([jpeg], {type: "image/jpeg"}));
+    if (liveStreamImageUrl) URL.revokeObjectURL(liveStreamImageUrl);
+    liveStreamImageUrl = imageUrl;
+    image.src = imageUrl;
+
+    liveStreamFrameCount++;
+    const now = performance.now();
+    if (!liveStreamFpsStarted) liveStreamFpsStarted = now;
+    const elapsed = now - liveStreamFpsStarted;
+    if (elapsed >= 1000) {
+      const fps = liveStreamFrameCount * 1000 / elapsed;
+      byId("liveStreamState").textContent = `HTTP-Livestream: ${fps.toFixed(1)} FPS`;
+      byId("liveStreamState").className = fps >= 25 ? "ok" : "warn";
+      liveStreamFrameCount = 0;
+      liveStreamFpsStarted = now;
+    }
+  }
+
+  function consumeLiveMultipart() {
+    while (true) {
+      if (liveStreamExpectedLength === null) {
+        const boundaryIndex = findBytes(liveStreamBuffer, liveBoundary);
+        if (boundaryIndex < 0) {
+          liveStreamBuffer = liveStreamBuffer.slice(
+            Math.max(0, liveStreamBuffer.length - liveBoundary.length + 1)
+          );
+          return;
+        }
+        liveStreamBuffer = liveStreamBuffer.slice(boundaryIndex + liveBoundary.length);
+        if (startsWithBytes(liveStreamBuffer, liveCrlf)) {
+          liveStreamBuffer = liveStreamBuffer.slice(liveCrlf.length);
+        }
+
+        const headerEnd = findBytes(liveStreamBuffer, liveHeaderSeparator);
+        if (headerEnd < 0) return;
+        const header = new TextDecoder().decode(liveStreamBuffer.slice(0, headerEnd));
+        const match = header.match(/content-length\s*:\s*(\d+)/i);
+        if (!match) {
+          liveStreamBuffer = liveStreamBuffer.slice(headerEnd + liveHeaderSeparator.length);
+          continue;
+        }
+        liveStreamExpectedLength = Number(match[1]);
+        liveStreamBuffer = liveStreamBuffer.slice(headerEnd + liveHeaderSeparator.length);
+      }
+
+      if (liveStreamBuffer.length < liveStreamExpectedLength + liveCrlf.length) return;
+      const jpeg = liveStreamBuffer.slice(0, liveStreamExpectedLength);
+      liveStreamBuffer = liveStreamBuffer.slice(liveStreamExpectedLength);
+      if (startsWithBytes(liveStreamBuffer, liveCrlf)) {
+        liveStreamBuffer = liveStreamBuffer.slice(liveCrlf.length);
+      }
+      liveStreamExpectedLength = null;
+      showLiveJpeg(jpeg);
+    }
+  }
+
+  async function startLiveStream() {
+    if (liveStreamController) liveStreamController.abort();
+    const controller = new AbortController();
+    liveStreamController = controller;
+    liveStreamBuffer = new Uint8Array(0);
+    liveStreamExpectedLength = null;
+    liveStreamFrameCount = 0;
+    liveStreamFpsStarted = 0;
+    byId("liveStreamState").textContent = "HTTP-Livestream wird verbunden ...";
+    byId("liveStreamState").className = "status";
+
+    try {
+      const response = await fetch(`/live.mjpg?stream=${Date.now()}`, {
+        cache: "no-store",
+        signal: controller.signal,
+      });
+      if (!response.ok || !response.body) {
+        throw new Error(`HTTP-Livestream nicht verfuegbar (${response.status})`);
+      }
+      const reader = response.body.getReader();
+      while (!controller.signal.aborted) {
+        const {value, done} = await reader.read();
+        if (done) throw new Error("HTTP-Livestream wurde beendet");
+        liveStreamBuffer = appendBytes(liveStreamBuffer, value);
+        consumeLiveMultipart();
+      }
+    } catch (error) {
+      if (error.name === "AbortError") return;
+      byId("liveStreamState").textContent = `HTTP-Livestream Fehler: ${error}`;
+      byId("liveStreamState").className = "warn";
+      if (!controller.signal.aborted) {
+        setTimeout(startLiveStream, 1000);
+      }
+    }
+  }
+
+  function showParameters(parameters) {
+    const values = parameters.ball_detection;
+    setValue("hsv_low", values.hsv_low);
+    setValue("hsv_high", values.hsv_high);
+    fields.forEach(name => setValue(name, values[name]));
+  }
+
+  function showCalibration(data) {
+    calibration = data;
+    const field = data.field || {};
+    const size = field.size_cm || {};
+    setValue("field_width", size.w);
+    setValue("field_height", size.h);
+    setValue("rod_positions", field.rods?.xs_norm || []);
+    distortionFields.forEach(name => setValue(name, data.distortion?.[name]));
+    byId("calibrationState").textContent = JSON.stringify(data, null, 2);
+  }
+
+  function showStatus(status) {
+    const live = status.live || {};
+    const delay = Number(status.web_live_delay_seconds ?? 0);
+    byId("liveState").textContent = live.available
+      ? `Frames aktiv | Sequenz ${live.sequence} | Webstream ${status.web_live_fps?.toFixed(0) ?? "30"} FPS | Verzoegerung ${delay.toFixed(1)} s | Quelle ${status.source_fps?.toFixed(1) ?? "?"} FPS`
+      : "Warte auf Frames ...";
+    byId("liveState").className = live.available ? "ok" : "warn";
+    const detectionEnabled = status.ball_detection_enabled !== false;
+    byId("detectionMode").textContent = detectionEnabled
+      ? "Ballerkennung: EIN"
+      : "Ballerkennung: AUS (voruebergehend deaktiviert)";
+    byId("detectionMode").className = detectionEnabled ? "status" : "status warn";
+    byId("detectionState").textContent = JSON.stringify({
+      ball: status.detection?.ball ?? null,
+      tracking: status.detection?.ball_track_reason ?? null,
+      valid_for_speed: status.detection?.ball_track_valid ?? false,
+      retro_frames: status.retro_analysis_frames,
+      last_goal: status.last_goal?.goal_position ?? null
+    }, null, 2);
+    byId("sourceState").textContent = JSON.stringify({
+      source: status.source,
+      shared_memory: status.shared_memory,
+      source_metrics: status.source_metrics,
+      camera: status.camera,
+      distortion: status.distortion
+    }, null, 2);
+  }
+
+  async function refreshLogs() {
+    try {
+      const response = await fetch(`/api/logs?after=${latestLogId}&limit=200`, {cache: "no-store"});
+      if (!response.ok) throw new Error(await response.text());
+      const result = await response.json();
+      const entries = result.logs || [];
+      const textarea = byId("runtimeLogs");
+      if (latestLogId === 0 && entries.length) textarea.value = "";
+      if (entries.length) {
+        const lines = entries.map(entry => entry.text || `${entry.time || ""} ${entry.message || ""}`);
+        const oldLines = textarea.value && textarea.value !== "Logs werden geladen ..."
+          ? textarea.value.split("\n") : [];
+        textarea.value = oldLines.concat(lines).slice(-300).join("\n");
+        textarea.scrollTop = textarea.scrollHeight;
+      }
+      latestLogId = Math.max(latestLogId, Number(result.latest_id || 0));
+      byId("logState").textContent = `Letzter Log-Eintrag: ${latestLogId}`;
+      byId("logState").className = "status ok";
+    } catch (error) {
+      byId("logState").textContent = "Logs nicht erreichbar: " + error;
+      byId("logState").className = "status warn";
+    }
+  }
+
+  async function refresh() {
+    try {
+      const response = await fetch("/api/status", {cache: "no-store"});
+      if (!response.ok) throw new Error(await response.text());
+      showStatus(await response.json());
+    } catch (error) {
+      byId("liveState").textContent = "Tracking API nicht erreichbar: " + error;
+      byId("liveState").className = "warn";
+    }
+  }
+
+  async function captureSnapshot() {
+    const message = byId("snapshotInfo");
+    try {
+      const response = await fetch("/api/snapshot", {method: "POST"});
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Snapshot fehlgeschlagen");
+      snapshot = result;
+      snapshotIndex = result.selected_index;
+      byId("snapshotTimeline").max = Math.max(0, result.count - 1);
+      byId("snapshotTimeline").value = snapshotIndex;
+      byId("snapshotPanel").classList.remove("hidden");
+      await loadSnapshotFrame();
+    } catch (error) {
+      message.textContent = String(error);
+      message.className = "warn";
+    }
+  }
+
+  async function loadSnapshotFrame() {
+    if (!snapshot) return;
+    const requestedSnapshot = snapshot;
+    const count = snapshot.count;
+    snapshotIndex = Math.max(0, Math.min(snapshotIndex, count - 1));
+    const requestedIndex = snapshotIndex;
+    byId("snapshotPosition").textContent = `Frame ${snapshotIndex + 1} / ${count}`;
+    byId("snapshotTimeline").max = Math.max(0, count - 1);
+    byId("snapshotTimeline").value = snapshotIndex;
+    byId("previousFrame").disabled = snapshotIndex <= 0;
+    byId("nextFrame").disabled = snapshotIndex >= count - 1;
+    const t = snapshot.timestamps[snapshotIndex] - snapshot.timestamps[0];
+    byId("snapshotInfo").textContent = `Zeit innerhalb des Snapshots: ${t.toFixed(4)} s`;
+
+    // Slider-Ereignisse kommen waehrend des Ziehens sehr schnell hintereinander.
+    // Eine alte Antwort darf deshalb weder den aktuelleren Frame ueberschreiben
+    // noch den Browser durch eine Warteschlange von Requests ausbremsen.
+    if (snapshotRequestController) snapshotRequestController.abort();
+    const controller = new AbortController();
+    snapshotRequestController = controller;
+    const requestSerial = ++snapshotRequestSerial;
+    const url = `/api/snapshot/frame?generation=${requestedSnapshot.generation}`
+      + `&index=${requestedIndex}&analysis=1&cache=${Date.now()}`;
+
+    try {
+      const response = await fetch(url, {
+        cache: "no-store",
+        signal: controller.signal,
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const blob = await response.blob();
+      if (requestSerial !== snapshotRequestSerial
+          || requestedSnapshot !== snapshot
+          || requestedIndex !== snapshotIndex) return;
+
+      const imageUrl = URL.createObjectURL(blob);
+      const oldImageUrl = snapshotImageUrl;
+      snapshotImageUrl = imageUrl;
+      const image = byId("snapshotImage");
+      image.onload = () => {
+        drawPoints();
+        if (oldImageUrl) URL.revokeObjectURL(oldImageUrl);
+      };
+      image.src = imageUrl;
+    } catch (error) {
+      if (error.name !== "AbortError" && requestSerial === snapshotRequestSerial) {
+        byId("snapshotInfo").textContent = String(error);
+        byId("snapshotInfo").className = "warn";
+      }
+    }
+  }
+
+  function moveSnapshot(step) {
+    if (!snapshot) return;
+    snapshotIndex += step;
+    loadSnapshotFrame();
+  }
+
+  function seekSnapshot(value) {
+    if (!snapshot) return;
+    snapshotIndex = Number(value);
+    loadSnapshotFrame();
+  }
+
+  function modeChanged() {
+    const mode = byId("calibrationMode").value;
+    byId("snapshotInfo").textContent = mode === "none"
+      ? "Analysemodus aktiv."
+      : "Jetzt im Snapshot-Bild klicken, um Punkte zu setzen.";
+    drawPoints();
+  }
+
+  function clearCurrentPoints() {
+    const mode = byId("calibrationMode").value;
+    if (mode !== "none") points[mode] = [];
+    drawPoints();
+  }
+
+  function imagePoint(event) {
+    const image = byId("snapshotImage");
+    const rect = image.getBoundingClientRect();
+    return [
+      Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)),
+      Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height))
+    ];
+  }
+
+  byId("snapshotImage").addEventListener("click", event => {
+    const mode = byId("calibrationMode").value;
+    if (mode === "none") return;
+    const limit = mode === "field" ? 4 : 2;
+    if (points[mode].length < limit) points[mode].push(imagePoint(event));
+    drawPoints();
+  });
+
+  function drawPoints() {
+    const image = byId("snapshotImage");
+    const canvas = byId("calibrationCanvas");
+    if (!image.naturalWidth) return;
+    canvas.width = image.naturalWidth;
+    canvas.height = image.naturalHeight;
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const colors = {field: "#00ff66", goal_left: "#ff3333", goal_right: "#3388ff"};
+    for (const [name, list] of Object.entries(points)) {
+      ctx.strokeStyle = colors[name];
+      ctx.fillStyle = colors[name];
+      ctx.lineWidth = Math.max(3, canvas.width / 450);
+      list.forEach((point, index) => {
+        const x = point[0] * canvas.width, y = point[1] * canvas.height;
+        ctx.beginPath(); ctx.arc(x, y, Math.max(5, canvas.width / 180), 0, Math.PI * 2); ctx.fill();
+        ctx.fillText(String(index + 1), x + 8, y - 8);
+      });
+      if (list.length > 1) {
+        ctx.beginPath();
+        list.forEach((point, index) => {
+          const x = point[0] * canvas.width, y = point[1] * canvas.height;
+          if (index === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        });
+        if (name === "field" && list.length === 4) ctx.closePath();
+        ctx.stroke();
+      }
+    }
+  }
+
+  async function saveCalibration() {
+    const payload = {persist: true, distortion: {}};
+    distortionFields.forEach(name => payload.distortion[name] = Number(byId(name).value));
+    if (points.field.length === 4) payload.field_corners_norm = points.field;
+    if (points.goal_left.length === 2 || points.goal_right.length === 2) {
+      payload.goals = {};
+      for (const side of ["left", "right"]) {
+        const list = points["goal_" + side];
+        if (list.length === 2) payload.goals[side] = {
+          x0: Math.min(list[0][0], list[1][0]), y0: Math.min(list[0][1], list[1][1]),
+          x1: Math.max(list[0][0], list[1][0]), y1: Math.max(list[0][1], list[1][1])
+        };
+      }
+    }
+    const width = Number(byId("field_width").value), height = Number(byId("field_height").value);
+    if (Number.isFinite(width) && Number.isFinite(height)) payload.field_size = {w: width, h: height};
+    const rods = byId("rod_positions").value.split(",").map(value => Number(value.trim())).filter(Number.isFinite);
+    if (rods.length) payload.rod_xs_norm = rods;
+    try {
+      const response = await fetch("/api/calibration", {
+        method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Kalibrierung fehlgeschlagen");
+      showCalibration(result);
+      points = {field: [], goal_left: [], goal_right: []};
+      byId("calibrationMessage").textContent = "Gespeichert und live angewendet.";
+      byId("calibrationMessage").className = "ok";
+      drawPoints();
+      if (snapshot) loadSnapshotFrame();
+    } catch (error) {
+      byId("calibrationMessage").textContent = String(error);
+      byId("calibrationMessage").className = "warn";
+    }
+  }
+
+  byId("parameters").addEventListener("submit", async event => {
+    event.preventDefault();
+    const vector = id => byId(id).value.split(",").map(value => Number(value.trim()));
+    const payload = {ball_detection: {hsv_low: vector("hsv_low"), hsv_high: vector("hsv_high")}, persist: byId("persist").checked};
+    fields.forEach(name => payload.ball_detection[name] = Number(byId(name).value));
+    const message = byId("parameterMessage");
+    try {
+      const response = await fetch("/api/parameters", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)});
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Speichern fehlgeschlagen");
+      showParameters(result);
+      message.textContent = result.persisted ? "Angewendet und gespeichert." : "Angewendet.";
+      message.className = "ok";
+    } catch (error) { message.textContent = String(error); message.className = "warn"; }
+  });
+
+  Promise.all([
+    fetch("/api/parameters", {cache: "no-store"}).then(response => response.json()),
+    fetch("/api/calibration", {cache: "no-store"}).then(response => response.json())
+  ]).then(([parameters, calibrationData]) => { showParameters(parameters); showCalibration(calibrationData); });
+  refresh();
+  refreshLogs();
+  setInterval(refresh, 1000);
+  setInterval(refreshLogs, 1000);
+  startLiveStream();
+</script>
+</body>
+</html>

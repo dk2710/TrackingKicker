@@ -1,6 +1,7 @@
-"""Application-wide runtime configuration and replay discovery."""
+"""Application-wide runtime configuration."""
 
 import os
+from dataclasses import replace
 from pathlib import Path
 
 try:
@@ -8,7 +9,7 @@ try:
 except ImportError:  # Windows/deployments without POSIX file locking
     _fcntl = None
 
-from .camera import RawReplaySource
+from .camera.CameraProcessSource import CameraProcessSource
 from .config import AppConfig
 from .model.VisionConfig import VisionConfig
 
@@ -16,7 +17,6 @@ from .model.VisionConfig import VisionConfig
 vision = VisionConfig.load()
 config = AppConfig.load()
 
-VIDEO_PATH = config.videos_dir / "test.npz"
 ANALYSIS_VIDEO_PATH = (Path(__file__).resolve().parents[1] / "videos").resolve()
 ANALYSIS_VIDEO_PATH.mkdir(parents=True, exist_ok=True)
 
@@ -59,9 +59,6 @@ GOAL_VIDEO_MAX_WIDTH = 640
 RETRO_TRIGGER_NO_BALL_FRAMES = 80
 RETRO_MAX_REANALYZE_FRAMES = RETRO_TRIGGER_NO_BALL_FRAMES
 RETRO_BUFFER_MAX_FRAMES = 160
-RETRO_BALL_LOSS_SECONDS = 0.5
-RETRO_REARM_WINDOW_SECONDS = 0.5
-RETRO_REARM_MIN_BALL_DETECTIONS = 3
 
 DIGIKICKER_POST_DEFAULT_URL = "https://localhost/goal"
 DIGIKICKER_POST_TIMEOUT_SECONDS = 2.0
@@ -85,45 +82,19 @@ def acquire_app_lock() -> bool:
         return False
 
 
-def find_replay_video() -> Path:
-    """Find a usable NPZ replay for camera-less operation."""
-    candidates = []
-    if VIDEO_PATH.exists():
-        candidates.append(VIDEO_PATH)
-
-    replay_directories = [config.videos_dir, ANALYSIS_VIDEO_PATH]
-    if config.debug_video:
-        configured_path = Path(config.debug_video)
-        if not configured_path.is_absolute():
-            candidates.extend(directory / configured_path for directory in replay_directories)
-        else:
-            candidates.append(configured_path)
-
-    for directory in replay_directories:
-        candidates.extend(directory.glob("session_raw_*.npz"))
-
-    existing = []
-    seen = set()
-    for candidate in candidates:
-        candidate = candidate.resolve()
-        if candidate in seen or not candidate.is_file():
-            continue
-        seen.add(candidate)
-        existing.append(candidate)
-
-    if not existing:
-        searched = ", ".join(str(path) for path in replay_directories)
-        raise FileNotFoundError(
-            "Kein Fallback-Video gefunden. Erwartet test.npz oder "
-            f"session_raw_*.npz in: {searched}"
-        )
-
-    if VIDEO_PATH.resolve() in existing:
-        return VIDEO_PATH.resolve()
-    return max(existing, key=lambda path: path.stat().st_mtime_ns)
-
-
 def create_replay_fallback():
-    replay_path = find_replay_video()
-    print(f"[REPLAY] Fallback-Quelle: {replay_path}")
-    return RawReplaySource(str(replay_path))
+    if config.camera is None:
+        raise RuntimeError(
+            "Fuer den Raw Replay Process wird eine Kamera-Konfiguration "
+            "mit Framegroesse benoetigt"
+        )
+    print(
+        "[REPLAY] Erwarte den separaten raw_replay_source Prozess."
+    )
+    replay_camera = replace(
+        config.camera,
+        source="camera_process",
+        frame_ipc_name=config.replay_ipc_name,
+        frame_ipc_slots=config.replay_ipc_slots,
+    )
+    return CameraProcessSource(replay_camera)

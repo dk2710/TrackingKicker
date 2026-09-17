@@ -6,10 +6,16 @@ Tischkicker-Tracker wichtigen Einstellungen.
 
 ## Start auf dem Orange Pi
 
-Aus dem Projektverzeichnis:
+Aus dem Projektverzeichnis in zwei Terminals:
 
 ```bash
 cd /home/dkleis/dev/tischkicker
+.venv/bin/python -u -m v3.camera_process.main
+```
+
+Danach den BallTuner starten:
+
+```bash
 .venv/bin/python -u -m basler_camera_tuner.main
 ```
 
@@ -25,16 +31,32 @@ angewendet.
 
 ## Wichtige Einstellungen
 
-- `force_fps`: Auflösung und FPS müssen zusammen in die verfügbare
-  GigE-Bandbreite passen. Für die aktuelle ROI-Konfiguration ist 120 FPS ein
-  stabiler Startwert.
-- `grab_strategy`: `latest_image_only` ist für den Live-Tuner sicherer;
-  `one_by_one` liefert für die Tracking-Anwendung jedes empfangene Bild.
+- `force_fps`: Die Kamera wird für die aktuelle ROI-Konfiguration mit mindestens
+  180 FPS angefordert. Die Oberfläche zeigt zusätzlich die tatsächlich
+  resultierende pylon-Rate und die erfolgreich empfangenen Kamera-Frames an.
+- `grab_strategy`: `latest_image_only` ist die aktive Strategie für Tuner und
+  Tracking. Ältere fertige Frames dürfen dabei verworfen werden.
+- `max_transfer_size` und `num_max_queued_urbs`: optionale USB-
+  Stream-Grabber-Parameter; `0` lässt den pylon-Standardwert unverändert.
 - `width`, `height`, `offset_x`, `offset_y`: Kamera-ROI.
 - `exposure_time`, `gain`, `exposure_auto`, `gain_auto`: Bildhelligkeit und
   Bewegungsunschärfe.
 - `packet_size`, `inter_packet_delay`: optionale GigE-Transportparameter;
   `0` lässt den Kamerawert unverändert.
+
+Der CameraProcess spricht nur mit pylon und schreibt rohe Frames in den
+Shared-Memory-Ring. Der BallTuner liest diesen Ring, erzeugt die auf 30 FPS
+begrenzte JPEG-Vorschau und führt optional die Ballerkennung aus. Dadurch wird
+die Kameraaufnahme nicht durch die Browserdarstellung ausgebremst. Mit **Ballerkennung: EIN/AUS** lassen sich
+Ballkontur, Farbmaske und Kalibrieranzeige ausblenden bzw. wieder aktivieren;
+die Kameraaufnahme läuft dabei weiter. Der Zustand wird in `settings.json`
+gespeichert.
+
+Der Tracker und der BallTuner lesen die Rohframes über den Shared-Memory-Ring
+`tracking_kicker_camera_frames`. Nur der CameraProcess öffnet die
+Basler-Kamera; BallTuner und Tracker greifen ohne JPEG-Umweg auf die Frames zu.
+Die Kameraeinstellungen werden vom BallTuner über die lokale Control-API auf
+Port 5011 an den CameraProcess gesendet.
 
 ## Ballerkennung einstellen
 

@@ -21,7 +21,6 @@ import sys
 import threading
 import time
 from collections import deque
-from math import ceil
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any, Dict, Optional
@@ -36,6 +35,7 @@ from .detection import BallDetector
 from .camera.distortion import DistortionCorrector
 from .camera.factory import create_camera_with_retry
 from .goal_media import GoalMediaMixin
+from .logging_support import configure_runtime_logging
 from .runtime import (
     ANALYSIS_VIDEO_PATH,
     DIGIKICKER_POST_DEFAULT_URL,
@@ -48,11 +48,10 @@ from .runtime import (
     HEADLESS,
     RETRO_BUFFER_MAX_FRAMES,
     RETRO_MAX_REANALYZE_FRAMES,
-    VIDEO_PATH,
+    RETRO_TRIGGER_NO_BALL_FRAMES,
     acquire_app_lock,
     config,
     create_replay_fallback,
-    find_replay_video,
     vision,
 )
 from .ui.opencv_gui import destroy_all, imshow, wait_key
@@ -70,7 +69,6 @@ from .workers import WorkerMixin
 Analyse_Video_Path = ANALYSIS_VIDEO_PATH
 _acquire_app_lock = acquire_app_lock
 _create_camera_with_retry = create_camera_with_retry
-_find_replay_video = find_replay_video
 _create_replay_fallback = create_replay_fallback
 
 
@@ -86,25 +84,19 @@ class KickerApp(
         self.video = source
         self.cfg: Optional[Dict[str, Any]] = None
         self.dist = DistortionCorrector(config.camera)
-        # In HEADLESS mode the detector can use a reduced corrected image.
-        # Keep this corrector separate because goal-video generation may use
-        # self.dist concurrently for full-resolution output.
-        self.analysis_dist = DistortionCorrector(config.camera)
         print(f"📁 Verzerrung config: {config.camera}")
         cv2.setUseOptimized(True)
 
-        # The capture worker publishes raw frames only. Analysis makes its own
-        # copy before modifying an image, so replay and recording can share
-        # the raw frame without another copy in the time-critical camera loop.
+        # Queues shared by the camera, processing and recording workers.
         self.frame_queue = Queue(maxsize=2)
         self.display_queue = Queue(maxsize=1)
-        self.recording_queue = Queue(maxsize=4)
-        # Retro detection is CPU-heavy but does not need to block live
-        # analysis. Only one bounded batch is pending at a time.
-        self.retro_queue = Queue(maxsize=1)
-        self.retro_result_queue = Queue(maxsize=1)
+        self.recording_queue = Queue()
         self.raw_queue = Queue(maxsize=2)
         self.processed_queue = Queue(maxsize=2)
+
+        self.detection_state_lock = threading.Lock()
+        self.last_detection = {}
+        self.processing_fps = 0.0
 
         self.history_lock = threading.Lock()
         self.goal_video_lock = threading.Lock()
@@ -129,44 +121,27 @@ class KickerApp(
         self.t_api = None
         self.t_cam = None
         self.t_proc = None
-        self.t_retro = None
         self.t_rec = None
         self.t_roll = None
 
         self.stop_event = threading.Event()
         self.record_event = threading.Event()
 
-        # Keep the complete raw window needed for the one-second goal NPZ,
-        # but do not retain every 180-FPS image for the visual replay. The
-        # replay encoder only emits GOAL_VIDEO_FPS frames anyway. Retaining
-        # hundreds of full-resolution arrays created avoidable DDR traffic
-        # next to the USB receive process.
-        camera_fps = float(
-            getattr(getattr(config, "camera", None), "force_fps", 180) or 180
-        )
-        pre_frames = max(
-            2,
-            int(ceil(camera_fps * GOAL_PRE_NPZ_DURATION_SECONDS)) + 2,
-        )
-        replay_frames = max(
-            GOAL_VIDEO_FRAME_LIMIT + 4,
-            int(ceil(GOAL_VIDEO_FPS * GOAL_VIDEO_DURATION_SECONDS)) + 4,
-        )
-        self.goal_pre_buffer = deque(maxlen=pre_frames)
-        self.replay_buffer = deque(maxlen=replay_frames)
-        self._last_replay_sample_timestamp = 0.0
+        # Raw replay buffer and bounded retro-analysis buffer.
+        self.replay_buffer = deque(maxlen=int(240 * config.replay_seconds))
         self.replay_lock = threading.Lock()
+        self.snapshot_lock = threading.Lock()
+        self.snapshot_generation = 0
+        self.snapshot_frames = []
+        self.calibration_lock = threading.RLock()
         self.history_frames = deque()
         self.skipped_frame_lock = threading.Lock()
         self.skipped_frame_buffer = deque(maxlen=RETRO_BUFFER_MAX_FRAMES)
         self._frame_sequence = 0
         self._last_visible_frame_id = None
+        self._last_retro_frame_id = None
+        self._no_ball_live_frames = 0
         self._retro_analysis_count = 0
-        self._last_ball_seen_timestamp = None
-        self._recent_ball_detections = deque()
-        self._retro_armed = False
-        self._retro_triggered_for_episode = False
-        self._waiting_for_new_ball = False
 
         # Last goal result and digiKicker notification settings.
         self.last_analysis_lock = threading.Lock()
@@ -189,6 +164,55 @@ class KickerApp(
 
         self.api = Flask(__name__)
         self.last_analysis = {}
+        self.api.add_url_rule("/", "dashboard", self.api_dashboard, methods=["GET"])
+        self.api.add_url_rule(
+            "/live.mjpg",
+            "live_stream",
+            self.api_live_stream,
+            methods=["GET"],
+        )
+        self.api.add_url_rule(
+            "/api/status",
+            "tracking_status",
+            self.api_status,
+            methods=["GET"],
+        )
+        self.api.add_url_rule(
+            "/api/logs",
+            "runtime_logs",
+            self.api_logs,
+            methods=["GET"],
+        )
+        self.api.add_url_rule(
+            "/status",
+            "status_alias",
+            self.api_status,
+            methods=["GET"],
+        )
+        self.api.add_url_rule(
+            "/api/parameters",
+            "parameters",
+            self.api_parameters,
+            methods=["GET", "POST"],
+        )
+        self.api.add_url_rule(
+            "/api/snapshot",
+            "snapshot",
+            self.api_snapshot,
+            methods=["GET", "POST"],
+        )
+        self.api.add_url_rule(
+            "/api/snapshot/frame",
+            "snapshot_frame",
+            self.api_snapshot_frame,
+            methods=["GET"],
+        )
+        self.api.add_url_rule(
+            "/api/calibration",
+            "calibration",
+            self.api_calibration,
+            methods=["GET", "POST"],
+        )
         self.api.add_url_rule("/test", "test", self.api_test, methods=["GET"])
         self.api.add_url_rule("/goal", "goal", self.api_goal, methods=["GET"])
         self.api.add_url_rule(
@@ -199,8 +223,14 @@ class KickerApp(
         )
 
         self.detector = BallDetector.from_config(config, vision.field)
-        self.retro_detector = BallDetector.from_config(config, vision.field)
-        self.retro_dist = DistortionCorrector(config.camera)
+        self.snapshot_detector = BallDetector.from_config(config, vision.field)
+        self.ball_detection_enabled = bool(
+            getattr(config, "ball_detection_enabled", False)
+        )
+        print(
+            "Ballerkennung: "
+            + ("aktiv" if self.ball_detection_enabled else "deaktiviert")
+        )
         self.analyzer = KickerAnalyzer(
             goals_cfg=vision.goals,
             field_cfg=vision.field,
@@ -224,30 +254,13 @@ class KickerApp(
             self._load_or_calibrate()
             assert self.cfg is not None
 
-            self.t_api = threading.Thread(
-                target=self.api_loop, name="http-api", daemon=True
-            )
-            self.t_cam = threading.Thread(
-                target=self.capture_loop, name="camera-capture", daemon=True
-            )
-            capture_only = os.environ.get("TK_CAPTURE_ONLY", "0") == "1"
-            if not capture_only:
-                self.t_proc = threading.Thread(
-                    target=self.analysis_loop, name="frame-analysis", daemon=True
-                )
-            self.t_retro = threading.Thread(
-                target=self.retro_loop, name="retro-analysis", daemon=True
-            )
-            self.t_rec = threading.Thread(
-                target=self.recording_loop, name="raw-recording", daemon=True
-            )
+            self.t_api = threading.Thread(target=self.api_loop, daemon=True)
+            self.t_cam = threading.Thread(target=self.camera_loop, daemon=True)
+            self.t_proc = threading.Thread(target=self.processing_loop, daemon=True)
+            self.t_rec = threading.Thread(target=self.recording_loop, daemon=True)
 
             self.t_cam.start()
-            if self.t_proc is not None:
-                self.t_proc.start()
-            elif capture_only:
-                print("🧪 TK_CAPTURE_ONLY=1 → Analyse-Thread deaktiviert")
-            self.t_retro.start()
+            self.t_proc.start()
             self.t_rec.start()
             self.t_api.start()
 
@@ -312,14 +325,7 @@ class KickerApp(
                 break
 
     def _join_threads(self):
-        for thread in [
-            self.t_cam,
-            self.t_proc,
-            self.t_retro,
-            self.t_rec,
-            self.t_roll,
-            self.t_api,
-        ]:
+        for thread in [self.t_cam, self.t_proc, self.t_rec, self.t_roll, self.t_api]:
             if thread is None:
                 continue
             try:
@@ -329,27 +335,14 @@ class KickerApp(
 
 
 def main() -> None:
+    configure_runtime_logging()
     if not _acquire_app_lock():
         sys.exit(1)
 
-    # Let OpenCV parallelize the expensive distortion remap. The camera and
-    # analysis workers are already decoupled, so this does not block capture.
-    # Keep the value configurable because the useful setting depends on the
-    # host CPU and should be measured together with the camera stream.
-    try:
-        opencv_threads = max(
-            1,
-            int(
-                os.environ.get(
-                    "TK_OPENCV_THREADS",
-                    str(getattr(config, "opencv_threads", 8) or 8),
-                )
-            ),
-        )
-    except (TypeError, ValueError):
-        opencv_threads = 8
-    cv2.setNumThreads(opencv_threads)
-    print(f"OpenCV Threads = {cv2.getNumThreads()}")
+    # Keep OpenCV from competing with pypylon/libusb for CPU time on the
+    # Orange Pi.  The camera worker remains responsive while the processing
+    # worker handles the latest frame.
+    cv2.setNumThreads(1)
 
     while True:
         source = None
@@ -361,7 +354,7 @@ def main() -> None:
                     print("📷 Quelle: Basler Kamera")
                 except Exception as exc:
                     print(f"❌ Kamera nicht verfügbar: {exc}")
-                    print("➡️ Fallback auf RawReplaySource")
+                    print("➡️ Fallback auf den separaten Raw Replay Process")
                     source = _create_replay_fallback()
             else:
                 source = _create_replay_fallback()

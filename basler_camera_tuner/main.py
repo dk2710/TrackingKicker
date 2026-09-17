@@ -9,7 +9,17 @@ from typing import Optional
 from flask import Flask, Response, jsonify, render_template_string, request
 
 from .camera import BaslerCamera
-from .settings import load_settings, save_settings
+from .settings import (
+    load_settings,
+    load_tracker_ball_settings,
+    save_settings,
+    save_tracker_ball_settings,
+)
+from v3.tracking_kicker.logging_support import (
+    configure_runtime_logging,
+    latest_log_id,
+    runtime_logs,
+)
 
 
 PAGE = """
@@ -42,7 +52,25 @@ PAGE = """
     button.secondary { background: #4b5563; margin-left: 6px; }
     .status { white-space: pre-wrap; font-family: ui-monospace, monospace;
               font-size: .8rem; line-height: 1.45; color: #bfdbfe; }
+    .telemetry { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+                 gap: 8px; margin: 0 0 14px; }
+    .metric { background: #111827; border: 1px solid #374151;
+              border-radius: 8px; padding: 9px 11px; }
+    .metric-label { display: block; color: #9ca3af; font-size: .75rem; }
+    .metric-value { display: block; margin-top: 2px; color: #a7f3d0;
+                    font-size: 1.15rem; font-weight: 700; }
+    .metric-value.warning { color: #fbbf24; }
+    .metric-detail { display: block; margin-top: 2px; color: #6b7280;
+                     font-size: .7rem; }
+    .preview-controls { display: flex; align-items: center; gap: 10px;
+                        margin: 0 0 12px; }
+    .preview-controls button { margin-top: 0; }
+    .preview-state { color: #9ca3af; font-size: .8rem; }
+    .preview-hidden { display: none; }
     .hint { font-size: .8rem; color: #9ca3af; line-height: 1.4; }
+    .logs { width: 100%; min-height: 190px; box-sizing: border-box; resize: vertical;
+            padding: 10px; border: 1px solid #4b5563; border-radius: 5px;
+            background: #111827; color: #dbeafe; font: .78rem/1.45 ui-monospace, monospace; }
     #message { min-height: 1.3em; margin-top: 10px; color: #a7f3d0; }
     @media (max-width: 850px) { .layout { grid-template-columns: 1fr; } }
   </style>
@@ -53,22 +81,80 @@ PAGE = """
   <div class="layout">
     <section class="card">
       <h2>Livebild und Ballerkennung</h2>
+      <div class="telemetry" aria-live="polite">
+        <div class="metric">
+          <span class="metric-label">Kamera-Soll</span>
+          <strong id="requested_fps" class="metric-value">-</strong>
+          <span class="metric-detail">konfiguriert</span>
+        </div>
+        <div class="metric">
+          <span class="metric-label">pylon-Rate</span>
+          <strong id="resulting_fps" class="metric-value">-</strong>
+          <span class="metric-detail">resultierende Kamerarate</span>
+        </div>
+        <div class="metric">
+          <span class="metric-label">Kamera-FPS</span>
+          <strong id="camera_fps" class="metric-value">-</strong>
+          <span class="metric-detail">erfolgreich empfangen</span>
+        </div>
+        <div class="metric">
+          <span class="metric-label">Frames gesamt</span>
+          <strong id="camera_frames_total" class="metric-value">-</strong>
+          <span class="metric-detail">seit dem Start</span>
+        </div>
+        <div class="metric">
+          <span class="metric-label">Vorschau-FPS</span>
+          <strong id="preview_fps" class="metric-value">-</strong>
+          <span class="metric-detail">nach JPEG-Verarbeitung</span>
+        </div>
+        <div class="metric">
+          <span class="metric-label">Fehlgeschlagene Grabs</span>
+          <strong id="failed_grabs" class="metric-value">-</strong>
+          <span class="metric-detail">seit dem Start</span>
+        </div>
+        <div class="metric">
+          <span class="metric-label">Payload-/Transportfehler</span>
+          <strong id="payload_errors" class="metric-value">-</strong>
+          <span class="metric-detail">seit dem Start</span>
+        </div>
+        <div class="metric">
+          <span class="metric-label">Verworfene Frames</span>
+          <strong id="dropped_frames" class="metric-value">-</strong>
+          <span class="metric-detail">LatestImageOnly / Block-ID</span>
+        </div>
+        <div class="metric">
+          <span class="metric-label">Reconnects</span>
+          <strong id="reconnects" class="metric-value">-</strong>
+          <span class="metric-detail">seit dem Start</span>
+        </div>
+      </div>
+      <div class="preview-controls">
+        <button id="ball_detection_toggle" onclick="toggleBallDetection()">
+          Ballerkennung: EIN
+        </button>
+        <span id="ball_detection_state" class="preview-state">
+          Overlay und Farbmaske aktiv
+        </span>
+      </div>
       <div class="previews">
         <div><h3>Rohbild</h3>
           <img src="/video_feed" alt="Livebild der Basler-Kamera"></div>
-        <div><h3>Ball-Overlay</h3>
+        <div id="ball_preview"><h3>Ball-Overlay</h3>
           <img src="/ball_feed" alt="Livebild mit erkannter Ballkontur"></div>
-        <div><h3>Farbmaske</h3>
+        <div id="mask_preview"><h3>Farbmaske</h3>
           <img src="/mask_feed" alt="HSV-Farbmaske der Ballerkennung"></div>
       </div>
       <p class="hint">Die Seite kann vom Laptop aus geöffnet werden. Der Tuner zeigt
         den zuletzt empfangenen Frame als Live-MJPEG-Stream.</p>
       <div id="status" class="status">Status wird geladen ...</div>
+      <h2 style="margin-top: 22px">System-Logs</h2>
+      <textarea id="runtimeLogs" class="logs" readonly spellcheck="false">Logs werden geladen ...</textarea>
+      <div id="logStatus" class="status">Zeitstempel werden geladen ...</div>
     </section>
     <section class="card">
       <h2>Kameraeinstellungen</h2>
       <div class="fields">
-        <label>FPS <input id="force_fps" type="number" step="1" min="0"></label>
+        <label>FPS <input id="force_fps" type="number" step="1" min="30"></label>
         <label>PixelFormat <select id="pixel_format">
           <option>BayerRG8</option><option>Mono8</option>
         </select></label>
@@ -89,6 +175,9 @@ PAGE = """
           <option value="one_by_one">OneByOne</option>
         </select></label>
         <label>MaxNumBuffer <input id="max_num_buffer" type="number" min="1"></label>
+        <label>MaxTransferSize (0=default) <input id="max_transfer_size" type="number" min="0"></label>
+        <label>NumMaxQueuedUrbs (0=default) <input id="num_max_queued_urbs" type="number" min="0"></label>
+        <label>DeviceLinkThroughputLimit <input id="device_link_throughput_limit" type="number" min="0"></label>
         <label>Packet Size (0=default) <input id="packet_size" type="number" min="0"></label>
         <label>Inter-Packet Delay <input id="inter_packet_delay" type="number" min="0"></label>
       </div>
@@ -96,9 +185,9 @@ PAGE = """
       <button class="secondary" onclick="reconnect()">Neu verbinden</button>
       <button class="secondary" onclick="exportTracker()">Für Tracker übernehmen</button>
       <div id="message"></div>
-      <p class="hint">Für das Tuning zuerst <b>LatestImageOnly</b> verwenden. Für die
-        Tracking-Anwendung erst auf <b>OneByOne</b> umstellen, wenn FPS und Netzwerk
-        stabil sind. Änderungen werden in <code>settings.json</code> gespeichert und
+      <p class="hint"><b>LatestImageOnly</b> ist die aktive Tracking-Strategie.
+        Ältere fertige Frames dürfen dabei verworfen werden; ein USB-Payload-Fehler
+        wird dadurch nicht repariert. Änderungen werden in <code>settings.json</code> gespeichert und
         nach jedem Reconnect erneut angewendet.</p>
       <h2 style="margin-top: 22px">Ballerkennung (HSV)</h2>
       <div class="fields">
@@ -125,11 +214,15 @@ PAGE = """
 <script>
 const names = ["force_fps", "width", "height", "offset_x", "offset_y",
   "exposure_time", "gain", "pixel_format", "exposure_auto", "gain_auto",
-  "grab_strategy", "max_num_buffer", "packet_size", "inter_packet_delay"];
+  "grab_strategy", "max_num_buffer", "max_transfer_size",
+  "num_max_queued_urbs", "device_link_throughput_limit", "packet_size",
+  "inter_packet_delay"];
 const ballNames = ["hsv_low_h", "hsv_high_h", "hsv_low_s", "hsv_high_s",
   "hsv_low_v", "hsv_high_v", "area_min", "area_max", "detection_scale",
   "radius_min_px", "radius_max_px", "circularity_min", "solidity_min"];
 let settingsLoaded = false;
+let ballDetectionEnabled = false;
+let latestLogId = 0;
 
 function fill(settings) {
   for (const name of names) {
@@ -163,6 +256,60 @@ function fillBall(settings) {
   }
 }
 
+function formatDecimal(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toFixed(1) : "-";
+}
+
+function formatInteger(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.trunc(number).toLocaleString("de-DE") : "-";
+}
+
+function updateTelemetry(data) {
+  document.getElementById("requested_fps").textContent =
+    `${formatDecimal(data.requested_fps)} FPS`;
+  document.getElementById("resulting_fps").textContent =
+    data.resulting_fps == null ? "-" : `${formatDecimal(data.resulting_fps)} FPS`;
+  document.getElementById("camera_fps").textContent =
+    `${formatDecimal(data.camera_fps)} FPS`;
+  document.getElementById("camera_frames_total").textContent =
+    formatInteger(data.camera_frames_total);
+  const previewFps = data.preview_fps != null
+    ? data.preview_fps : data.measured_fps;
+  document.getElementById("preview_fps").textContent =
+    `${formatDecimal(previewFps)} FPS`;
+
+  const failedElement = document.getElementById("failed_grabs");
+  const failed = Number(data.failed_grabs);
+  failedElement.textContent = formatInteger(failed);
+  failedElement.classList.toggle("warning", Number.isFinite(failed) && failed > 0);
+  document.getElementById("payload_errors").textContent =
+    formatInteger(data.payload_errors);
+  document.getElementById("dropped_frames").textContent =
+    formatInteger(data.dropped_frames);
+  document.getElementById("reconnects").textContent =
+    formatInteger(data.reconnects);
+}
+
+function updateBallDetectionUi(data) {
+  ballDetectionEnabled = data.ball_detection_enabled !== false;
+  const button = document.getElementById("ball_detection_toggle");
+  const state = document.getElementById("ball_detection_state");
+  button.textContent = ballDetectionEnabled
+    ? "Ballerkennung: EIN"
+    : "Ballerkennung: AUS";
+  state.textContent = ballDetectionEnabled
+    ? "Overlay und Farbmaske aktiv"
+    : "Overlay, Farbmaske und Kalibrieranzeige deaktiviert";
+  document.getElementById("ball_preview").classList.toggle(
+    "preview-hidden", !ballDetectionEnabled
+  );
+  document.getElementById("mask_preview").classList.toggle(
+    "preview-hidden", !ballDetectionEnabled
+  );
+}
+
 async function refresh() {
   const response = await fetch("/api/status");
   const data = await response.json();
@@ -172,7 +319,25 @@ async function refresh() {
     fillBall(data.ball_detection);
     settingsLoaded = true;
   }
+  updateTelemetry(data);
+  updateBallDetectionUi(data);
   document.getElementById("status").textContent = JSON.stringify(data, null, 2);
+}
+
+async function toggleBallDetection() {
+  const response = await fetch("/api/ball_detection", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({enabled: !ballDetectionEnabled})
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    document.getElementById("message").textContent = data.message || "Fehler";
+    return;
+  }
+  updateBallDetectionUi(data);
+  document.getElementById("message").textContent = data.message || "Gespeichert";
+  await refresh();
 }
 
 async function applySettings() {
@@ -200,8 +365,32 @@ async function exportTracker() {
   document.getElementById("message").textContent = data.message || "Tracker-Konfiguration aktualisiert";
 }
 
+async function refreshLogs() {
+  try {
+    const response = await fetch(`/api/logs?after=${latestLogId}&limit=200`, {cache: "no-store"});
+    if (!response.ok) throw new Error(await response.text());
+    const data = await response.json();
+    const entries = data.logs || [];
+    const textarea = document.getElementById("runtimeLogs");
+    if (latestLogId === 0 && entries.length) textarea.value = "";
+    if (entries.length) {
+      const oldLines = textarea.value && textarea.value !== "Logs werden geladen ..."
+        ? textarea.value.split("\n") : [];
+      textarea.value = oldLines.concat(entries.map(item => item.text || ""))
+        .slice(-300).join("\n");
+      textarea.scrollTop = textarea.scrollHeight;
+    }
+    latestLogId = Math.max(latestLogId, Number(data.latest_id || 0));
+    document.getElementById("logStatus").textContent = `Letzter Log-Eintrag: ${latestLogId}`;
+  } catch (error) {
+    document.getElementById("logStatus").textContent = "Logs nicht erreichbar: " + error;
+  }
+}
+
 refresh().catch(error => document.getElementById("message").textContent = error);
+refreshLogs();
 setInterval(() => refresh().catch(() => {}), 1500);
+setInterval(() => refreshLogs().catch(() => {}), 1000);
 </script>
 </body>
 </html>
@@ -215,15 +404,11 @@ def _export_tracker_ball_settings(
     if tracker_config_path is None or not tracker_config_path.exists():
         raise FileNotFoundError("v3/tracking_kicker/config.json nicht gefunden")
 
-    with tracker_config_path.open("r", encoding="utf-8") as handle:
-        config = json.load(handle)
-    config["ball_detection"] = camera.ball_settings.as_tracker_dict()
-
-    temporary = tracker_config_path.with_suffix(tracker_config_path.suffix + ".tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        json.dump(config, handle, indent=2)
-        handle.write("\n")
-    temporary.replace(tracker_config_path)
+    save_tracker_ball_settings(
+        tracker_config_path,
+        camera.ball_settings,
+        camera.is_ball_detection_enabled(),
+    )
 
 
 def create_app(
@@ -245,6 +430,15 @@ def create_app(
     @app.get("/api/status")
     def status():
         return jsonify(camera.status())
+
+    @app.get("/api/logs")
+    def logs():
+        after = request.args.get("after", default=0, type=int)
+        limit = request.args.get("limit", default=200, type=int)
+        return jsonify({
+            "logs": runtime_logs(after=after or 0, limit=limit or 200),
+            "latest_id": latest_log_id(),
+        })
 
     @app.get("/snapshot.jpg")
     def snapshot():
@@ -315,6 +509,11 @@ def create_app(
             ok = camera.update_settings(camera_values) if camera_values else True
             if ball_values:
                 camera.update_ball_settings(ball_values)
+                save_tracker_ball_settings(
+                    tracker_config_path,
+                    camera.ball_settings,
+                    camera.is_ball_detection_enabled(),
+                )
             save_settings(
                 settings_path,
                 camera.settings,
@@ -338,6 +537,37 @@ def create_app(
             "camera_open": ok,
         }), (200 if ok else 503)
 
+    @app.post("/api/ball_detection")
+    def ball_detection():
+        payload = request.get_json(silent=True) or {}
+        if "enabled" not in payload:
+            return jsonify({"message": "enabled muss angegeben werden"}), 400
+        enabled = bool(payload["enabled"])
+        camera.set_ball_detection_enabled(enabled)
+        server_settings["ball_detection_enabled"] = enabled
+        try:
+            save_settings(
+                settings_path,
+                camera.settings,
+                camera.ball_settings,
+                server_settings,
+            )
+            save_tracker_ball_settings(
+                tracker_config_path,
+                camera.ball_settings,
+                enabled,
+            )
+        except OSError as exc:
+            return jsonify({"message": str(exc)}), 500
+        return jsonify({
+            "message": (
+                "Ballerkennung und Kalibrieranzeige aktiviert"
+                if enabled
+                else "Ballerkennung und Kalibrieranzeige deaktiviert"
+            ),
+            "ball_detection_enabled": enabled,
+        })
+
     @app.post("/api/export_tracker")
     def export_tracker():
         try:
@@ -353,6 +583,7 @@ def create_app(
 
 
 def main() -> None:
+    configure_runtime_logging()
     parser = argparse.ArgumentParser(description="Basler Livebild und Kamera-Tuner")
     parser.add_argument(
         "--settings",
@@ -363,15 +594,32 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=None)
     args = parser.parse_args()
 
-    camera_settings, ball_settings, server_settings = load_settings(args.settings)
+    camera_settings, _unused_ball_settings, server_settings = load_settings(args.settings)
+    tracker_config_path = Path(__file__).parent.parent / "v3" / "tracking_kicker" / "config.json"
+    ball_settings, tracker_detection_enabled = load_tracker_ball_settings(
+        tracker_config_path
+    )
+    server_settings["ball_detection_enabled"] = tracker_detection_enabled
     if args.host is not None:
         server_settings["host"] = args.host
     if args.port is not None:
         server_settings["port"] = args.port
 
-    camera = BaslerCamera(camera_settings, ball_settings)
+    camera = BaslerCamera(
+        camera_settings,
+        ball_settings,
+        ball_detection_enabled=tracker_detection_enabled,
+        frame_ipc_name=str(
+            server_settings.get("frame_ipc_name", "tracking_kicker_camera_frames")
+        ),
+        frame_ipc_slots=int(server_settings.get("frame_ipc_slots", 3)),
+        control_url=str(
+            server_settings.get(
+                "camera_control_url", "http://127.0.0.1:5011"
+            )
+        ),
+    )
     camera.start()
-    tracker_config_path = Path(__file__).parent.parent / "v3" / "tracking_kicker" / "config.json"
     app = create_app(camera, args.settings, server_settings, tracker_config_path)
     print(
         "Basler Tuner erreichbar unter "
