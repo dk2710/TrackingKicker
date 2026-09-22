@@ -86,6 +86,7 @@ class BallDetector:
         self._track_velocity_px_s = (0.0, 0.0)
         self._track_misses = 0
         self.max_track_misses = 3
+        self.last_mask: Optional[np.ndarray] = None
 
         self.expected_r: Optional[float] = None
         self._last_xy: Optional[Tuple[int, int]] = None
@@ -147,9 +148,25 @@ class BallDetector:
     # ---------------------------------------------------------
     # Detection
     # ---------------------------------------------------------
-    def detect(self, frame: Frame):
-        image = frame.frame
-        scale = self.detection_scale
+    def detect(self, frame: Frame, detection_image: Optional[np.ndarray] = None):
+        """Detect the ball in one frame.
+
+        ``detection_image`` may be supplied when the caller has already
+        converted, resized and corrected the image for the detector.  This is
+        used by the high-rate headless tracker path to avoid doing the same
+        preparation twice.  The returned coordinates are still expressed in
+        the original ``frame.frame`` coordinate system.
+        """
+
+        image = frame.frame if detection_image is None else detection_image
+        if image is None:
+            raise ValueError("Leeres Kamerabild")
+
+        if detection_image is None:
+            scale = self.detection_scale
+        else:
+            original_width = max(1, int(frame.frame.shape[1]))
+            scale = float(image.shape[1]) / original_width
 
         # Diese Attribute werden auch bei einer reinen Positionsanalyse
         # gesetzt. Nur ball_track_valid wird vom Analyzer fuer die
@@ -161,7 +178,7 @@ class BallDetector:
         # Die Vollbild-Erkennung ist auf dem Orange Pi sehr teuer. Die
         # Detektion erfolgt halbaufgeloest; die Koordinaten werden unten
         # wieder auf die Originalaufloesung hochgerechnet.
-        if 0.0 < scale < 1.0:
+        if detection_image is None and 0.0 < scale < 1.0:
             image = cv2.resize(
                 image,
                 None,
@@ -169,10 +186,12 @@ class BallDetector:
                 fy=scale,
                 interpolation=cv2.INTER_AREA,
             )
-        else:
+            scale = float(image.shape[1]) / max(1, int(frame.frame.shape[1]))
+        elif not 0.0 < scale <= 1.0:
             scale = 1.0
 
         mask = self._mask_ball(image)
+        self.last_mask = mask
         cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         if not cnts:

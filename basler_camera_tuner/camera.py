@@ -6,6 +6,7 @@ import json
 import threading
 import time
 from dataclasses import fields
+from queue import Empty, Full, Queue
 from typing import Any, Dict, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -14,7 +15,9 @@ import cv2
 import numpy as np
 
 from v3.camera_frame_ipc import DEFAULT_NAME, DEFAULT_SLOTS, SharedFrameRing
+from v3.tracking_kicker.Objects.Frames import Frame
 from v3.tracking_kicker.camera.conversion import to_bgr
+from v3.tracking_kicker.detection import BallDetector
 
 from .settings import BallDetectionSettings, CameraSettings
 
@@ -34,35 +37,78 @@ class BaslerCamera:
         frame_ipc_slots: int = DEFAULT_SLOTS,
         control_url: str = "http://127.0.0.1:5011",
     ) -> None:
+        # Keep OpenCV's work bounded in the website process. The historical
+        # tracker used one OpenCV worker because multi-threaded blur/contour
+        # processing competed with the high-rate camera transport.
+        cv2.setUseOptimized(True)
+        cv2.setNumThreads(1)
         self.settings = settings
         self.ball_settings = ball_settings or BallDetectionSettings()
         self._ball_detection_enabled = bool(ball_detection_enabled)
         self._frame_ipc_name = str(frame_ipc_name)
         self._frame_ipc_slots = DEFAULT_SLOTS
         self._control_url = str(control_url).rstrip("/")
+        self._detector_lock = threading.RLock()
+        self._detector = self._build_detector()
         self._ring: Optional[SharedFrameRing] = None
         self._ring_lock = threading.RLock()
         self._stop_event = threading.Event()
+        self._detection_queue: Queue = Queue(maxsize=8)
         self._capture_thread: Optional[threading.Thread] = None
+        self._detection_thread: Optional[threading.Thread] = None
         self._preview_thread: Optional[threading.Thread] = None
         self._raw_frame: Optional[np.ndarray] = None
         self._raw_sequence = 0
+        self._raw_timestamp = 0.0
         self._latest_frame: Optional[np.ndarray] = None
         self._latest_jpeg: Optional[bytes] = None
         self._latest_ball_jpeg: Optional[bytes] = None
         self._latest_mask_jpeg: Optional[bytes] = None
+        self._latest_detection_mask: Optional[np.ndarray] = None
+        self._latest_detection_sequence = 0
         self._last_ball = None
         self._latest_lock = threading.Lock()
         self._stats_lock = threading.Lock()
         self._frame_number = 0
         self._received_frames = 0
         self._preview_fps = 0.0
+        self._detection_attempts = 0
+        self._detection_hits = 0
+        self._detection_errors = 0
+        self._detection_queue_dropped = 0
+        self._detection_time_ms = 0.0
+        self._detection_last_ms = 0.0
+        self._detection_started = time.monotonic()
         self._dropped_frames = 0
         self._ipc_errors = 0
         self._last_error = ""
         self._last_error_time = 0.0
         self._remote_status: Dict[str, Any] = {}
         self._remote_last_error = ""
+
+    def _build_detector(self) -> BallDetector:
+        settings = self.ball_settings
+        return BallDetector(
+            hsv_low=(
+                int(settings.hsv_low_h),
+                int(settings.hsv_low_s),
+                int(settings.hsv_low_v),
+            ),
+            hsv_high=(
+                int(settings.hsv_high_h),
+                int(settings.hsv_high_s),
+                int(settings.hsv_high_v),
+            ),
+            area_min=float(settings.area_min),
+            area_max=float(settings.area_max),
+            detection_scale=float(settings.detection_scale),
+            expected_fps=float(self.settings.force_fps),
+            radius_min_px=float(settings.radius_min_px),
+            radius_max_px=float(settings.radius_max_px),
+            circularity_min=float(settings.circularity_min),
+            solidity_min=float(settings.solidity_min),
+            pixel_format=str(self.settings.pixel_format),
+        )
 
     # ------------------------------------------------------------------
     # CameraProcess control API
@@ -108,7 +154,11 @@ class BaslerCamera:
             raise ValueError("Die Tracking-Konfiguration verwendet LatestImageOnly")
         result = self._request("/api/settings", method="POST", payload={"camera": values})
         if isinstance(result.get("settings"), dict):
-            self.settings = CameraSettings(**result["settings"])
+            updated = CameraSettings(**result["settings"])
+            if updated != self.settings:
+                self.settings = updated
+                with self._detector_lock:
+                    self._detector = self._build_detector()
         return bool(result.get("camera_open", False))
 
     def reconnect(self) -> bool:
@@ -134,11 +184,19 @@ class BaslerCamera:
             target=self._preview_loop, name="ball-tuner-preview", daemon=True
         )
         self._capture_thread.start()
+        self._detection_thread = threading.Thread(
+            target=self._detection_loop, name="ball-tuner-detection", daemon=True
+        )
+        self._detection_thread.start()
         self._preview_thread.start()
 
     def stop(self) -> None:
         self._stop_event.set()
-        for thread in (self._capture_thread, self._preview_thread):
+        for thread in (
+            self._capture_thread,
+            self._detection_thread,
+            self._preview_thread,
+        ):
             if thread is not None:
                 thread.join(timeout=2.0)
         with self._ring_lock:
@@ -212,6 +270,64 @@ class BaslerCamera:
             with self._latest_lock:
                 self._raw_frame = image
                 self._raw_sequence = int(sequence)
+                self._raw_timestamp = float(_timestamp)
+            if self.is_ball_detection_enabled():
+                try:
+                    self._detection_queue.put_nowait(
+                        (int(sequence), float(_timestamp), image)
+                    )
+                except Full:
+                    with self._stats_lock:
+                        self._detection_queue_dropped += 1
+            else:
+                with self._latest_lock:
+                    self._last_ball = None
+                    self._latest_detection_mask = None
+                    self._latest_detection_sequence = int(sequence)
+
+    def _detection_loop(self) -> None:
+        """Run OpenCV independently from the shared-memory reader."""
+
+        while not self._stop_event.is_set():
+            try:
+                sequence, timestamp, image = self._detection_queue.get(timeout=0.1)
+            except Empty:
+                continue
+            if not self.is_ball_detection_enabled():
+                continue
+            self._detect_frame(sequence, timestamp, image)
+
+    def _detect_frame(self, sequence: int, timestamp: float, image: np.ndarray) -> None:
+        """Try the OpenCV detector for every frame received from the mailbox."""
+
+        started = time.perf_counter()
+        frame = Frame()
+        frame.frame = image
+        frame.timestamp = float(timestamp)
+        try:
+            with self._detector_lock:
+                self._detector.detect(frame)
+                mask = self._detector.last_mask
+                mask_copy = None if mask is None else mask.copy()
+            ball = None if frame.ball is None else list(frame.ball)
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            with self._latest_lock:
+                self._last_ball = ball
+                self._latest_detection_mask = mask_copy
+                self._latest_detection_sequence = int(sequence)
+            with self._stats_lock:
+                self._detection_attempts += 1
+                self._detection_hits += int(ball is not None)
+                self._detection_time_ms += elapsed_ms
+                self._detection_last_ms = elapsed_ms
+        except Exception as exc:
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            with self._stats_lock:
+                self._detection_attempts += 1
+                self._detection_errors += 1
+                self._detection_time_ms += elapsed_ms
+                self._detection_last_ms = elapsed_ms
+            self._set_error(f"Ballerkennung fehlgeschlagen: {exc}")
 
     def _preview_loop(self) -> None:
         interval = 1.0 / self.PREVIEW_FPS_LIMIT
@@ -245,25 +361,34 @@ class BaslerCamera:
                 return False
             detection_enabled = self.is_ball_detection_enabled()
             if detection_enabled:
-                ball_preview, mask_preview, ball = self._create_ball_preview(image)
+                with self._latest_lock:
+                    ball = self._last_ball
+                ball_preview = image.copy()
+                if ball is not None:
+                    x, y, radius = (int(value) for value in ball)
+                    cv2.circle(
+                        ball_preview,
+                        (x, y),
+                        max(2, radius),
+                        (0, 255, 255),
+                        3,
+                    )
             else:
                 ball_preview, mask_preview, ball = image, image, None
             ok, encoded = cv2.imencode(
-                ".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 85]
+                ".jpg", ball_preview, [int(cv2.IMWRITE_JPEG_QUALITY), 85]
             )
-            if detection_enabled:
-                preview_ok, ball_encoded = cv2.imencode(".jpg", ball_preview)
-                mask_ok, mask_encoded = cv2.imencode(".jpg", mask_preview)
-            else:
-                preview_ok = mask_ok = ok
-                ball_encoded = mask_encoded = encoded
-            if not ok or not preview_ok or not mask_ok:
+            if not ok:
                 return False
             with self._latest_lock:
                 self._latest_frame = image
                 self._latest_jpeg = encoded.tobytes()
-                self._latest_ball_jpeg = ball_encoded.tobytes()
-                self._latest_mask_jpeg = mask_encoded.tobytes()
+                # The first detection stage exposes the detected position in
+                # the overlay and status. Keep the two auxiliary endpoints
+                # on the same single encoded color frame so detection does
+                # not add two more JPEG encoders to the 30-FPS web path.
+                self._latest_ball_jpeg = self._latest_jpeg
+                self._latest_mask_jpeg = self._latest_jpeg
                 self._frame_number += 1
                 self._received_frames += 1
                 self._last_ball = ball
@@ -271,48 +396,6 @@ class BaslerCamera:
         except Exception as exc:
             self._set_error(f"Preview-Verarbeitung fehlgeschlagen: {exc}")
             return False
-
-    def _create_ball_preview(self, image):
-        settings = self.ball_settings
-        scale = float(settings.detection_scale)
-        detection_image = image
-        if 0.0 < scale < 1.0:
-            detection_image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        hsv = cv2.cvtColor(cv2.GaussianBlur(detection_image, (5, 5), 0), cv2.COLOR_BGR2HSV)
-        lower = np.array([settings.hsv_low_h, settings.hsv_low_s, settings.hsv_low_v], dtype=np.uint8)
-        upper = np.array([settings.hsv_high_h, settings.hsv_high_s, settings.hsv_high_v], dtype=np.uint8)
-        mask = cv2.inRange(hsv, lower, upper)
-        mask = cv2.morphologyEx(
-            mask,
-            cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
-            iterations=2,
-        )
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        candidates = []
-        area_scale = scale * scale
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if not settings.area_min * area_scale <= area <= settings.area_max * area_scale:
-                continue
-            (x, y), radius = cv2.minEnclosingCircle(contour)
-            if not settings.radius_min_px * scale < radius < settings.radius_max_px * scale:
-                continue
-            perimeter = cv2.arcLength(contour, True)
-            circularity = 4.0 * np.pi * area / (perimeter * perimeter) if perimeter else 0.0
-            hull_area = cv2.contourArea(cv2.convexHull(contour))
-            solidity = area / hull_area if hull_area else 0.0
-            if circularity >= settings.circularity_min and solidity >= settings.solidity_min:
-                candidates.append((area, x / scale, y / scale, radius / scale))
-        preview = image.copy()
-        ball = None
-        if candidates:
-            _, x, y, radius = max(candidates, key=lambda value: value[0])
-            ball = [round(x), round(y), round(radius)]
-            cv2.circle(preview, (round(x), round(y)), max(2, round(radius)), (0, 255, 255), 3)
-        if mask.shape[:2] != image.shape[:2]:
-            mask = cv2.resize(mask, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST)
-        return preview, cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR), ball
 
     # ------------------------------------------------------------------
     # Settings, detection and status exposed to the existing web UI
@@ -351,9 +434,15 @@ class BaslerCamera:
         if not 0.0 <= candidate.solidity_min <= 1.0:
             raise ValueError("solidity_min muss zwischen 0 und 1 liegen")
         self.ball_settings = candidate
+        with self._detector_lock:
+            self._detector = self._build_detector()
 
     def set_ball_detection_enabled(self, enabled: bool) -> None:
         self._ball_detection_enabled = bool(enabled)
+        if not self._ball_detection_enabled:
+            with self._latest_lock:
+                self._last_ball = None
+                self._latest_detection_mask = None
 
     def is_ball_detection_enabled(self) -> bool:
         return self._ball_detection_enabled
@@ -386,6 +475,13 @@ class BaslerCamera:
             dropped = self._dropped_frames
             ipc_errors = self._ipc_errors
             local_error = self._last_error
+            detection_attempts = self._detection_attempts
+            detection_hits = self._detection_hits
+            detection_errors = self._detection_errors
+            detection_queue_dropped = self._detection_queue_dropped
+            detection_time_ms = self._detection_time_ms
+            detection_last_ms = self._detection_last_ms
+        detection_elapsed = max(0.001, time.monotonic() - self._detection_started)
         result = dict(remote)
         result.update({
             "frame_number": frame_number,
@@ -401,6 +497,15 @@ class BaslerCamera:
             "ball_detection": dict(vars(self.ball_settings)),
             "ball_detection_enabled": self.is_ball_detection_enabled(),
             "detected_ball": self._last_ball,
+            "detection_attempts": detection_attempts,
+            "detection_hits": detection_hits,
+            "detection_errors": detection_errors,
+            "detection_queue_dropped": detection_queue_dropped,
+            "detection_fps": round(detection_attempts / detection_elapsed, 2),
+            "detection_avg_ms": round(
+                detection_time_ms / max(1, detection_attempts), 3
+            ),
+            "detection_last_ms": round(detection_last_ms, 3),
             "frame_ipc": remote.get("frame_ipc", {
                 "name": self._frame_ipc_name,
                 "slots": self._frame_ipc_slots,

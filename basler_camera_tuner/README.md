@@ -6,17 +6,11 @@ Tischkicker-Tracker wichtigen Einstellungen.
 
 ## Start auf dem Orange Pi
 
-Aus dem Projektverzeichnis in zwei Terminals:
+Aus dem Projektverzeichnis genügt ein Prozess:
 
 ```bash
 cd /home/dkleis/dev/tischkicker
 .venv/bin/python -u -m v3.camera_process.main
-```
-
-Danach den BallTuner starten:
-
-```bash
-.venv/bin/python -u -m basler_camera_tuner.main
 ```
 
 Danach auf dem Laptop öffnen:
@@ -44,19 +38,19 @@ angewendet.
 - `packet_size`, `inter_packet_delay`: optionale GigE-Transportparameter;
   `0` lässt den Kamerawert unverändert.
 
-Der CameraProcess spricht nur mit pylon und schreibt rohe Frames in den
-Shared-Memory-Ring. Der BallTuner liest diesen Ring, erzeugt die auf 30 FPS
-begrenzte JPEG-Vorschau und führt optional die Ballerkennung aus. Dadurch wird
-die Kameraaufnahme nicht durch die Browserdarstellung ausgebremst. Mit **Ballerkennung: EIN/AUS** lassen sich
+Der CameraProcess spricht mit pylon und legt das jeweils neueste rohe Frame in
+einen kleinen In-Process-Puffer. Der Website-Thread liest diesen Puffer,
+erzeugt die auf 30 FPS begrenzte JPEG-Vorschau und führt optional die
+Ballerkennung aus. Dadurch wird die Kameraaufnahme nicht durch die
+Browserdarstellung ausgebremst. Mit **Ballerkennung: EIN/AUS** lassen sich
 Ballkontur, Farbmaske und Kalibrieranzeige ausblenden bzw. wieder aktivieren;
 die Kameraaufnahme läuft dabei weiter. Der Zustand wird in `settings.json`
 gespeichert.
 
-Der Tracker und der BallTuner lesen die Rohframes über den Shared-Memory-Ring
-`tracking_kicker_camera_frames`. Nur der CameraProcess öffnet die
-Basler-Kamera; BallTuner und Tracker greifen ohne JPEG-Umweg auf die Frames zu.
-Die Kameraeinstellungen werden vom BallTuner über die lokale Control-API auf
-Port 5011 an den CameraProcess gesendet.
+Der CameraProcess öffnet die Basler-Kamera. Website und CameraProcess laufen
+im selben Python-Prozess; die Kameraeinstellungen werden direkt an den
+CameraProcess weitergegeben. Der separate alte Shared-Memory-Startweg bleibt
+für bestehende Tracker-Integrationen als Kompatibilität erhalten.
 
 ## Ballerkennung einstellen
 

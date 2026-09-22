@@ -1,6 +1,6 @@
 {
   "headless": true,
-  "ball_detection_enabled": false,
+  "ball_detection_enabled": true,
   "replay_seconds": 3,
   "replay_ipc_name": "tracking_kicker_replay_frames",
     "replay_ipc_slots": 3,
@@ -26,16 +26,16 @@
     "solidity_min": 0.85
   },
   "camera": {
-    "force_fps": 180,
+    "force_fps": 60,
     "height": 650,
     "offset_y": 266,
     "width": 1100,
     "offset_x": 240,
-    "exposure_time": 2000.0,
+    "exposure_time": 4000.0,
     "gain": 10.0,
     "grab_strategy_latest_only": true,
     "serial_number": "40719659",
-    "max_num_buffer": 256,
+    "max_num_buffer": 0,
     "pixel_format": "BayerRG8",
     "max_transfer_size": 0,
     "num_max_queued_urbs": 0,

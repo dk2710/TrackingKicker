@@ -30,7 +30,7 @@ class Camera:
 
     # Optional stable device selection and host buffer configuration
     serial_number: str | None = None
-    max_num_buffer: int = 256
+    max_num_buffer: int = 0
     pixel_format: str = "BayerRG8"
     max_transfer_size: int = 0
     num_max_queued_urbs: int = 0

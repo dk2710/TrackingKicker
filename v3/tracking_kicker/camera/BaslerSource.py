@@ -30,7 +30,9 @@ class BaslerSource:
     USB camera.
     """
 
-    RETRIEVE_TIMEOUT_MS = 100
+    # Match v4's blocking grab timeout.  A transient USB scheduling delay is
+    # handled as a timeout result instead of aborting the source too early.
+    RETRIEVE_TIMEOUT_MS = 1000
     STARTUP_SETTLE_SECONDS = 2.0
     RECOVERY_FAILURE_THRESHOLD = 5
     RECOVERY_MIN_FAILURE_DURATION_SECONDS = 2.0

@@ -146,7 +146,6 @@ PAGE = """
       </div>
       <p class="hint">Die Seite kann vom Laptop aus geöffnet werden. Der Tuner zeigt
         den zuletzt empfangenen Frame als Live-MJPEG-Stream.</p>
-      <div id="status" class="status">Status wird geladen ...</div>
       <h2 style="margin-top: 22px">System-Logs</h2>
       <textarea id="runtimeLogs" class="logs" readonly spellcheck="false">Logs werden geladen ...</textarea>
       <div id="logStatus" class="status">Zeitstempel werden geladen ...</div>
@@ -177,6 +176,9 @@ PAGE = """
         <label>MaxNumBuffer <input id="max_num_buffer" type="number" min="1"></label>
         <label>MaxTransferSize (0=default) <input id="max_transfer_size" type="number" min="0"></label>
         <label>NumMaxQueuedUrbs (0=default) <input id="num_max_queued_urbs" type="number" min="0"></label>
+        <label>DeviceLinkThroughputLimitMode <select id="device_link_throughput_limit_mode">
+          <option>Off</option><option>On</option>
+        </select></label>
         <label>DeviceLinkThroughputLimit <input id="device_link_throughput_limit" type="number" min="0"></label>
         <label>Packet Size (0=default) <input id="packet_size" type="number" min="0"></label>
         <label>Inter-Packet Delay <input id="inter_packet_delay" type="number" min="0"></label>
@@ -215,7 +217,8 @@ PAGE = """
 const names = ["force_fps", "width", "height", "offset_x", "offset_y",
   "exposure_time", "gain", "pixel_format", "exposure_auto", "gain_auto",
   "grab_strategy", "max_num_buffer", "max_transfer_size",
-  "num_max_queued_urbs", "device_link_throughput_limit", "packet_size",
+  "num_max_queued_urbs", "device_link_throughput_limit_mode",
+  "device_link_throughput_limit", "packet_size",
   "inter_packet_delay"];
 const ballNames = ["hsv_low_h", "hsv_high_h", "hsv_low_s", "hsv_high_s",
   "hsv_low_v", "hsv_high_v", "area_min", "area_max", "detection_scale",
@@ -321,7 +324,6 @@ async function refresh() {
   }
   updateTelemetry(data);
   updateBallDetectionUi(data);
-  document.getElementById("status").textContent = JSON.stringify(data, null, 2);
 }
 
 async function toggleBallDetection() {
@@ -375,9 +377,9 @@ async function refreshLogs() {
     if (latestLogId === 0 && entries.length) textarea.value = "";
     if (entries.length) {
       const oldLines = textarea.value && textarea.value !== "Logs werden geladen ..."
-        ? textarea.value.split("\n") : [];
+        ? textarea.value.split("\\n") : [];
       textarea.value = oldLines.concat(entries.map(item => item.text || ""))
-        .slice(-300).join("\n");
+        .slice(-300).join("\\n");
       textarea.scrollTop = textarea.scrollHeight;
     }
     latestLogId = Math.max(latestLogId, Number(data.latest_id || 0));
@@ -390,7 +392,7 @@ async function refreshLogs() {
 refresh().catch(error => document.getElementById("message").textContent = error);
 refreshLogs();
 setInterval(() => refresh().catch(() => {}), 1500);
-setInterval(() => refreshLogs().catch(() => {}), 1000);
+setInterval(() => refreshLogs().catch(() => {}), 3000);
 </script>
 </body>
 </html>
@@ -436,7 +438,12 @@ def create_app(
         after = request.args.get("after", default=0, type=int)
         limit = request.args.get("limit", default=200, type=int)
         return jsonify({
-            "logs": runtime_logs(after=after or 0, limit=limit or 200),
+            "logs": runtime_logs(
+                after=after or 0,
+                limit=limit or 200,
+                errors_only=True,
+                include_diagnostics=True,
+            ),
             "latest_id": latest_log_id(),
         })
 

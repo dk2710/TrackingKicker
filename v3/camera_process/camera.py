@@ -27,7 +27,7 @@ from v3.tracking_kicker.camera.pixel_format import resolve_pixel_format
 
 
 class CameraProcess:
-    RETRIEVE_TIMEOUT_MS = 100
+    RETRIEVE_TIMEOUT_MS = 1000
     PREVIEW_FPS_LIMIT = 30.0
 
     def __init__(
@@ -68,6 +68,7 @@ class CameraProcess:
         self._handoff_lock = threading.Lock()
         self._handoff_event = threading.Event()
         self._pending_frame: Optional[np.ndarray] = None
+        self._pending_frame_timestamp = 0.0
         self._pending_frame_created_at = 0.0
         self._capture_handoff_dropped = 0
         self._frame_ring_lock = threading.RLock()
@@ -278,12 +279,6 @@ class CameraProcess:
 
     def _configure_camera(self, camera) -> None:
         settings = self.settings
-        self._set_feature(camera, "TriggerSelector", "FrameStart", required=False)
-        self._set_feature(camera, "TriggerMode", "Off", required=True)
-        # Some daA1440 firmware/transport combinations expose this node as
-        # read-only after a USB reconnect. Continuous acquisition is already
-        # the camera default; failure to rewrite it must not block grabbing.
-        self._set_feature(camera, "AcquisitionMode", "Continuous", required=False)
         self._set_feature(camera, "ExposureAuto", settings.exposure_auto, required=True)
         self._set_feature(camera, "GainAuto", settings.gain_auto, required=True)
         pixel_format, available_formats = resolve_pixel_format(
@@ -305,20 +300,27 @@ class CameraProcess:
         self._set_feature(camera, "Height", int(settings.height), required=True)
         self._set_feature(camera, "OffsetX", int(settings.offset_x), required=True)
         self._set_feature(camera, "OffsetY", int(settings.offset_y), required=True)
-        try:
-            camera.MaxNumBuffer = int(settings.max_num_buffer)
-        except Exception as exc:
-            print(f"[CAMERA-WARN] MaxNumBuffer nicht setzbar: {exc}")
+        if int(settings.max_num_buffer or 0) > 0:
+            try:
+                camera.MaxNumBuffer = int(settings.max_num_buffer)
+            except Exception as exc:
+                print(f"[CAMERA-WARN] MaxNumBuffer nicht setzbar: {exc}")
         self._set_stream_parameter(camera, "MaxTransferSize", settings.max_transfer_size)
         self._set_stream_parameter(camera, "NumMaxQueuedUrbs", settings.num_max_queued_urbs)
+        if int(settings.device_link_throughput_limit or 0) > 0:
+            self._set_feature(
+                camera,
+                "DeviceLinkThroughputLimit",
+                int(settings.device_link_throughput_limit),
+                required=False,
+            )
         self._set_feature(
             camera,
-            "DeviceLinkThroughputLimit",
-            int(settings.device_link_throughput_limit),
+            "AcquisitionFrameRateEnable",
+            bool(settings.acquisition_frame_rate_enable),
             required=False,
         )
-        if settings.force_fps > 0:
-            self._set_feature(camera, "AcquisitionFrameRateEnable", True, required=False)
+        if settings.acquisition_frame_rate_enable and settings.force_fps > 0:
             self._set_feature(camera, "AcquisitionFrameRate", settings.force_fps, required=False)
 
     def _open_camera_locked(self) -> bool:
@@ -327,10 +329,9 @@ class CameraProcess:
         try:
             device = pylon.TlFactory.GetInstance().CreateFirstDevice()
             camera = pylon.InstantCamera(device)
-            # InstantCamera registers an automatic acquire configuration by
-            # default. It can try to write AcquisitionMode during Open() and
-            # fail on this USB camera after reconnect. All configuration is
-            # applied explicitly below instead.
+            # This USB camera can expose AcquisitionMode as read-only during
+            # pylon's automatic acquire configuration. v4 does not need this
+            # workaround in every state, but v3 must keep it for reconnects.
             camera.RegisterConfiguration(
                 None,
                 pylon.RegistrationMode_ReplaceAll,
@@ -406,7 +407,7 @@ class CameraProcess:
     # ------------------------------------------------------------------
     # Transport loop and status
     # ------------------------------------------------------------------
-    def _handoff_frame(self, image: np.ndarray) -> None:
+    def _handoff_frame(self, image: np.ndarray, timestamp: float) -> None:
         """Replace the pending frame without waiting for the publisher."""
 
         with self._handoff_lock:
@@ -414,6 +415,7 @@ class CameraProcess:
                 with self._state_lock:
                     self._capture_handoff_dropped += 1
             self._pending_frame = image
+            self._pending_frame_timestamp = float(timestamp)
             self._pending_frame_created_at = time.monotonic()
             self._handoff_event.set()
 
@@ -539,8 +541,10 @@ class CameraProcess:
                 continue
             with self._handoff_lock:
                 image = self._pending_frame
+                timestamp = self._pending_frame_timestamp
                 created_at = self._pending_frame_created_at
                 self._pending_frame = None
+                self._pending_frame_timestamp = 0.0
                 self._pending_frame_created_at = 0.0
                 self._handoff_event.clear()
             if image is None or not self.publish_frames:
@@ -549,7 +553,11 @@ class CameraProcess:
             publish_started = time.perf_counter()
             try:
                 with self._frame_ring_lock:
-                    sequence = self.frame_ring.publish(image, time.monotonic())
+                    # v4 timestamps the frame immediately after the owned
+                    # GetArray().copy(). Preserve that acquisition timestamp
+                    # through the asynchronous publisher instead of stamping
+                    # it after the handoff/publisher delay.
+                    sequence = self.frame_ring.publish(image, timestamp)
                 publish_ms = (time.perf_counter() - publish_started) * 1000.0
                 with self._state_lock:
                     if sequence is None:
@@ -637,12 +645,16 @@ class CameraProcess:
                         # alive. Copy it before Release(); the publisher
                         # thread receives an independent latest-frame array.
                         copy_started = time.perf_counter()
-                        image = np.array(result.GetArray(), copy=True, order="C")
+                        image = result.GetArray().copy()
+                        # Keep the same timestamp semantics as v4: the time
+                        # belongs to the copied camera frame, not to a later
+                        # shared-memory publication.
+                        frame_timestamp = time.perf_counter()
                         copy_ms = (time.perf_counter() - copy_started) * 1000.0
                         self._record_block_id(result)
                         if self.publish_frames:
                             handoff_started = time.perf_counter()
-                            self._handoff_frame(image)
+                            self._handoff_frame(image, frame_timestamp)
                             handoff_ms = (time.perf_counter() - handoff_started) * 1000.0
                         with self._state_lock:
                             self._camera_frames_total += 1

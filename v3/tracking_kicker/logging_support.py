@@ -17,6 +17,16 @@ _HANDLER: logging.Handler | None = None
 _ORIGINAL_STDOUT = None
 _ORIGINAL_STDERR = None
 
+_ERROR_MARKERS = (
+    "-ERR]",
+    "ERROR",
+    "FEHLER",
+    "FEHLGESCHLAGEN",
+    "ABGEBROCHEN",
+    "PAYLOAD DATA HAS BEEN DISCARDED",
+    "PAYLOAD-/TRANSPORTFEHLER",
+)
+
 
 class _MemoryHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
@@ -113,14 +123,44 @@ def configure_runtime_logging() -> None:
         )
 
 
-def runtime_logs(*, after: int = 0, limit: int = 200) -> list[dict[str, Any]]:
-    """Return new dashboard log entries after an optional sequence number."""
+def runtime_logs(
+    *,
+    after: int = 0,
+    limit: int = 200,
+    errors_only: bool = False,
+    include_diagnostics: bool = False,
+) -> list[dict[str, Any]]:
+    """Return new dashboard log entries after an optional sequence number.
+
+    The web dashboard can request a compact view. Legacy ``print`` output is
+    recorded at INFO, so the explicit error markers are included there as
+    well as normal ERROR and CRITICAL records.
+    """
 
     after = max(0, int(after))
     limit = max(1, min(int(limit), 500))
     with _LOCK:
-        entries = [item.copy() for item in _RECORDS if int(item["id"]) > after]
+        entries = []
+        for item in _RECORDS:
+            if int(item["id"]) <= after:
+                continue
+            if errors_only and not _is_dashboard_error(item):
+                if not (include_diagnostics and _is_diagnostic(item)):
+                    continue
+            entries.append(item.copy())
     return entries[-limit:]
+
+
+def _is_dashboard_error(item: dict[str, Any]) -> bool:
+    level = str(item.get("level", "")).upper()
+    if level in {"ERROR", "CRITICAL"}:
+        return True
+    text = str(item.get("text", "")).upper()
+    return any(marker in text for marker in _ERROR_MARKERS)
+
+
+def _is_diagnostic(item: dict[str, Any]) -> bool:
+    return "[CAMERA-DIAG]" in str(item.get("text", ""))
 
 
 def latest_log_id() -> int:

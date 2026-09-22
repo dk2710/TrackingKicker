@@ -12,12 +12,16 @@ class CameraSettings:
 
     # The web stream uses 30 FPS. Higher acquisition rates remain available,
     # but the USB transport must be allowed to run lower when necessary.
-    force_fps: float = 180.0
+    force_fps: float = 60.0
+    # Keep the camera's acquisition-rate limiter disabled unless explicitly
+    # requested. ``force_fps`` remains the nominal/expected rate for status
+    # and detection timing; it is not written to the camera while disabled.
+    acquisition_frame_rate_enable: bool = False
     width: int = 1100
     height: int = 650
     offset_x: int = 240
     offset_y: int = 266
-    exposure_time: float = 2000.0
+    exposure_time: float = 4000.0
     gain: float = 10.0
     pixel_format: str = "BayerRG8"
     exposure_auto: str = "Off"
@@ -26,17 +30,16 @@ class CameraSettings:
     # LatestImageOnly is the production strategy. It prevents an application
     # backlog when the tracker or preview temporarily needs more time.
     grab_strategy: str = "latest_image_only"
-    max_num_buffer: int = 256
+    # v4 leaves the pylon default untouched.
+    max_num_buffer: int = 0
 
-    # USB stream-grabber tuning. The 4 MiB transfer size is the value
-    # recommended in pypylon issue #718 for intermittent payload loss.
-    max_transfer_size: int = 4 * 1024 * 1024
+    # Zero leaves the pylon/USB stream-grabber defaults untouched, matching v4.
+    max_transfer_size: int = 0
     num_max_queued_urbs: int = 0
 
-    # Basler's USB transport workaround from pypylon issue #718. Zero keeps
-    # the camera default; 160 MB/s leaves headroom while still supporting the
-    # current 1100x650 BayerRG8 stream at 180 FPS.
-    device_link_throughput_limit: int = 160000000
+    # Zero leaves the camera's default throughput handling untouched, matching v4.
+    device_link_throughput_limit_mode: str = "Off"
+    device_link_throughput_limit: int = 0
 
     # Optional GigE transport settings. Zero means leave the camera default.
     packet_size: int = 0

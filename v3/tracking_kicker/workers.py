@@ -8,6 +8,7 @@ from collections import deque
 from datetime import datetime
 from queue import Empty
 
+import cv2
 import numpy as np
 
 from .camera.conversion import to_bgr
@@ -170,8 +171,13 @@ class WorkerMixin:
                 objframe.frame_id = self._frame_sequence
 
                 with self.replay_lock:
+                    # CameraProcessSource already returns an owned copy from
+                    # the shared mailbox.  The processing loop replaces
+                    # ``frame.frame`` with a converted image, so retaining
+                    # this raw array does not alias a later mutation.  Avoid
+                    # a second full-image copy at camera rate.
                     self.replay_buffer.append(
-                        (objframe.frame.copy(), objframe.timestamp)
+                        (objframe.frame, objframe.timestamp)
                     )
                     while (
                         self.replay_buffer
@@ -251,9 +257,29 @@ class WorkerMixin:
                 frame.frame = to_bgr(frame.frame, self.dist.camera.pixel_format)
                 stage_time["cvt"] += time.perf_counter() - stage_start
 
+                # In headless operation the full-resolution corrected image
+                # is never displayed.  Prepare the smaller detector input
+                # first and apply the distortion map at that resolution. It
+                # keeps the ball coordinates in the original frame system,
+                # while avoiding a full-resolution remap on every frame.
+                detection_image = None
+                detection_scale = float(
+                    getattr(self.detector, "detection_scale", 1.0) or 1.0
+                )
                 stage_start = time.perf_counter()
-                with self.calibration_lock:
-                    frame.frame = self.dist.apply(frame.frame)
+                if HEADLESS and 0.0 < detection_scale < 1.0:
+                    detection_image = cv2.resize(
+                        frame.frame,
+                        None,
+                        fx=detection_scale,
+                        fy=detection_scale,
+                        interpolation=cv2.INTER_AREA,
+                    )
+                    with self.calibration_lock:
+                        detection_image = self.dist.apply(detection_image)
+                else:
+                    with self.calibration_lock:
+                        frame.frame = self.dist.apply(frame.frame)
                 stage_time["dist"] += time.perf_counter() - stage_start
 
                 now = time.perf_counter()
@@ -261,7 +287,7 @@ class WorkerMixin:
 
                 stage_start = time.perf_counter()
                 if self.ball_detection_enabled:
-                    self.detector.detect(frame)
+                    self.detector.detect(frame, detection_image=detection_image)
                 else:
                     frame.ball = None
                     frame.ball_track_valid = False
@@ -352,16 +378,17 @@ class WorkerMixin:
                 stage_time["analyze"] += time.perf_counter() - stage_start
                 self._handle_goal(goal)
 
-                stage_start = time.perf_counter()
-                self.analyzer.draw_overlay(frame)
-                stage_time["overlay"] += time.perf_counter() - stage_start
+                if not HEADLESS:
+                    stage_start = time.perf_counter()
+                    self.analyzer.draw_overlay(frame)
+                    stage_time["overlay"] += time.perf_counter() - stage_start
 
-                if self.display_queue.full():
-                    try:
-                        self.display_queue.get_nowait()
-                    except Empty:
-                        pass
-                self.display_queue.put(frame.frame)
+                    if self.display_queue.full():
+                        try:
+                            self.display_queue.get_nowait()
+                        except Empty:
+                            pass
+                    self.display_queue.put(frame.frame)
 
                 if now - last_log >= 1.0:
                     dt = now - last_log
