@@ -9,17 +9,17 @@ from unittest.mock import patch
 import numpy as np
 from flask import Flask
 
-from v3.tracking_kicker.comms.http_api import ApiMixin
-from v3.tracking_kicker.goal_media import GoalMediaMixin
-from v3.tracking_kicker.goal_replay import (
+from tracking_kicker.comms.http_api import ApiMixin
+from tracking_kicker.goal_media import GoalMediaMixin
+from tracking_kicker.goal_replay import (
     calculate_three_point_speed_kmh,
     select_goal_frames,
 )
-from v3.tracking_kicker.runtime import (
+from tracking_kicker.runtime import (
     GOAL_VIDEO_FRAME_LIMIT,
     GOAL_VIDEO_FPS,
 )
-from v3.tracking_kicker.Objects.Frames import Frame
+from tracking_kicker.Objects.Frames import Frame
 
 
 FFMPEG_AVAILABLE = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
@@ -47,8 +47,8 @@ class ApiHarness(ApiMixin):
 
 class RetroHarness(GoalMediaMixin):
     def __init__(self):
-        from v3.tracking_kicker.camera.distortion import DistortionCorrector
-        from v3.tracking_kicker.runtime import config
+        from tracking_kicker.camera.distortion import DistortionCorrector
+        from tracking_kicker.runtime import config
 
         self.dist = DistortionCorrector(config.camera)
         self.calibration_lock = threading.RLock()
@@ -122,7 +122,7 @@ class GoalReplayTests(unittest.TestCase):
             }
 
             with patch(
-                "v3.tracking_kicker.comms.http_api.ANALYSIS_VIDEO_PATH",
+                "tracking_kicker.comms.http_api.ANALYSIS_VIDEO_PATH",
                 video_dir,
             ):
                 client = harness.api.test_client()
@@ -157,7 +157,7 @@ class GoalReplayTests(unittest.TestCase):
             def detect(self, frame):
                 frame.ball = (int(round(frame.timestamp * 100.0)), 2, 3)
 
-        with patch("v3.tracking_kicker.goal_media.BallDetector", Detector):
+        with patch("tracking_kicker.goal_media.BallDetector", Detector):
             result = harness._retro_analyze_last_second(source, 1.0)
 
         self.assertEqual(result["direction"], "backward")
@@ -180,7 +180,7 @@ class GoalReplayTests(unittest.TestCase):
             frames.append(frame)
 
         with tempfile.TemporaryDirectory() as temporary:
-            with patch("v3.tracking_kicker.goal_media.ANALYSIS_VIDEO_PATH", Path(temporary)):
+            with patch("tracking_kicker.goal_media.ANALYSIS_VIDEO_PATH", Path(temporary)):
                 video_path = Path(harness.create_goal_video(frames))
                 self.assertTrue(video_path.exists())
 
@@ -244,7 +244,7 @@ class GoalReplayTests(unittest.TestCase):
         }
 
         with tempfile.TemporaryDirectory() as temporary:
-            with patch("v3.tracking_kicker.goal_media.ANALYSIS_VIDEO_PATH", Path(temporary)):
+            with patch("tracking_kicker.goal_media.ANALYSIS_VIDEO_PATH", Path(temporary)):
                 with patch.object(
                     harness,
                     "_retro_analyze_last_second",
