@@ -21,7 +21,6 @@ import sys
 import threading
 import time
 from collections import deque
-from pathlib import Path
 from queue import Empty, Queue
 from typing import Any, Dict, Optional
 
@@ -40,28 +39,14 @@ from .runtime import (
     ANALYSIS_VIDEO_PATH,
     DIGIKICKER_POST_DEFAULT_URL,
     DIGIKICKER_POST_TIMEOUT_SECONDS,
-    GOAL_PRE_NPZ_DURATION_SECONDS,
-    GOAL_VIDEO_DURATION_SECONDS,
-    GOAL_VIDEO_FRAME_LIMIT,
     GOAL_VIDEO_FPS,
-    GOAL_VIDEO_MAX_WIDTH,
     HEADLESS,
-    RETRO_BUFFER_MAX_FRAMES,
-    RETRO_MAX_REANALYZE_FRAMES,
-    RETRO_TRIGGER_NO_BALL_FRAMES,
     acquire_app_lock,
     config,
     create_replay_fallback,
     vision,
 )
 from .ui.opencv_gui import destroy_all, imshow, wait_key
-from .ui.opencv_gui import (
-    destroy_all as gui_destroy_all,
-    destroy_window as gui_destroy_window,
-    imshow as gui_imshow,
-    named_window as gui_named_window,
-    wait_key as gui_wait_key,
-)
 from .workers import WorkerMixin
 
 
@@ -91,57 +76,44 @@ class KickerApp(
         self.frame_queue = Queue(maxsize=2)
         self.display_queue = Queue(maxsize=1)
         self.recording_queue = Queue()
-        self.raw_queue = Queue(maxsize=2)
-        self.processed_queue = Queue(maxsize=2)
 
         self.detection_state_lock = threading.Lock()
         self.last_detection = {}
         self.processing_fps = 0.0
 
-        self.history_lock = threading.Lock()
         self.goal_video_lock = threading.Lock()
-        self.goal_video_ready = threading.Event()
         self.goal_video_path: Optional[str] = None
         self.goal_video_speed = 0.0
         self.goal_video_frame_count = 0
         self.goal_video_fps = GOAL_VIDEO_FPS
         self.goal_video_thread: Optional[threading.Thread] = None
         self.goal_video_generation = 0
-        self.goal_video_result_delivered = False
+        self.goal_video_result: Optional[Dict[str, Any]] = None
         self.goal_video_error: Optional[str] = None
 
-        self.rolling_video_queue = Queue(maxsize=1)
-        self.rolling_video_lock = threading.Lock()
-        self.rolling_video_path: Optional[str] = None
-        self.rolling_video_list: Optional[Path] = None
-        self.rolling_video_ready_time = 0.0
-        self.rolling_video_thread: Optional[threading.Thread] = None
-        self.rolling_last_submit = 0.0
+        # Freeze a candidate as soon as the ball enters a goal ROI.  The
+        # existing missing-ball confirmation can then run without losing the
+        # three seconds before the actual goal.
+        self.goal_capture_lock = threading.Lock()
+        self.pending_goal_capture = None
 
         self.t_api = None
         self.t_cam = None
         self.t_proc = None
         self.t_rec = None
-        self.t_roll = None
 
         self.stop_event = threading.Event()
         self.record_event = threading.Event()
 
-        # Raw replay buffer and bounded retro-analysis buffer.
+        # The worker trims this raw history by camera timestamps to three
+        # seconds.  A small count limit protects against a faulty timestamp.
         self.replay_buffer = deque(maxlen=int(240 * config.replay_seconds))
         self.replay_lock = threading.Lock()
         self.snapshot_lock = threading.Lock()
         self.snapshot_generation = 0
         self.snapshot_frames = []
         self.calibration_lock = threading.RLock()
-        self.history_frames = deque()
-        self.skipped_frame_lock = threading.Lock()
-        self.skipped_frame_buffer = deque(maxlen=RETRO_BUFFER_MAX_FRAMES)
         self._frame_sequence = 0
-        self._last_visible_frame_id = None
-        self._last_retro_frame_id = None
-        self._no_ball_live_frames = 0
-        self._retro_analysis_count = 0
 
         # Last goal result and digiKicker notification settings.
         self.last_analysis_lock = threading.Lock()
@@ -224,6 +196,10 @@ class KickerApp(
 
         self.detector = BallDetector.from_config(config, vision.field)
         self.snapshot_detector = BallDetector.from_config(config, vision.field)
+        # The continuous position/speed analysis is paused.  Ball detection
+        # remains enabled because it is still needed to detect a goal ROI
+        # entry and freeze the history.
+        self.live_analysis_enabled = False
         self.ball_detection_enabled = bool(
             getattr(config, "ball_detection_enabled", False)
         )
@@ -325,7 +301,7 @@ class KickerApp(
                 break
 
     def _join_threads(self):
-        for thread in [self.t_cam, self.t_proc, self.t_rec, self.t_roll, self.t_api]:
+        for thread in [self.t_cam, self.t_proc, self.t_rec, self.t_api]:
             if thread is None:
                 continue
             try:

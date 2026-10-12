@@ -14,7 +14,13 @@ from ..Objects.Frames import Frame
 from ..camera.conversion import to_bgr
 from ..model.RodConfig import RodConfig
 from ..model.Vision import FieldConfig, FieldSize, GoalROI, GoalsConfig
-from ..runtime import ANALYSIS_VIDEO_PATH, GOAL_VIDEO_FRAME_LIMIT, config, vision
+from ..runtime import (
+    ANALYSIS_VIDEO_PATH,
+    GOAL_VIDEO_FPS,
+    GOAL_VIDEO_FRAME_LIMIT,
+    config,
+    vision,
+)
 from ..logging_support import latest_log_id, runtime_logs
 
 
@@ -363,13 +369,16 @@ class ApiMixin:
             "source_fps": measured_fps,
             "source_metrics": source_metrics,
             "processing_fps": float(getattr(self, "processing_fps", 0.0)),
+            "live_analysis_enabled": bool(self.live_analysis_enabled),
             "ball_detection_enabled": bool(self.ball_detection_enabled),
             "web_live_fps": WEB_LIVE_FPS,
             "web_live_delay_seconds": WEB_LIVE_DELAY_SECONDS,
             "live": live,
             "detection": detection,
             "last_goal": latest_goal,
-            "retro_analysis_frames": int(self._retro_analysis_count),
+            "goal_analysis": (
+                latest_goal.get("analysis") if latest_goal else None
+            ),
             "urls": {
                 "dashboard": url_for("dashboard"),
                 "live": url_for("live_stream"),
@@ -686,13 +695,15 @@ class ApiMixin:
             use_reloader=False,
         )
 
-    def _api_goal_fast(self):
-        """Start/poll the latest three-second goal video without blocking."""
-        refresh = request.args.get("refresh", "").lower() in {
-            "1", "true", "yes", "on"
-        }
-        requested_generation = request.args.get("generation", type=int)
+    def api_goal(self):
+        """Return the result created by the latest confirmed goal.
 
+        The endpoint never creates a replay by itself.  A goal event freezes
+        and analyzes the history first; callers can poll this endpoint while
+        the 90 color frames are being encoded.
+        """
+
+        requested_generation = request.args.get("generation", type=int)
         with self.goal_video_lock:
             video_path = self.goal_video_path
             preparing = (
@@ -700,116 +711,64 @@ class ApiMixin:
                 and self.goal_video_thread.is_alive()
             )
             generation = self.goal_video_generation
-            result_delivered = self.goal_video_result_delivered
             error = self.goal_video_error
+            result = dict(self.goal_video_result or {})
 
-        should_start = refresh or (
-            requested_generation is None
-            and not preparing
-            and (video_path is None or result_delivered)
-        )
-        if should_start:
-            generation = self._start_goal_video_preparation(force=True)
-            preparing = True
+        if generation == 0 and not preparing and not result:
+            return jsonify({
+                "status": "no_goal",
+                "video_ready": False,
+                "message": "Noch kein bestätigtes Tor vorhanden",
+            }), 404
 
-        if requested_generation is not None and requested_generation != generation:
-            requested_generation = generation
-
-        if preparing or video_path is None:
-            with self.last_analysis_lock:
-                latest_goal = dict(self.last_analysis)
-            response = {
+        if preparing:
+            return jsonify({
                 "status": "preparing",
                 "video_ready": False,
                 "video_generation": generation,
-                "ball_speed_kmh": float(self.goal_video_speed),
                 "retry_after_ms": 100,
                 "status_url": url_for("goal", generation=generation),
-            }
-            if latest_goal:
-                response["goal_position"] = latest_goal.get("goal_position")
-                response["goal_side"] = latest_goal.get("side")
-            if error:
-                response["error"] = error
-            return jsonify(response), 202
+            }), 202
 
-        if error:
+        if error or video_path is None or not result:
             return jsonify({
                 "status": "error",
                 "video_ready": False,
                 "video_generation": generation,
-                "message": error,
+                "message": error or "Goal-Video ist nicht verfügbar",
             }), 503
 
-        with self.goal_video_lock:
-            self.goal_video_result_delivered = True
+        if requested_generation is not None and requested_generation != generation:
+            return jsonify({
+                "status": "gone",
+                "video_ready": False,
+                "video_generation": generation,
+                "message": "Diese Goal-Generation ist nicht mehr aktuell",
+            }), 409
 
-        speed = float(self.goal_video_speed)
-        frame_count = self.goal_video_frame_count or GOAL_VIDEO_FRAME_LIMIT
-        with self.last_analysis_lock:
-            latest_goal = dict(self.last_analysis)
         video_filename = Path(video_path).name
         try:
             video_version = Path(video_path).stat().st_mtime_ns
         except OSError:
             video_version = time.time_ns()
 
-        response = {
+        result.update({
             "status": "ready",
             "video_ready": True,
             "video_generation": generation,
-            "ball_speed_kmh": speed,
+            "ball_speed_kmh": float(result.get("speed_kmh", 0.0)),
             "video_url": url_for(
                 "goal_video",
                 filename=video_filename,
                 v=video_version,
             ),
             "video_filename": video_filename,
-            "video_frame_count": frame_count,
-            "video_fps": self.goal_video_fps,
-        }
-        if latest_goal:
-            response["goal_position"] = latest_goal.get("goal_position")
-            response["goal_side"] = latest_goal.get("side")
-        return jsonify(response), 200
-
-    def api_goal(self):
-        return self._api_goal_fast()
-
-    def _api_goal_legacy(self):
-        with self.goal_video_lock:
-            video_path = self.goal_video_path
-            preparing = (
-                self.goal_video_thread is not None
-                and self.goal_video_thread.is_alive()
-            )
-
-        if not preparing:
-            self._start_goal_video_preparation(force=True)
-            preparing = True
-
-        if preparing:
-            self.goal_video_ready.wait(timeout=6.0)
-            with self.goal_video_lock:
-                video_path = self.goal_video_path
-
-        speed = float(self.goal_video_speed)
-        frame_count = GOAL_VIDEO_FRAME_LIMIT
-        if video_path is None:
-            return jsonify({
-                "status": "error",
-                "message": "Die letzten 3 Sekunden konnten nicht als Video erstellt werden",
-            }), 503
-
-        video_filename = Path(video_path).name
-        video_url = url_for("goal_video", filename=video_filename)
-        return jsonify({
-            "ball_speed_kmh": speed,
-            "video_url": video_url,
-            "video_filename": video_filename,
-            "video_frame_count": frame_count,
-            "video_fps": self.goal_video_fps,
+            "video_frame_count": int(
+                result.get("video_frame_count", GOAL_VIDEO_FRAME_LIMIT)
+            ),
+            "video_fps": float(result.get("video_fps", GOAL_VIDEO_FPS)),
         })
+        return jsonify(result), 200
 
     def api_goal_video(self, filename):
         response = send_from_directory(

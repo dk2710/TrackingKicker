@@ -13,12 +13,12 @@ GOAL_CONFIRMATION_MISSING_SECONDS = 1.0
 
 
 class KickerAnalyzer:
-    """Stateful goal and ball-position analysis with goal-only speed checks.
+    """Stateful goal detection plus the retained legacy analysis helpers.
 
-    Every frame can still provide ``frame.ball`` for the normal position and
-    goal analysis. Speed is calculated only after a goal was confirmed and
-    only from observations which the detector marked as belonging to the
-    same track.
+    The active application calls :meth:`process_goal_frame` during the live
+    stream.  The expensive position and speed path remains available for
+    replay tools, while the goal media worker performs the current reverse
+    three-point speed calculation.
     """
 
     def __init__(self, goals_cfg: GoalsConfig, field_cfg: FieldConfig | None = None):
@@ -65,6 +65,10 @@ class KickerAnalyzer:
         self._pending_start_time: Optional[float] = None
         self._pending_missing_since: Optional[float] = None
         self._goal_locked = False
+        self._candidate_event_id = 0
+        self._pending_candidate = None
+        self._cancelled_candidate = None
+        self._last_reported_candidate_id = None
 
         # The application uses this event as the payload for its POST.
         self._goal_event_id = 0
@@ -90,6 +94,11 @@ class KickerAnalyzer:
         goal_time = float(timestamp) if timestamp is not None else time.perf_counter()
         self._goal_event_id += 1
         self._last_goal_timestamp = goal_time
+        candidate_id = (
+            self._pending_candidate.get("candidate_id")
+            if self._pending_candidate is not None
+            else None
+        )
         self.last_goal_event = {
             "event_id": self._goal_event_id,
             "event": "goal",
@@ -99,6 +108,7 @@ class KickerAnalyzer:
             "position": side,
             "goal_position": side,
             "goal_timestamp": goal_time,
+            "candidate_id": candidate_id,
             "speed_kmh": 0.0,
             "ball_speed_kmh": 0.0,
             "speed": 0.0,
@@ -139,6 +149,7 @@ class KickerAnalyzer:
                     self._pending_side = None
                     self._pending_start_time = None
                     self._pending_missing_since = None
+                    self._pending_candidate = None
             return goal_left, goal_right
 
         x, y, r = ball
@@ -157,10 +168,22 @@ class KickerAnalyzer:
                 self._pending_side = "left"
                 self._pending_start_time = timestamp
                 self._pending_missing_since = None
+                self._candidate_event_id += 1
+                self._pending_candidate = {
+                    "candidate_id": self._candidate_event_id,
+                    "side": "left",
+                    "goal_timestamp": timestamp,
+                }
             elif in_right:
                 self._pending_side = "right"
                 self._pending_start_time = timestamp
                 self._pending_missing_since = None
+                self._candidate_event_id += 1
+                self._pending_candidate = {
+                    "candidate_id": self._candidate_event_id,
+                    "side": "right",
+                    "goal_timestamp": timestamp,
+                }
             return False, False
 
         pending_in_goal = (
@@ -175,15 +198,30 @@ class KickerAnalyzer:
         # A visible ball outside the candidate ROI means that the required
         # one-second complete absence has not happened. Cancel this candidate;
         # if it is already in the other ROI, start that side as a new one.
+        if self._pending_candidate is not None:
+            self._cancelled_candidate = self._pending_candidate
+        self._pending_candidate = None
         self._pending_side = None
         self._pending_start_time = None
         self._pending_missing_since = None
         if in_left:
             self._pending_side = "left"
             self._pending_start_time = timestamp
+            self._candidate_event_id += 1
+            self._pending_candidate = {
+                "candidate_id": self._candidate_event_id,
+                "side": "left",
+                "goal_timestamp": timestamp,
+            }
         elif in_right:
             self._pending_side = "right"
             self._pending_start_time = timestamp
+            self._candidate_event_id += 1
+            self._pending_candidate = {
+                "candidate_id": self._candidate_event_id,
+                "side": "right",
+                "goal_timestamp": timestamp,
+            }
 
         return goal_left, goal_right
 
@@ -315,6 +353,42 @@ class KickerAnalyzer:
             self._pending_start_time = float(landing_timestamp)
             self._pending_missing_since = None
         return False, False
+
+    def consume_goal_candidate(self):
+        """Return and clear the newest candidate that entered a goal ROI.
+
+        The worker uses this early event to freeze the three-second history
+        before it rotates out.  The existing one-second confirmation rule
+        still decides whether the candidate becomes a real goal.
+        """
+
+        candidate = self._pending_candidate
+        if candidate is None:
+            return None
+        candidate_id = candidate.get("candidate_id")
+        if candidate_id == self._last_reported_candidate_id:
+            return None
+        self._last_reported_candidate_id = candidate_id
+        return dict(candidate)
+
+    def consume_cancelled_goal_candidate(self):
+        """Return a candidate that left the ROI before confirmation."""
+
+        candidate = self._cancelled_candidate
+        self._cancelled_candidate = None
+        return candidate
+
+    def process_goal_frame(self, frame):
+        """Run only the lightweight live goal state machine.
+
+        Continuous position and speed analysis is intentionally disabled for
+        now.  Ball detection remains active because it is the trigger that
+        freezes the history and confirms a goal; the expensive speed analysis
+        is performed retrospectively by :mod:`goal_media`.
+        """
+
+        timestamp = float(getattr(frame, "timestamp", time.perf_counter()))
+        return self._update_goals(frame.ball, frame.frame.shape, timestamp)
 
     def _finalize_goal_speed(self) -> None:
         if self._last_goal_timestamp is None:
